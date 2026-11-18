@@ -1,0 +1,1369 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100dvh;
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  color: inherit;
+}
+
+/* Visible high-contrast keyboard focus ring across both themes (R-32) */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Tactile active press feedback without shifting neighboring layout */
+.pressable {
+  transition:
+    transform var(--dur-press) ease-out,
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease;
+}
+
+.pressable:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+/* Strict Liquid Glass Dose Cap: only applied to K/Bilah mode and 1 active floating menu/sheet */
+.glass-tray-surface {
+  background: var(--glass-tray);
+  border: 1px solid var(--glass-border);
+  box-shadow: inset 0 1px 2px rgba(20, 25, 23, 0.05);
+  backdrop-filter: blur(10px) saturate(140%);
+  -webkit-backdrop-filter: blur(10px) saturate(140%);
+}
+
+.glass-regular-surface {
+  background: var(--glass-surface);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-glass);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass-tray-surface,
+  .glass-regular-surface {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+/* Application Shell */
+.app-shell {
+  display: flex;
+  width: 100%;
+  min-height: 100dvh;
+  background: var(--bg);
+  overflow-x: clip;
+}
+
+/* Desktop Sidebar (260px solid Sumi surface, 0 blur) */
+.sidebar {
+  width: 260px;
+  flex-shrink: 0;
+  height: 100dvh;
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 8px;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  z-index: 20;
+  transition: width 180ms var(--ease-spring), transform 220ms var(--ease-sheet);
+}
+
+.sidebar.collapsed {
+  width: 0;
+  padding: 0;
+  border-right: none;
+  overflow: hidden;
+}
+
+.sidebar-top-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 44px;
+  padding: 0 6px 0 8px;
+  margin-bottom: 4px;
+}
+
+.sidebar-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+
+.sidebar-nav-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--r-control);
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+}
+
+.sidebar-nav-btn:hover {
+  background: var(--surface-hover);
+}
+
+.new-chat-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-full);
+  background: var(--accent-soft);
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.sidebar-search-box {
+  padding: 4px 4px 8px 4px;
+}
+
+.sidebar-search-input {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border-radius: var(--r-control);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.sidebar-history-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.history-section-label {
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  color: var(--text-subtle);
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.history-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 4px 0 10px;
+  border-radius: var(--r-control);
+  background: transparent;
+  cursor: pointer;
+}
+
+.history-row:hover {
+  background: var(--surface-hover);
+}
+
+.history-row.active {
+  background: var(--accent-soft);
+}
+
+.history-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  border: none;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 20px;
+  color: var(--text);
+}
+
+.history-row-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-pin-icon {
+  color: var(--accent);
+  flex-shrink: 0;
+  display: inline-flex;
+}
+
+.history-dots-btn {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: var(--r-menu-item);
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.history-row:hover .history-dots-btn,
+.history-row:focus-within .history-dots-btn,
+.history-dots-btn[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.history-dots-btn:hover {
+  background: var(--surface-pressed);
+  color: var(--text);
+}
+
+.sidebar-account-footer {
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+  margin-top: 4px;
+  position: relative;
+}
+
+.account-row-btn {
+  width: 100%;
+  height: 52px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--r-control);
+  background: transparent;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.account-row-btn:hover {
+  background: var(--surface-hover);
+}
+
+.account-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r-full);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.account-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.account-name {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-email {
+  font-size: 12px;
+  color: var(--text-subtle);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Main Reading Canvas */
+.main-stage {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  background: var(--bg);
+  position: relative;
+}
+
+.stage-header {
+  height: 56px;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 15;
+}
+
+.header-left,
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.icon-square-btn {
+  min-width: 36px;
+  min-height: 36px;
+  border-radius: var(--r-control);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0 8px;
+}
+
+.icon-square-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+/* K/Pil bahasa */
+.lang-pill-btn {
+  height: 36px;
+  padding: 0 10px 0 12px;
+  border-radius: var(--r-pill-lang);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(20, 25, 23, 0.04);
+}
+
+.lang-pill-btn:hover {
+  background: var(--surface-hover);
+}
+
+/* Offline status banner */
+.offline-banner {
+  margin: 0 auto;
+  width: min(720px, calc(100% - 32px));
+  padding: 8px 14px;
+  border-radius: var(--r-control);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* Centered Empty Composition vs Active Stream Composition */
+.stage-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.stage-body.is-empty {
+  justify-content: center;
+  align-items: center;
+  padding: 24px 24px 72px 24px;
+}
+
+.empty-center-stack {
+  width: 100%;
+  max-width: 720px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+}
+
+.greeting-heading {
+  margin: 0;
+  font-size: 28px;
+  line-height: 35px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-align: center;
+  color: var(--text);
+}
+
+.stream-column {
+  flex: 1;
+  width: 100%;
+  max-width: 752px;
+  margin: 0 auto;
+  padding: 20px 16px 36px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.composer-dock {
+  position: sticky;
+  bottom: 0;
+  width: 100%;
+  background: linear-gradient(to top, var(--bg) 78%, transparent);
+  padding: 8px 16px calc(16px + env(safe-area-inset-bottom, 0px)) 16px;
+  z-index: 14;
+}
+
+.composer-dock-inner {
+  width: 100%;
+  max-width: 720px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Desktop vs Mobile ordering of K/Bilah mode & K/Composer:
+   Desktop (>= 768px): Composer on top (order 1), Mode bar below (order 2).
+   Mobile (< 768px): Mode bar on top (order 1), Composer below (order 2). */
+.composer-zone-wrapper {
+  width: 100%;
+  max-width: 720px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.composer-slot {
+  width: 100%;
+  order: 1;
+}
+
+.mode-bar-slot {
+  order: 2;
+  display: flex;
+  justify-content: center;
+}
+
+/* K/Composer Squircle Island */
+.composer-island {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-island);
+  box-shadow: var(--shadow-e1), var(--composer-specular);
+  padding: 12px 12px 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.composer-textarea {
+  width: 100%;
+  min-height: 48px;
+  max-height: 220px;
+  resize: none;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 16px;
+  line-height: 24px;
+  padding: 0;
+}
+
+.composer-textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.composer-textarea:focus {
+  outline: none;
+}
+
+.composer-island:focus-within {
+  border-color: var(--focus-ring);
+}
+
+.composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.composer-meta-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-subtle);
+}
+
+.composer-controls-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mic-round-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.mic-round-btn:hover {
+  background: var(--surface-hover);
+}
+
+.mic-round-btn.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.send-round-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-full);
+  border: none;
+  background: var(--accent);
+  color: var(--on-accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.send-round-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.send-round-btn:disabled {
+  background: var(--surface-pressed);
+  color: var(--text-subtle);
+  cursor: not-allowed;
+}
+
+.send-round-btn.stopping {
+  background: var(--text);
+  color: var(--bg);
+}
+
+/* Dictation Bar inside K/Composer (L2 & H4) */
+.dictation-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-radius: var(--r-card);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.dictation-bars {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+}
+
+.dictation-bar {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: height 90ms ease-out;
+}
+
+/* K/Bilah mode (Liquid Glass Segmented Capsule: 26px outer = 22px inner + 4px padding) */
+.mode-tray {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 46px;
+  padding: 4px;
+  border-radius: var(--r-tray);
+}
+
+.mode-seg-btn {
+  height: 38px;
+  padding: 0 14px;
+  border: none;
+  border-radius: var(--r-app-icon);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition:
+    background-color 180ms var(--ease-spring),
+    color 180ms var(--ease-spring),
+    box-shadow 180ms var(--ease-spring);
+}
+
+.mode-seg-btn:hover {
+  color: var(--text);
+}
+
+.mode-seg-btn[aria-selected="true"] {
+  background: var(--glass-pill-active);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: var(--shadow-pill);
+}
+
+/* Task Mode Cards (Gambar L3/H5, Dokumen L4/H6, Link L5/H7) */
+.task-drop-card {
+  width: 100%;
+  background: var(--surface);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r-island);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+  box-shadow: var(--shadow-e1);
+}
+
+.task-drop-card.dragging {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* Buttons (K/Tombol utama & K/Tombol sekunder) */
+.btn-primary {
+  min-height: 36px;
+  padding: 0 16px;
+  border-radius: var(--r-control);
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-primary:disabled {
+  background: var(--surface-pressed);
+  color: var(--text-subtle);
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: var(--r-control);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.btn-danger {
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: var(--r-control);
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 14px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+/* Attachment Chip (K/Chip lampiran: Siap, Membaca, Galat, BelumBisa) */
+.attachment-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.attachment-chip {
+  min-height: 56px;
+  padding: 10px 10px 10px 12px;
+  border-radius: var(--r-card);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  text-align: left;
+}
+
+.attachment-chip.is-error {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.attachment-chip-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.attachment-chip-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.attachment-chip.is-error .attachment-chip-sub {
+  color: var(--danger);
+  font-weight: 500;
+}
+
+/* Conversation Turns (K/Bubble pengguna + K/Balasan Charter + K/Kartu hasil) */
+.turn-user-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.user-bubble {
+  max-width: min(580px, 92%);
+  padding: 12px 16px;
+  border-radius: var(--r-popover);
+  background: var(--bubble-user);
+  color: var(--text);
+  font-family: var(--font-jp);
+  font-size: 17px;
+  line-height: 30px;
+  font-weight: 300;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.turn-assistant-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+}
+
+/* Aturan Pemisahan Suara Serif: Charter ONLY on translated prose */
+.assistant-prose {
+  width: 100%;
+  max-width: 720px;
+  font-family: var(--font-result);
+  font-size: 18px;
+  line-height: 30px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.turn-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.action-chip-btn {
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: var(--r-menu-item);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.action-chip-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.name-chips-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+
+.name-chip {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: var(--r-pill-lang);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.name-chip.locked {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* Result Card (K/Kartu hasil) */
+.result-card {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  padding: 16px;
+  box-shadow: var(--shadow-e1);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: var(--r-menu-item);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.status-badge.done {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.status-badge.running {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.status-badge.warning {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.status-badge.error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.progress-track {
+  width: 100%;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--surface-pressed);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
+/* Desktop Context Popovers (K/Menu riwayat 216px, K/Menu akun, K/Menu bahasa) */
+.context-popover {
+  position: fixed;
+  min-width: 216px;
+  padding: 6px;
+  border-radius: var(--r-popover);
+  z-index: 60;
+  animation: popoverIn var(--dur-popover-in) var(--ease-spring);
+}
+
+@keyframes popoverIn {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.menu-item-btn {
+  width: 100%;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--r-menu-item);
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+}
+
+.menu-item-btn:hover {
+  background: var(--surface-hover);
+}
+
+.menu-item-btn.danger {
+  color: var(--danger);
+}
+
+.menu-item-btn.danger:hover {
+  background: var(--danger-soft);
+}
+
+.menu-item-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.menu-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 2px;
+}
+
+/* Scrim, Modals, Mobile Drawer (Laci 320px) & Mobile Bottom Sheet (K/Lembar bawah) */
+.scrim-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.modal-dialog {
+  width: min(620px, 100%);
+  max-height: min(86dvh, 720px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-dialog);
+  box-shadow: var(--shadow-e2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.modal-title {
+  margin: 0;
+  font-size: 17px;
+  line-height: 24px;
+  font-weight: 600;
+}
+
+.modal-body {
+  padding: 20px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.modal-footer {
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* Bottom Sheet Mobile (K/Lembar bawah) */
+.bottom-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  z-index: 65;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.bottom-sheet {
+  width: 100%;
+  max-width: 480px;
+  border-radius: var(--r-island) var(--r-island) 0 0;
+  padding: 4px 16px calc(28px + env(safe-area-inset-bottom, 0px)) 16px;
+  animation: sheetUp var(--dur-sheet-in) var(--ease-sheet);
+}
+
+@keyframes sheetUp {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.sheet-handle-btn {
+  width: 100%;
+  height: 36px;
+  min-height: 44px;
+  border: none;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.sheet-handle-pill {
+  width: 38px;
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--border-strong);
+}
+
+.sheet-row-btn {
+  width: 100%;
+  min-height: 52px;
+  padding: 0 12px;
+  border: none;
+  border-radius: var(--r-control);
+  background: transparent;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 20px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.sheet-row-btn:hover,
+.sheet-row-btn:active {
+  background: var(--surface-hover);
+}
+
+.sheet-row-btn.danger {
+  color: var(--danger);
+}
+
+/* K/Toast with Undo */
+.toast-container {
+  position: fixed;
+  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast-bar {
+  pointer-events: auto;
+  min-height: 40px;
+  padding: 8px 16px;
+  border-radius: var(--r-control);
+  background: var(--text);
+  color: var(--bg);
+  box-shadow: var(--shadow-e1);
+  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.toast-undo-btn {
+  border: none;
+  background: transparent;
+  color: var(--bg);
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 4px 6px;
+  min-height: 32px;
+}
+
+/* Sub-pages: /berkas, /kamus, /masuk */
+.subpage-container {
+  width: 100%;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 20px 20px 64px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.form-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.field-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.field-input,
+.field-select {
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: var(--r-control);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 15px;
+}
+
+/* Auth Page (/masuk & /masuk/kode) */
+.auth-screen {
+  min-height: 100dvh;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg);
+}
+
+.auth-card {
+  width: min(420px, 100%);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-dialog);
+  padding: 32px 28px;
+  box-shadow: var(--shadow-e1);
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* Tablet Intermediate State (768px..1023px): comfortable sidebar & two-column cards */
+@media (min-width: 768px) and (max-width: 1023px) {
+  .sidebar {
+    width: 228px;
+  }
+
+  .stream-column,
+  .composer-dock-inner,
+  .composer-zone-wrapper {
+    max-width: 660px;
+  }
+}
+
+/* Mobile Distinct Reflow (< 768px): Laci 320px over Scrim, 44x44px tap targets, Mode bar ABOVE Composer */
+@media (max-width: 767px) {
+  .sidebar {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: min(320px, calc(100vw - 56px));
+    z-index: 55;
+    box-shadow: var(--shadow-e2);
+    transform: translateX(0);
+  }
+
+  .sidebar.mobile-closed {
+    transform: translateX(-105%);
+    pointer-events: none;
+  }
+
+  .sidebar-nav-btn,
+  .history-row,
+  .history-row-main {
+    min-height: 44px;
+    font-size: 15px;
+  }
+
+  .history-dots-btn {
+    opacity: 1;
+    width: 44px;
+    height: 44px;
+  }
+
+  .icon-square-btn,
+  .lang-pill-btn,
+  .btn-primary,
+  .btn-secondary,
+  .btn-danger,
+  .action-chip-btn {
+    min-height: 44px;
+  }
+
+  .mic-round-btn,
+  .send-round-btn {
+    width: 44px;
+    height: 44px;
+  }
+
+  .greeting-heading {
+    font-size: 24px;
+    line-height: 30px;
+  }
+
+  .user-bubble {
+    font-size: 16px;
+    line-height: 28px;
+  }
+
+  .assistant-prose {
+    font-size: 17px;
+    line-height: 28px;
+  }
+
+  .stage-body.is-empty {
+    padding: 16px 16px 48px 16px;
+  }
+
+  /* Gemini-Mobile Ergonomics: K/Bilah mode sits ABOVE K/Composer on mobile */
+  .mode-bar-slot {
+    order: 1;
+    width: 100%;
+  }
+
+  .composer-slot {
+    order: 2;
+    width: 100%;
+  }
+
+  .mode-tray {
+    width: 100%;
+    height: 46px;
+    justify-content: space-between;
+    gap: 2px;
+  }
+
+  .mode-seg-btn {
+    flex: 1 1 auto;
+    justify-content: center;
+    height: 38px;
+    padding: 0 7px;
+    gap: 4px;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+
+  .composer-dock {
+    padding: 4px 12px calc(10px + env(safe-area-inset-bottom, 0px) + var(--dur-kb-offset)) 12px;
+  }
+
+  .form-grid-2 {
+    grid-template-columns: 1fr;
+  }
+}

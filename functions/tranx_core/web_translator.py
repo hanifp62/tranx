@@ -1,0 +1,441 @@
+"""Mode Link: Anti-SSRF IP-pinned web fetcher, HTML sanitizer, DOM jptrans translator, and link rewriter."""
+
+from __future__ import annotations
+
+import html as html_lib
+import http.client
+import ipaddress
+import re
+import socket
+import ssl
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import quote, urljoin, urlsplit
+
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+from jptrans.errors import InputError
+from jptrans.models import Document, Paragraph
+from jptrans.pipeline import Translator
+from jptrans.readers.aozora import is_aozora, parse_aozora
+from jptrans.textnorm import contains_japanese
+
+from .cache import LayeredTranslationCache
+from .config import AppSettings, TitleStyle, long_config, parse_mode_target
+from .engines import UsageTracker, build_engine_chain
+from .glossary_store import FirestoreGlossary, glossary_entry_to_dict
+
+MAX_URL_LENGTH = 2048
+MAX_HTML_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_REDIRECTS = 3
+CONNECT_TIMEOUT_SEC = 5.0
+READ_TIMEOUT_SEC = 12.0
+
+CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+ALLOWED_CONTENT_TYPES = ("text/html", "application/xhtml+xml", "text/plain")
+STRIP_TAGS = frozenset(
+    {"script", "noscript", "object", "embed", "applet", "iframe", "frame", "frameset"}
+)
+SKIP_TEXT_PARENTS = frozenset(
+    {"script", "style", "noscript", "code", "pre", "textarea", "svg", "math"}
+)
+ANTIBOT_MARKERS = (
+    "cf-chl-bypass",
+    "challenges.cloudflare.com",
+    "g-recaptcha",
+    "h-captcha",
+    "cf-turnstile",
+    "verify you are human",
+)
+
+
+class SSRFBlockedError(InputError):
+    """Raised when a URL or resolved IP violates anti-SSRF rules."""
+
+
+class WebGateBlockedError(InputError):
+    """Raised when the target page requires login or presents an anti-bot gate."""
+
+
+@dataclass(frozen=True)
+class FetchedPage:
+    final_url: str
+    host: str
+    content_type: str
+    text: str
+
+
+ResolverFn = Callable[[str, int], list[str]]
+HttpFetchFn = Callable[[str], FetchedPage]
+
+
+def default_dns_resolver(host: str, port: int) -> list[str]:
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise SSRFBlockedError(f"Nama domain tidak ditemukan: {host}") from exc
+    addrs: list[str] = []
+    for info in infos:
+        ip_str = str(info[4][0]).split("%", 1)[0]
+        if ip_str not in addrs:
+            addrs.append(ip_str)
+    if not addrs:
+        raise SSRFBlockedError(f"Tidak ada alamat IP publik untuk {host}")
+    return addrs
+
+
+def assert_public_ip(ip_str: str) -> None:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError as exc:
+        raise SSRFBlockedError(f"Alamat IP tidak sah: {ip_str!r}") from exc
+
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+
+    if (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+        or (isinstance(addr, ipaddress.IPv4Address) and addr in CGNAT_NET)
+    ):
+        raise SSRFBlockedError(f"Akses ke alamat internal/privat ditolak ({ip_str})")
+
+
+def validate_and_resolve_url(
+    raw_url: str, *, resolver: ResolverFn = default_dns_resolver
+) -> tuple[Any, str]:
+    """Validate URL scheme/host/port and return (SplitResult, verified_public_ip)."""
+    url = (raw_url or "").strip()
+    if not url or len(url) > MAX_URL_LENGTH:
+        raise SSRFBlockedError("URL kosong atau melebihi batas 2.048 karakter")
+
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise SSRFBlockedError("Hanya skema http:// dan https:// yang diizinkan")
+    if parts.username or parts.password:
+        raise SSRFBlockedError("Kredensial di dalam URL tidak diizinkan")
+
+    host = (parts.hostname or "").strip().lower()
+    if not host or host in ("localhost", "metadata.google.internal") or host.endswith(".local") or host.endswith(".internal"):
+        raise SSRFBlockedError(f"Host tidak diizinkan: {host!r}")
+
+    try:
+        port = parts.port or (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise SSRFBlockedError("Port URL tidak sah") from exc
+    if port not in (80, 443):
+        raise SSRFBlockedError("Hanya port standar 80 dan 443 yang diizinkan")
+
+    # Direct IP literal check before DNS
+    try:
+        ipaddress.ip_address(host)
+        assert_public_ip(host)
+        return parts, host
+    except ValueError:
+        pass
+
+    resolved_ips = resolver(host, port)
+    for ip_str in resolved_ips:
+        assert_public_ip(ip_str)
+    return parts, resolved_ips[0]
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect TCP to a pre-validated IP while verifying TLS SNI against the original hostname."""
+
+    def __init__(self, pinned_ip: str, server_hostname: str, port: int, timeout: float) -> None:
+        super().__init__(server_hostname, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._pinned_ip = pinned_ip
+        self._server_hostname = server_hostname
+
+    def connect(self) -> None:
+        raw_sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw_sock, server_hostname=self._server_hostname)
+
+
+def fetch_url_safely(
+    url: str, *, resolver: ResolverFn = default_dns_resolver
+) -> FetchedPage:
+    """Fetch HTML with IP pinning, redirect re-validation, size limit, and anti-bot check."""
+    current_url = url
+    for _hop in range(MAX_REDIRECTS + 1):
+        parts, pinned_ip = validate_and_resolve_url(current_url, resolver=resolver)
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower()
+        port = parts.port or (443 if scheme == "https" else 80)
+        path_and_query = parts.path or "/"
+        if parts.query:
+            path_and_query = f"{path_and_query}?{parts.query}"
+
+        conn: http.client.HTTPConnection
+        if scheme == "https":
+            conn = _PinnedHTTPSConnection(pinned_ip, host, port, CONNECT_TIMEOUT_SEC)
+        else:
+            conn = http.client.HTTPConnection(pinned_ip, port=port, timeout=CONNECT_TIMEOUT_SEC)
+
+        try:
+            conn.request(
+                "GET",
+                path_and_query,
+                headers={
+                    "Host": host,
+                    "User-Agent": "tranX-Reader/2.1 (+personal-translator)",
+                    "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9",
+                    "Accept-Encoding": "identity",
+                },
+            )
+            conn.sock.settimeout(READ_TIMEOUT_SEC)
+            resp = conn.getresponse()
+            status = resp.status
+
+            if status in (301, 302, 303, 307, 308):
+                location = resp.getheader("Location")
+                if not location:
+                    raise InputError("Situs mengalihkan halaman tanpa tujuan Location")
+                current_url = urljoin(current_url, location)
+                continue
+
+            if status in (401, 403):
+                raise WebGateBlockedError(
+                    "Situs ini memerlukan login pribadi atau membatasi akses otomatis. Buka situs asli di tab baru."
+                )
+            if status >= 400:
+                raise InputError(f"Situs mengembalikan status HTTP {status}")
+
+            ctype_header = (resp.getheader("Content-Type") or "text/html").lower()
+            mime_only = ctype_header.split(";", 1)[0].strip()
+            if not any(mime_only.startswith(allowed) for allowed in ALLOWED_CONTENT_TYPES):
+                raise InputError(f"Tipe konten {mime_only!r} bukan halaman teks/HTML")
+
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                piece = resp.read(65536)
+                if not piece:
+                    break
+                total += len(piece)
+                if total > MAX_HTML_BYTES:
+                    raise InputError("Ukuran halaman web melebihi batas aman 5 MB")
+                chunks.append(piece)
+            raw_bytes = b"".join(chunks)
+        finally:
+            conn.close()
+
+        decoded = _decode_html_bytes(raw_bytes, ctype_header)
+        lower_sample = decoded[:16384].lower()
+        if any(marker in lower_sample for marker in ANTIBOT_MARKERS) and len(decoded) < 25000:
+            raise WebGateBlockedError(
+                "Halaman ini dilindungi tantangan anti-bot/CAPTCHA. Buka situs asli secara langsung."
+            )
+
+        return FetchedPage(
+            final_url=current_url,
+            host=host,
+            content_type=mime_only,
+            text=decoded,
+        )
+
+    raise InputError(f"Terlalu banyak pengalihan URL (> {MAX_REDIRECTS})")
+
+
+def _decode_html_bytes(raw: bytes, content_type_header: str) -> str:
+    m = re.search(r"charset=([A-Za-z0-9_\-]+)", content_type_header, re.I)
+    candidates: list[str] = []
+    if m:
+        candidates.append(m.group(1))
+    meta_match = re.search(br'charset=["\']?([A-Za-z0-9_\-]+)', raw[:4096], re.I)
+    if meta_match:
+        candidates.append(meta_match.group(1).decode("ascii", errors="ignore"))
+    candidates.extend(["utf-8", "shift_jis", "euc_jp", "cp932"])
+
+    for enc in candidates:
+        try:
+            return raw.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def sanitize_soup(soup: BeautifulSoup, final_url: str, rewrite_link_fn: Callable[[str], str]) -> None:
+    """Strip executable scripts/handlers, inject <base>, and rewrite navigable <a href> links."""
+    for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        comment.extract()
+
+    for bad in soup.find_all(STRIP_TAGS):
+        bad.decompose()
+
+    for meta in soup.find_all("meta"):
+        http_equiv = (meta.get("http-equiv") or "").lower()
+        if http_equiv in ("refresh", "content-security-policy"):
+            meta.decompose()
+
+    for tag in soup.find_all(True):
+        if not isinstance(tag, Tag):
+            continue
+        for attr in list(tag.attrs.keys()):
+            low = attr.lower()
+            val = tag.attrs.get(attr)
+            val_str = " ".join(val) if isinstance(val, list) else str(val or "")
+            if low.startswith("on") or low == "srcdoc":
+                del tag.attrs[attr]
+                continue
+            if low in ("href", "src", "action", "formaction"):
+                stripped = val_str.strip().lower()
+                if stripped.startswith(("javascript:", "vbscript:", "data:text/html")):
+                    del tag.attrs[attr]
+
+        if tag.name == "a" and tag.get("href"):
+            href_val = str(tag.get("href")).strip()
+            if not href_val.startswith("#") and not href_val.lower().startswith("mailto:"):
+                abs_target = urljoin(final_url, href_val)
+                if abs_target.startswith(("http://", "https://")):
+                    tag["href"] = rewrite_link_fn(abs_target)
+                    tag["target"] = "_top"
+
+    if soup.head is None:
+        head_tag = soup.new_tag("head")
+        if soup.html:
+            soup.html.insert(0, head_tag)
+        else:
+            soup.insert(0, head_tag)
+
+    for existing_base in soup.head.find_all("base"):
+        existing_base.decompose()
+    base_tag = soup.new_tag("base", href=final_url)
+    soup.head.insert(0, base_tag)
+
+
+def translate_web_page(
+    *,
+    url: str,
+    mode: str,
+    title_id: str | None,
+    view: str,
+    settings: AppSettings,
+    glossary: FirestoreGlossary,
+    cache: LayeredTranslationCache,
+    style: TitleStyle | None = None,
+    fetcher: HttpFetchFn = fetch_url_safely,
+    api_key: str | None = None,
+    usage_tracker: UsageTracker | None = None,
+    llm_transport: Any = None,
+    viewer_route_prefix: str = "/web",
+) -> dict[str, Any]:
+    """Fetch, sanitize, translate DOM text nodes via jptrans, and return preview + full HTML."""
+    page = fetcher(url)
+    target_lang = parse_mode_target(mode, settings.default_target)
+
+    def _rewrite_link(abs_url: str) -> str:
+        q_url = quote(abs_url, safe="")
+        q_mode = quote(f"ja-{target_lang}", safe="")
+        tid_part = f"&titleId={quote(title_id, safe='')}" if title_id else ""
+        return f"{viewer_route_prefix}?url={q_url}&mode={q_mode}{tid_part}"
+
+    is_aozora_page = page.host.endswith("aozora.gr.jp") or is_aozora(page.text)
+    soup = BeautifulSoup(page.text, "html.parser")
+    raw_title = (soup.title.string.strip() if soup.title and soup.title.string else "") or page.host
+
+    sanitize_soup(soup, page.final_url, _rewrite_link)
+
+    if view == "orig":
+        return {
+            "finalUrl": page.final_url,
+            "host": page.host,
+            "isAozora": is_aozora_page,
+            "titleSrc": raw_title,
+            "titleDst": raw_title,
+            "excerptSrc": "",
+            "excerptDst": "",
+            "paragraphCount": 0,
+            "lockedNames": [],
+            "html": str(soup),
+        }
+
+    # Collect Japanese text nodes in document order
+    text_nodes: list[NavigableString] = []
+    paragraphs: list[Paragraph] = []
+    for node in soup.find_all(string=True):
+        if not isinstance(node, NavigableString):
+            continue
+        parent = node.parent
+        if parent is None or parent.name in SKIP_TEXT_PARENTS:
+            continue
+        stripped = str(node).strip()
+        if not stripped or not contains_japanese(stripped):
+            continue
+        text_nodes.append(node)
+        kind = "heading" if parent.name in ("title", "h1", "h2", "h3") else "text"
+        paragraphs.append(Paragraph(text=stripped, kind=kind))
+
+    if not paragraphs and is_aozora_page:
+        aozora_doc = parse_aozora(page.text, raw_title)
+        paragraphs = aozora_doc.paragraphs
+
+    cfg = long_config(settings, target_lang, style=style)
+    engines = build_engine_chain(
+        cfg,
+        settings,
+        api_key=api_key,
+        usage_tracker=usage_tracker,
+        transport=llm_transport,
+    )
+
+    title_dst = raw_title
+    excerpt_src = ""
+    excerpt_dst = ""
+
+    if paragraphs:
+        doc = Document(title=glossary.title or raw_title, paragraphs=paragraphs, fmt="html")
+        with Translator(cfg, engines, cache, glossary) as tr:
+            translated = tr.translate_document(doc)
+
+        if text_nodes and len(translated.paragraphs) == len(text_nodes):
+            for node, tpara in zip(text_nodes, translated.paragraphs):
+                dst_txt = tpara.target or tpara.source.text
+                orig_str = str(node)
+                lead_ws = orig_str[: len(orig_str) - len(orig_str.lstrip())]
+                trail_ws = orig_str[len(orig_str.rstrip()) :]
+                node.replace_with(NavigableString(f"{lead_ws}{dst_txt}{trail_ws}"))
+            if soup.title and soup.title.string:
+                title_dst = soup.title.string.strip()
+        else:
+            # Plain text / Aozora clean HTML fallback
+            body_html = "\n".join(
+                f"<p>{html_lib.escape(tp.target or tp.source.text)}</p>"
+                for tp in translated.paragraphs
+            )
+            soup = BeautifulSoup(
+                f"<!doctype html><html><head><title>{html_lib.escape(raw_title)}</title></head>"
+                f"<body><article>{body_html}</article></body></html>",
+                "html.parser",
+            )
+            sanitize_soup(soup, page.final_url, _rewrite_link)
+
+        body_paras = [tp for tp in translated.paragraphs if tp.source.kind != "heading"] or translated.paragraphs
+        excerpt_src = " ".join(tp.source.text for tp in body_paras[:2])[:260]
+        excerpt_dst = " ".join((tp.target or tp.source.text) for tp in body_paras[:2])[:280]
+        if translated.paragraphs and title_dst == raw_title and translated.paragraphs[0].source.kind == "heading":
+            title_dst = translated.paragraphs[0].target or raw_title
+
+    locked = [
+        glossary_entry_to_dict(e)
+        for e in glossary.non_builtin_entries()
+        if e.confirmed
+    ]
+    return {
+        "finalUrl": page.final_url,
+        "host": page.host,
+        "isAozora": is_aozora_page,
+        "titleSrc": raw_title,
+        "titleDst": title_dst,
+        "excerptSrc": excerpt_src,
+        "excerptDst": excerpt_dst,
+        "paragraphCount": len(paragraphs),
+        "lockedNames": locked,
+        "html": str(soup),
+    }

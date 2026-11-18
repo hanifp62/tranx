@@ -1,0 +1,317 @@
+import type { UiLang } from '../types';
+
+export interface UiStrings {
+  greeting: string;
+  pasteAndTranslate: string;
+  composerPlaceholder: string;
+  composerImagePlaceholder: string;
+  composerDocPlaceholder: string;
+  composerLinkPlaceholder: string;
+  modeText: string;
+  modeImage: string;
+  modeDocument: string;
+  modeLink: string;
+  langJaId: string;
+  langJaEn: string;
+  langMenuTitle: string;
+  sourceAutoHint: string;
+  sidebarNew: string;
+  sidebarSearch: string;
+  sidebarSearchPlaceholder: string;
+  sidebarMore: string;
+  myFiles: string;
+  glossary: string;
+  shortcuts: string;
+  pinnedSection: string;
+  recentSection: string;
+  emptyHistory: string;
+  noSearchMatch: string;
+  pinChat: string;
+  pinToTop: string;
+  unpinChat: string;
+  renameChat: string;
+  shareChat: string;
+  deleteChat: string;
+  deleteHistoryMobile: string;
+  settings: string;
+  uiLanguage: string;
+  help: string;
+  sendFeedback: string;
+  learnMore: string;
+  signOut: string;
+  signOutTitle: string;
+  signOutBody: string;
+  cancel: string;
+  save: string;
+  undo: string;
+  copiedToast: string;
+  pinnedToast: string;
+  unpinnedToast: string;
+  langChangedToast: string;
+  deletedToast: string;
+  dictationListening: string;
+  dictationStop: string;
+  dictationStart: string;
+  send: string;
+  stop: string;
+  showAll: string;
+  showLess: string;
+  editSource: string;
+  copyTranslation: string;
+  retranslate: string;
+  selectText: string;
+  sideBySide: string;
+  imageOverlay: string;
+  takeCameraPhoto: string;
+  pickFromGallery: string;
+  pickImage: string;
+  downloadImage: string;
+  copyText: string;
+  pickDocument: string;
+  dropFilesHere: string;
+  supportedDocHint: string;
+  supportedImageHint: string;
+  pasteLinkLabel: string;
+  translateLinkBtn: string;
+  openFullTranslatedPage: string;
+  openOriginalSite: string;
+  downloadResult: string;
+  readSideBySide: string;
+  resumeTranslation: string;
+  retryNow: string;
+  pickAnotherFile: string;
+  lockName: string;
+  lockedBadge: string;
+  loginSubtitle: string;
+  loginWithGoogle: string;
+  loginWithPairCode: string;
+  pairCodeTitle: string;
+  pairCodeHint: string;
+  pairSubmit: string;
+  backToLogin: string;
+  notOwnerError: string;
+  offlineBanner: string;
+  settingsGeneral: string;
+  settingsAccount: string;
+  settingsData: string;
+  settingsAdvanced: string;
+  themeLabel: string;
+  themeSystem: string;
+  themeLight: string;
+  themeDark: string;
+  defaultTargetLabel: string;
+  inboxFromShortcut: string;
+  translateNow: string;
+  dismiss: string;
+}
+
+export const STRINGS: Record<UiLang, UiStrings> = {
+  id: {
+    greeting: 'Mau baca apa hari ini?',
+    pasteAndTranslate: 'Tempel dan terjemahkan',
+    composerPlaceholder: 'Ketik atau tempel teks, atau mulai bicara...',
+    composerImagePlaceholder: 'Tambahkan catatan konteks tokoh bila perlu...',
+    composerDocPlaceholder: 'Tambahkan petunjuk judul karya bila perlu...',
+    composerLinkPlaceholder: 'Tempel tautan artikel atau bab web Jepang (https://...)',
+    modeText: 'Teks',
+    modeImage: 'Gambar',
+    modeDocument: 'Dokumen',
+    modeLink: 'Link',
+    langJaId: 'Jepang \u2192 Indonesia',
+    langJaEn: 'Jepang \u2192 Inggris',
+    langMenuTitle: 'Bahasa terjemahan',
+    sourceAutoHint: 'Sumber bahasa Jepang dikenali otomatis.',
+    sidebarNew: 'Baru',
+    sidebarSearch: 'Cari',
+    sidebarSearchPlaceholder: 'Cari judul atau isi bacaan...',
+    sidebarMore: 'Lainnya',
+    myFiles: 'Berkas saya',
+    glossary: 'Daftar nama',
+    shortcuts: 'Pintasan keyboard',
+    pinnedSection: 'Disematkan',
+    recentSection: 'Terbaru',
+    emptyHistory: 'Belum ada riwayat bacaan. Kirim teks, gambar, dokumen, atau tautan untuk memulai.',
+    noSearchMatch: 'Tidak ada percakapan yang cocok dengan kata kunci tersebut.',
+    pinChat: 'Sematkan',
+    pinToTop: 'Sematkan ke atas',
+    unpinChat: 'Lepas sematan',
+    renameChat: 'Ganti nama',
+    shareChat: 'Bagikan',
+    deleteChat: 'Hapus',
+    deleteHistoryMobile: 'Hapus riwayat',
+    settings: 'Setelan',
+    uiLanguage: 'Bahasa tampilan',
+    help: 'Bantuan',
+    sendFeedback: 'Kirim masukan',
+    learnMore: 'Pelajari lebih lanjut',
+    signOut: 'Keluar',
+    signOutTitle: 'Keluar dari tranX?',
+    signOutBody: 'Riwayat percakapan dan daftar nama tetap tersimpan aman di akun Anda.',
+    cancel: 'Batal',
+    save: 'Simpan',
+    undo: 'Urungkan',
+    copiedToast: 'Terjemahan disalin',
+    pinnedToast: 'Percakapan disematkan ke atas',
+    unpinnedToast: 'Sematan dilepas',
+    langChangedToast: 'Bahasa tampilan diubah ke Indonesia',
+    deletedToast: 'Percakapan dihapus',
+    dictationListening: 'Mendengarkan bahasa Jepang...',
+    dictationStop: 'Selesai bicara',
+    dictationStart: 'Dikte suara',
+    send: 'Kirim',
+    stop: 'Hentikan',
+    showAll: 'Tampilkan semua',
+    showLess: 'Ringkas sumber',
+    editSource: 'Sunting sumber',
+    copyTranslation: 'Salin',
+    retranslate: 'Terjemahkan ulang',
+    selectText: 'Pilih teks',
+    sideBySide: 'Berdampingan',
+    imageOverlay: 'Hamparan gambar',
+    takeCameraPhoto: 'Ambil foto kamera',
+    pickFromGallery: 'Galeri',
+    pickImage: 'Pilih gambar',
+    downloadImage: 'Unduh gambar',
+    copyText: 'Salin teks',
+    pickDocument: 'Pilih berkas',
+    dropFilesHere: 'Lepaskan berkas di sini untuk diterjemahkan',
+    supportedDocHint: 'Mendukung .epub, .pdf, .docx, .srt, .vtt, .ass, .html, .md, .txt hingga 50 MB.',
+    supportedImageHint: 'Tarik tangkapan layar, halaman manga, atau foto teks Jepang (.png, .jpg, .webp).',
+    pasteLinkLabel: 'Alamat halaman web Jepang',
+    translateLinkBtn: 'Terjemahkan halaman',
+    openFullTranslatedPage: 'Buka halaman terjemahan penuh',
+    openOriginalSite: 'Buka situs asli',
+    downloadResult: 'Unduh',
+    readSideBySide: 'Baca berdampingan',
+    resumeTranslation: 'Lanjutkan',
+    retryNow: 'Coba sekarang',
+    pickAnotherFile: 'Pilih berkas lain',
+    lockName: 'Kunci ejaan nama',
+    lockedBadge: 'Terkunci',
+    loginSubtitle: 'Ruang baca lintas perangkat untuk teks, gambar, dokumen, dan tautan berbahasa Jepang.',
+    loginWithGoogle: 'Masuk dengan Google',
+    loginWithPairCode: 'Masuk dengan kode pasangan 6 angka',
+    pairCodeTitle: 'Pasangkan perangkat',
+    pairCodeHint: 'Buka Setelan \u2192 Akun di perangkat utama Anda, lalu masukkan 6 angka kode pasangan.',
+    pairSubmit: 'Masuk dengan kode',
+    backToLogin: 'Kembali ke halaman masuk',
+    notOwnerError: 'Akses ditolak. Aplikasi pribadi ini terkunci khusus untuk akun pemilik.',
+    offlineBanner: 'Koneksi terputus. Anda tetap dapat membaca riwayat dan daftar nama tersimpan.',
+    settingsGeneral: 'Umum',
+    settingsAccount: 'Akun',
+    settingsData: 'Data',
+    settingsAdvanced: 'Lanjutan',
+    themeLabel: 'Tema tampilan',
+    themeSystem: 'Ikuti sistem',
+    themeLight: 'Terang',
+    themeDark: 'Gelap',
+    defaultTargetLabel: 'Bahasa tujuan bawaan',
+    inboxFromShortcut: 'Kiriman baru dari Pintasan',
+    translateNow: 'Terjemahkan sekarang',
+    dismiss: 'Abaikan',
+  },
+  en: {
+    greeting: 'What would you like to read today?',
+    pasteAndTranslate: 'Paste and translate',
+    composerPlaceholder: 'Type or paste Japanese text, or start speaking...',
+    composerImagePlaceholder: 'Add character context notes if needed...',
+    composerDocPlaceholder: 'Add series or work title hint if needed...',
+    composerLinkPlaceholder: 'Paste a Japanese article or chapter URL (https://...)',
+    modeText: 'Text',
+    modeImage: 'Image',
+    modeDocument: 'Document',
+    modeLink: 'Link',
+    langJaId: 'Japanese \u2192 Indonesian',
+    langJaEn: 'Japanese \u2192 English',
+    langMenuTitle: 'Target language',
+    sourceAutoHint: 'Japanese source is detected automatically.',
+    sidebarNew: 'New',
+    sidebarSearch: 'Search',
+    sidebarSearchPlaceholder: 'Search titles or reading history...',
+    sidebarMore: 'More',
+    myFiles: 'My files',
+    glossary: 'Name glossary',
+    shortcuts: 'Keyboard shortcuts',
+    pinnedSection: 'Pinned',
+    recentSection: 'Recent',
+    emptyHistory: 'No reading history yet. Send text, an image, a document, or a link to start.',
+    noSearchMatch: 'No conversations match that search query.',
+    pinChat: 'Pin',
+    pinToTop: 'Pin to top',
+    unpinChat: 'Unpin',
+    renameChat: 'Rename',
+    shareChat: 'Share',
+    deleteChat: 'Delete',
+    deleteHistoryMobile: 'Delete history',
+    settings: 'Settings',
+    uiLanguage: 'Display language',
+    help: 'Help',
+    sendFeedback: 'Send feedback',
+    learnMore: 'Learn more',
+    signOut: 'Sign out',
+    signOutTitle: 'Sign out of tranX?',
+    signOutBody: 'Your conversation history and locked character names stay safely synced.',
+    cancel: 'Cancel',
+    save: 'Save',
+    undo: 'Undo',
+    copiedToast: 'Translation copied',
+    pinnedToast: 'Conversation pinned to top',
+    unpinnedToast: 'Conversation unpinned',
+    langChangedToast: 'Display language changed to English',
+    deletedToast: 'Conversation deleted',
+    dictationListening: 'Listening in Japanese...',
+    dictationStop: 'Finish speaking',
+    dictationStart: 'Voice dictation',
+    send: 'Send',
+    stop: 'Stop',
+    showAll: 'Show full source',
+    showLess: 'Collapse source',
+    editSource: 'Edit source',
+    copyTranslation: 'Copy',
+    retranslate: 'Retranslate',
+    selectText: 'Select text',
+    sideBySide: 'Side by side',
+    imageOverlay: 'Image overlay',
+    takeCameraPhoto: 'Take camera photo',
+    pickFromGallery: 'Gallery',
+    pickImage: 'Choose image',
+    downloadImage: 'Download image',
+    copyText: 'Copy text',
+    pickDocument: 'Choose file',
+    dropFilesHere: 'Drop file here to translate',
+    supportedDocHint: 'Supports .epub, .pdf, .docx, .srt, .vtt, .ass, .html, .md, .txt up to 50 MB.',
+    supportedImageHint: 'Drop a screenshot, manga page, or photo with Japanese text (.png, .jpg, .webp).',
+    pasteLinkLabel: 'Japanese web page URL',
+    translateLinkBtn: 'Translate page',
+    openFullTranslatedPage: 'Open full translated page',
+    openOriginalSite: 'Open original site',
+    downloadResult: 'Download',
+    readSideBySide: 'Read side by side',
+    resumeTranslation: 'Resume',
+    retryNow: 'Retry now',
+    pickAnotherFile: 'Choose another file',
+    lockName: 'Lock name spelling',
+    lockedBadge: 'Locked',
+    loginSubtitle: 'Cross-device reading workspace for Japanese text, images, documents, and web links.',
+    loginWithGoogle: 'Sign in with Google',
+    loginWithPairCode: 'Sign in with 6-digit pair code',
+    pairCodeTitle: 'Pair this device',
+    pairCodeHint: 'Open Settings \u2192 Account on your primary device and enter the 6-digit code.',
+    pairSubmit: 'Sign in with code',
+    backToLogin: 'Back to sign in',
+    notOwnerError: 'Access denied. This personal app is locked to the owner account.',
+    offlineBanner: 'You are offline. Saved history and character glossaries remain available.',
+    settingsGeneral: 'General',
+    settingsAccount: 'Account',
+    settingsData: 'Data',
+    settingsAdvanced: 'Advanced',
+    themeLabel: 'Appearance',
+    themeSystem: 'Match system',
+    themeLight: 'Light',
+    themeDark: 'Dark',
+    defaultTargetLabel: 'Default target language',
+    inboxFromShortcut: 'New capture from Shortcuts',
+    translateNow: 'Translate now',
+    dismiss: 'Dismiss',
+  },
+};

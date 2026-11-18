@@ -1,0 +1,627 @@
+{
+  "日本": {
+    "id": "Jepang",
+    "en": "Japan",
+    "reading": "にほん"
+  },
+  "中国": {
+    "id": "Tiongkok",
+    "en": "China",
+    "reading": "ちゅうごく"
+  },
+  "韓国": {
+    "id": "Korea Selatan",
+    "en": "South Korea",
+    "reading": "かんこく"
+  },
+  "台湾": {
+    "id": "Taiwan",
+    "en": "Taiwan",
+    "reading": "たいわん"
+  },
+  "北海道": {
+    "id": "Hokkaido",
+    "en": "Hokkaido",
+    "reading": "ほっかいどう"
+  },
+  "青森": {
+    "id": "Aomori",
+    "en": "Aomori",
+    "reading": "あおもり"
+  },
+  "岩手": {
+    "id": "Iwate",
+    "en": "Iwate",
+    "reading": "いわて"
+  },
+  "宮城": {
+    "id": "Miyagi",
+    "en": "Miyagi",
+    "reading": "みやぎ"
+  },
+  "秋田": {
+    "id": "Akita",
+    "en": "Akita",
+    "reading": "あきた"
+  },
+  "山形": {
+    "id": "Yamagata",
+    "en": "Yamagata",
+    "reading": "やまがた"
+  },
+  "福島": {
+    "id": "Fukushima",
+    "en": "Fukushima",
+    "reading": "ふくしま"
+  },
+  "茨城": {
+    "id": "Ibaraki",
+    "en": "Ibaraki",
+    "reading": "いばらき"
+  },
+  "栃木": {
+    "id": "Tochigi",
+    "en": "Tochigi",
+    "reading": "とちぎ"
+  },
+  "群馬": {
+    "id": "Gunma",
+    "en": "Gunma",
+    "reading": "ぐんま"
+  },
+  "埼玉": {
+    "id": "Saitama",
+    "en": "Saitama",
+    "reading": "さいたま"
+  },
+  "千葉": {
+    "id": "Chiba",
+    "en": "Chiba",
+    "reading": "ちば"
+  },
+  "東京": {
+    "id": "Tokyo",
+    "en": "Tokyo",
+    "reading": "とうきょう"
+  },
+  "神奈川": {
+    "id": "Kanagawa",
+    "en": "Kanagawa",
+    "reading": "かながわ"
+  },
+  "新潟": {
+    "id": "Niigata",
+    "en": "Niigata",
+    "reading": "にいがた"
+  },
+  "富山": {
+    "id": "Toyama",
+    "en": "Toyama",
+    "reading": "とやま"
+  },
+  "石川": {
+    "id": "Ishikawa",
+    "en": "Ishikawa",
+    "reading": "いしかわ"
+  },
+  "福井": {
+    "id": "Fukui",
+    "en": "Fukui",
+    "reading": "ふくい"
+  },
+  "山梨": {
+    "id": "Yamanashi",
+    "en": "Yamanashi",
+    "reading": "やまなし"
+  },
+  "長野": {
+    "id": "Nagano",
+    "en": "Nagano",
+    "reading": "ながの"
+  },
+  "岐阜": {
+    "id": "Gifu",
+    "en": "Gifu",
+    "reading": "ぎふ"
+  },
+  "静岡": {
+    "id": "Shizuoka",
+    "en": "Shizuoka",
+    "reading": "しずおか"
+  },
+  "愛知": {
+    "id": "Aichi",
+    "en": "Aichi",
+    "reading": "あいち"
+  },
+  "三重": {
+    "id": "Mie",
+    "en": "Mie",
+    "reading": "みえ"
+  },
+  "滋賀": {
+    "id": "Shiga",
+    "en": "Shiga",
+    "reading": "しが"
+  },
+  "京都": {
+    "id": "Kyoto",
+    "en": "Kyoto",
+    "reading": "きょうと"
+  },
+  "大阪": {
+    "id": "Osaka",
+    "en": "Osaka",
+    "reading": "おおさか"
+  },
+  "兵庫": {
+    "id": "Hyogo",
+    "en": "Hyogo",
+    "reading": "ひょうご"
+  },
+  "奈良": {
+    "id": "Nara",
+    "en": "Nara",
+    "reading": "なら"
+  },
+  "和歌山": {
+    "id": "Wakayama",
+    "en": "Wakayama",
+    "reading": "わかやま"
+  },
+  "鳥取": {
+    "id": "Tottori",
+    "en": "Tottori",
+    "reading": "とっとり"
+  },
+  "島根": {
+    "id": "Shimane",
+    "en": "Shimane",
+    "reading": "しまね"
+  },
+  "岡山": {
+    "id": "Okayama",
+    "en": "Okayama",
+    "reading": "おかやま"
+  },
+  "広島": {
+    "id": "Hiroshima",
+    "en": "Hiroshima",
+    "reading": "ひろしま"
+  },
+  "山口": {
+    "id": "Yamaguchi",
+    "en": "Yamaguchi",
+    "reading": "やまぐち"
+  },
+  "徳島": {
+    "id": "Tokushima",
+    "en": "Tokushima",
+    "reading": "とくしま"
+  },
+  "香川": {
+    "id": "Kagawa",
+    "en": "Kagawa",
+    "reading": "かがわ"
+  },
+  "愛媛": {
+    "id": "Ehime",
+    "en": "Ehime",
+    "reading": "えひめ"
+  },
+  "高知": {
+    "id": "Kochi",
+    "en": "Kochi",
+    "reading": "こうち"
+  },
+  "福岡": {
+    "id": "Fukuoka",
+    "en": "Fukuoka",
+    "reading": "ふくおか"
+  },
+  "佐賀": {
+    "id": "Saga",
+    "en": "Saga",
+    "reading": "さが"
+  },
+  "長崎": {
+    "id": "Nagasaki",
+    "en": "Nagasaki",
+    "reading": "ながさき"
+  },
+  "熊本": {
+    "id": "Kumamoto",
+    "en": "Kumamoto",
+    "reading": "くまもと"
+  },
+  "大分": {
+    "id": "Oita",
+    "en": "Oita",
+    "reading": "おおいた"
+  },
+  "宮崎": {
+    "id": "Miyazaki",
+    "en": "Miyazaki",
+    "reading": "みやざき"
+  },
+  "鹿児島": {
+    "id": "Kagoshima",
+    "en": "Kagoshima",
+    "reading": "かごしま"
+  },
+  "沖縄": {
+    "id": "Okinawa",
+    "en": "Okinawa",
+    "reading": "おきなわ"
+  },
+  "横浜": {
+    "id": "Yokohama",
+    "en": "Yokohama",
+    "reading": "よこはま"
+  },
+  "名古屋": {
+    "id": "Nagoya",
+    "en": "Nagoya",
+    "reading": "なごや"
+  },
+  "札幌": {
+    "id": "Sapporo",
+    "en": "Sapporo",
+    "reading": "さっぽろ"
+  },
+  "神戸": {
+    "id": "Kobe",
+    "en": "Kobe",
+    "reading": "こうべ"
+  },
+  "仙台": {
+    "id": "Sendai",
+    "en": "Sendai",
+    "reading": "せんだい"
+  },
+  "川崎": {
+    "id": "Kawasaki",
+    "en": "Kawasaki",
+    "reading": "かわさき"
+  },
+  "横須賀": {
+    "id": "Yokosuka",
+    "en": "Yokosuka",
+    "reading": "よこすか"
+  },
+  "鎌倉": {
+    "id": "Kamakura",
+    "en": "Kamakura",
+    "reading": "かまくら"
+  },
+  "箱根": {
+    "id": "Hakone",
+    "en": "Hakone",
+    "reading": "はこね"
+  },
+  "金沢": {
+    "id": "Kanazawa",
+    "en": "Kanazawa",
+    "reading": "かなざわ"
+  },
+  "函館": {
+    "id": "Hakodate",
+    "en": "Hakodate",
+    "reading": "はこだて"
+  },
+  "小樽": {
+    "id": "Otaru",
+    "en": "Otaru",
+    "reading": "おたる"
+  },
+  "博多": {
+    "id": "Hakata",
+    "en": "Hakata",
+    "reading": "はかた"
+  },
+  "渋谷": {
+    "id": "Shibuya",
+    "en": "Shibuya",
+    "reading": "しぶや"
+  },
+  "新宿": {
+    "id": "Shinjuku",
+    "en": "Shinjuku",
+    "reading": "しんじゅく"
+  },
+  "池袋": {
+    "id": "Ikebukuro",
+    "en": "Ikebukuro",
+    "reading": "いけぶくろ"
+  },
+  "秋葉原": {
+    "id": "Akihabara",
+    "en": "Akihabara",
+    "reading": "あきはばら"
+  },
+  "原宿": {
+    "id": "Harajuku",
+    "en": "Harajuku",
+    "reading": "はらじゅく"
+  },
+  "銀座": {
+    "id": "Ginza",
+    "en": "Ginza",
+    "reading": "ぎんざ"
+  },
+  "浅草": {
+    "id": "Asakusa",
+    "en": "Asakusa",
+    "reading": "あさくさ"
+  },
+  "六本木": {
+    "id": "Roppongi",
+    "en": "Roppongi",
+    "reading": "ろっぽんぎ"
+  },
+  "品川": {
+    "id": "Shinagawa",
+    "en": "Shinagawa",
+    "reading": "しながわ"
+  },
+  "上野": {
+    "id": "Ueno",
+    "en": "Ueno",
+    "reading": "うえの"
+  },
+  "富士": {
+    "id": "Fuji",
+    "en": "Fuji",
+    "reading": "ふじ"
+  },
+  "関東": {
+    "id": "Kanto",
+    "en": "Kanto",
+    "reading": "かんとう"
+  },
+  "関西": {
+    "id": "Kansai",
+    "en": "Kansai",
+    "reading": "かんさい"
+  },
+  "九州": {
+    "id": "Kyushu",
+    "en": "Kyushu",
+    "reading": "きゅうしゅう"
+  },
+  "四国": {
+    "id": "Shikoku",
+    "en": "Shikoku",
+    "reading": "しこく"
+  },
+  "江戸": {
+    "id": "Edo",
+    "en": "Edo",
+    "reading": "えど"
+  },
+  "盛岡": {
+    "id": "Morioka",
+    "en": "Morioka",
+    "reading": "もりおか"
+  },
+  "水戸": {
+    "id": "Mito",
+    "en": "Mito",
+    "reading": "みと"
+  },
+  "宇都宮": {
+    "id": "Utsunomiya",
+    "en": "Utsunomiya",
+    "reading": "うつのみや"
+  },
+  "前橋": {
+    "id": "Maebashi",
+    "en": "Maebashi",
+    "reading": "まえばし"
+  },
+  "甲府": {
+    "id": "Kofu",
+    "en": "Kofu",
+    "reading": "こうふ"
+  },
+  "津": {
+    "id": "Tsu",
+    "en": "Tsu",
+    "reading": "つ"
+  },
+  "大津": {
+    "id": "Otsu",
+    "en": "Otsu",
+    "reading": "おおつ"
+  },
+  "松江": {
+    "id": "Matsue",
+    "en": "Matsue",
+    "reading": "まつえ"
+  },
+  "高松": {
+    "id": "Takamatsu",
+    "en": "Takamatsu",
+    "reading": "たかまつ"
+  },
+  "松山": {
+    "id": "Matsuyama",
+    "en": "Matsuyama",
+    "reading": "まつやま"
+  },
+  "那覇": {
+    "id": "Naha",
+    "en": "Naha",
+    "reading": "なは"
+  },
+  "北九州": {
+    "id": "Kitakyushu",
+    "en": "Kitakyushu",
+    "reading": "きたきゅうしゅう"
+  },
+  "堺": {
+    "id": "Sakai",
+    "en": "Sakai",
+    "reading": "さかい"
+  },
+  "浜松": {
+    "id": "Hamamatsu",
+    "en": "Hamamatsu",
+    "reading": "はままつ"
+  },
+  "相模原": {
+    "id": "Sagamihara",
+    "en": "Sagamihara",
+    "reading": "さがみはら"
+  },
+  "船橋": {
+    "id": "Funabashi",
+    "en": "Funabashi",
+    "reading": "ふなばし"
+  },
+  "川口": {
+    "id": "Kawaguchi",
+    "en": "Kawaguchi",
+    "reading": "かわぐち"
+  },
+  "八王子": {
+    "id": "Hachioji",
+    "en": "Hachioji",
+    "reading": "はちおうじ"
+  },
+  "姫路": {
+    "id": "Himeji",
+    "en": "Himeji",
+    "reading": "ひめじ"
+  },
+  "東大阪": {
+    "id": "Higashiosaka",
+    "en": "Higashiosaka",
+    "reading": "ひがしおおさか"
+  },
+  "西宮": {
+    "id": "Nishinomiya",
+    "en": "Nishinomiya",
+    "reading": "にしのみや"
+  },
+  "市川": {
+    "id": "Ichikawa",
+    "en": "Ichikawa",
+    "reading": "いちかわ"
+  },
+  "倉敷": {
+    "id": "Kurashiki",
+    "en": "Kurashiki",
+    "reading": "くらしき"
+  },
+  "福山": {
+    "id": "Fukuyama",
+    "en": "Fukuyama",
+    "reading": "ふくやま"
+  },
+  "尼崎": {
+    "id": "Amagasaki",
+    "en": "Amagasaki",
+    "reading": "あまがさき"
+  },
+  "町田": {
+    "id": "Machida",
+    "en": "Machida",
+    "reading": "まちだ"
+  },
+  "豊田": {
+    "id": "Toyota",
+    "en": "Toyota",
+    "reading": "とよた"
+  },
+  "藤沢": {
+    "id": "Fujisawa",
+    "en": "Fujisawa",
+    "reading": "ふじさわ"
+  },
+  "枚方": {
+    "id": "Hirakata",
+    "en": "Hirakata",
+    "reading": "ひらかた"
+  },
+  "豊中": {
+    "id": "Toyonaka",
+    "en": "Toyonaka",
+    "reading": "とよなか"
+  },
+  "一宮": {
+    "id": "Ichinomiya",
+    "en": "Ichinomiya",
+    "reading": "いちのみや"
+  },
+  "岡崎": {
+    "id": "Okazaki",
+    "en": "Okazaki",
+    "reading": "おかざき"
+  },
+  "高崎": {
+    "id": "Takasaki",
+    "en": "Takasaki",
+    "reading": "たかさき"
+  },
+  "吹田": {
+    "id": "Suita",
+    "en": "Suita",
+    "reading": "すいた"
+  },
+  "高槻": {
+    "id": "Takatsuki",
+    "en": "Takatsuki",
+    "reading": "たかつき"
+  },
+  "旭川": {
+    "id": "Asahikawa",
+    "en": "Asahikawa",
+    "reading": "あさひかわ"
+  },
+  "郡山": {
+    "id": "Koriyama",
+    "en": "Koriyama",
+    "reading": "こおりやま"
+  },
+  "川越": {
+    "id": "Kawagoe",
+    "en": "Kawagoe",
+    "reading": "かわごえ"
+  },
+  "所沢": {
+    "id": "Tokorozawa",
+    "en": "Tokorozawa",
+    "reading": "ところざわ"
+  },
+  "越谷": {
+    "id": "Koshigaya",
+    "en": "Koshigaya",
+    "reading": "こしがや"
+  },
+  "松戸": {
+    "id": "Matsudo",
+    "en": "Matsudo",
+    "reading": "まつど"
+  },
+  "久留米": {
+    "id": "Kurume",
+    "en": "Kurume",
+    "reading": "くるめ"
+  },
+  "春日井": {
+    "id": "Kasugai",
+    "en": "Kasugai",
+    "reading": "かすがい"
+  },
+  "四日市": {
+    "id": "Yokkaichi",
+    "en": "Yokkaichi",
+    "reading": "よっかいち"
+  },
+  "下関": {
+    "id": "Shimonoseki",
+    "en": "Shimonoseki",
+    "reading": "しものせき"
+  }
+}

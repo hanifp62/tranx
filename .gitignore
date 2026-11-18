@@ -1,0 +1,39 @@
+# Python & virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+functions/venv/
+functions/.venv/
+
+# Node & frontend build
+node_modules/
+web/node_modules/
+web/dist/
+web/dev-dist/
+playwright-report/
+test-results/
+web/playwright-report/
+web/test-results/
+
+# Firebase & local secrets
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+storage-debug.log
+pubsub-debug.log
+.env
+.env.*
+!.env.example
+!web/.env.example
+functions/.env
+functions/.env.*
+!functions/.env.example
+web/.env.local
+
+# OS metadata
+.DS_Store

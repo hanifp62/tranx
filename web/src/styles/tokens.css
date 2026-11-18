@@ -1,0 +1,138 @@
+/* Sistem Desain tranX v3: Ruang Baca Tinta Sumi & Kaca Optik */
+:root {
+  color-scheme: light;
+
+  /* 3-Pigment Japanese Sumi, Rokusho & Shu Semantic Palette (Terang) */
+  --bg: #FAFBFA;
+  --bg-sidebar: #F1F3F2;
+  --surface: #FFFFFF;
+  --surface-hover: #ECEFED;
+  --surface-pressed: #E2E6E4;
+  --border: #DEE3E0;
+  --border-strong: #78817E;
+  --text: #141917;
+  --text-muted: #4F5855;
+  --text-subtle: #646D6A;
+  --accent: #17695B;
+  --accent-hover: #10574B;
+  --on-accent: #FFFFFF;
+  --accent-soft: #E0EFEA;
+  --success: #2B6B2E;
+  --success-soft: #E4F1E3;
+  --warning: #7E4E00;
+  --warning-soft: #FAEFD9;
+  --danger: #B42A1E;
+  --danger-soft: #FBE7E4;
+  --focus-ring: #17695B;
+  --bubble-user: #EEF1EF;
+  --overlay: rgba(20, 25, 23, 0.40);
+  --brand-tile: #17695B;
+  --brand-on-tile: #F4FBF8;
+
+  /* Apple Liquid Glass Optical Tokens (Terang) */
+  --glass-surface: rgba(255, 255, 255, 0.85);
+  --glass-tray: rgba(232, 238, 235, 0.75);
+  --glass-border: rgba(207, 216, 212, 0.80);
+  --glass-pill-active: #FFFFFF;
+  --composer-specular: inset 0 1px 0 rgba(255, 255, 255, 0.80);
+
+  /* Two-Layer Sumi Elevation */
+  --shadow-e1: 0 1px 2px rgba(20, 25, 23, 0.06), 0 4px 16px rgba(20, 25, 23, 0.06);
+  --shadow-e2: 0 4px 12px rgba(20, 25, 23, 0.08), 0 16px 40px rgba(20, 25, 23, 0.12);
+  --shadow-glass: 0 2px 6px rgba(20, 25, 23, 0.06), 0 14px 32px -4px rgba(20, 25, 23, 0.12);
+  --shadow-pill: 0 1px 3px rgba(20, 25, 23, 0.08), 0 2px 6px rgba(20, 25, 23, 0.05);
+
+  /* Three Zero-Download Typography Stacks */
+  --font-ui: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-result: Charter, Georgia, Cambria, serif;
+  --font-jp: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif;
+
+  /* 10-Step Concentric Radius Hierarchy */
+  --r-menu-item: 8px;
+  --r-control: 10px;
+  --r-pill-lang: 12px;
+  --r-card: 14px;
+  --r-popover: 16px;
+  --r-dialog: 20px;
+  --r-app-icon: 22px;
+  --r-island: 24px;
+  --r-tray: 26px;
+  --r-full: 9999px;
+
+  /* 4px / 8px Spacing Scale */
+  --sp-xxs: 2px;
+  --sp-xs: 4px;
+  --sp-sm: 8px;
+  --sp-md: 12px;
+  --sp-lg: 16px;
+  --sp-xl: 24px;
+  --sp-xxl: 48px;
+
+  /* Critical-Damped Micro-Motion (< 240ms, 0 infinite loops) */
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-sheet: cubic-bezier(0.32, 0.72, 0, 1);
+  --dur-press: 120ms;
+  --dur-popover-in: 160ms;
+  --dur-popover-out: 120ms;
+  --dur-sheet-in: 220ms;
+  --dur-kb-offset: 0px;
+}
+
+[data-tranx-v3="Gelap"] {
+  color-scheme: dark;
+
+  --bg: #171B1A;
+  --bg-sidebar: #111514;
+  --surface: #1F2423;
+  --surface-hover: #272D2B;
+  --surface-pressed: #2F3533;
+  --border: #2B3230;
+  --border-strong: #747E7A;
+  --text: #E7ECEA;
+  --text-muted: #A5AEAA;
+  --text-subtle: #8E9894;
+  --accent: #5DC3AC;
+  --accent-hover: #7FD2BF;
+  --on-accent: #0E1A17;
+  --accent-soft: #173430;
+  --success: #78C77D;
+  --success-soft: #17301A;
+  --warning: #E8B34E;
+  --warning-soft: #33290F;
+  --danger: #FF8A7A;
+  --danger-soft: #3A1C18;
+  --focus-ring: #5DC3AC;
+  --bubble-user: #262C2A;
+  --overlay: rgba(6, 9, 8, 0.64);
+  --brand-tile: #17695B;
+  --brand-on-tile: #F4FBF8;
+
+  --glass-surface: rgba(31, 36, 35, 0.85);
+  --glass-tray: rgba(39, 45, 43, 0.78);
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --glass-pill-active: #2F3533;
+  --composer-specular: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+
+  --shadow-e1: 0 1px 3px rgba(0, 0, 0, 0.28), 0 6px 18px rgba(0, 0, 0, 0.24);
+  --shadow-e2: 0 6px 16px rgba(0, 0, 0, 0.36), 0 20px 44px rgba(0, 0, 0, 0.42);
+  --shadow-glass: 0 4px 12px rgba(0, 0, 0, 0.34), 0 16px 36px -4px rgba(0, 0, 0, 0.44);
+  --shadow-pill: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root,
+  [data-tranx-v3="Gelap"] {
+    --glass-surface: var(--surface);
+    --glass-tray: var(--surface-hover);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 150ms !important;
+    transition-duration: 150ms !important;
+    scroll-behavior: auto !important;
+  }
+}

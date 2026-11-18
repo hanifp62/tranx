@@ -1,0 +1,340 @@
+rules_version = '2';
+
+// Assumed data model for tranX (single-owner cross-device translator):
+// - settings/owner: Admin-SDK-managed owner bootstrap record; owner read-only.
+// - settings/app: Owner-editable limits, LLM preferences, target language, UI language, and theme.
+// - settings/engineStatus: Admin-SDK-managed engine availability snapshot; owner read-only.
+// - titles/{titleId}: Work metadata (name, kind) and optional rendering style map.
+// - titles/{titleId}/glossary/{key}: User-confirmed glossary entries (surface, kind, renders, glosses).
+// - conversations/{cid}: Thread metadata; deleted exclusively via DELETE /v1/conversations/{cid}.
+// - conversations/{cid}/messages/{mid} and paras/{paraId}: Admin-SDK-written turns; owner read-only.
+// - jobs/{jobId}: Async file/image jobs; client creates as 'uploading' (<= 50 MiB) and updates state to 'queued' or 'stopped'.
+// - usage/{dayId} and inbox/{inboxId}: Admin-SDK-written quota counters and inbox captures; owner read-only.
+// - metrics/{metricId}: Append-only owner telemetry records.
+// - devices/{deviceId}: Paired or active owner devices managed by owner.
+// - pairCodes/{code}, inboxTokens/{tokenId}, cacheEntries/{hash}: Admin-SDK-only state; no client access.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return isAuthenticated()
+        && request.auth.token.firebase.sign_in_provider != 'anonymous'
+        && (
+          (
+            'email' in request.auth.token
+            && request.auth.token.email == 'hanifp633@gmail.com'
+            && 'email_verified' in request.auth.token
+            && request.auth.token.email_verified == true
+          )
+          || (
+            'owner' in request.auth.token
+            && request.auth.token.owner == true
+          )
+        );
+    }
+
+    function hasOnlyAllowedFields(data, fields) {
+      return data.keys().hasOnly(fields);
+    }
+
+    function isCreatedAtUnchanged() {
+      return !('createdAt' in resource.data)
+        || !('createdAt' in request.resource.data)
+        || request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    function isOptionalBoundedString(data, field, maxLen) {
+      return !(field in data)
+        || data[field] == null
+        || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isOptionalTimeValue(data, field) {
+      return !(field in data)
+        || data[field] == null
+        || data[field] is timestamp
+        || (data[field] is int && data[field] >= 0);
+    }
+
+    function isValidAppSettings(data) {
+      return hasOnlyAllowedFields(data, [
+          'llmModels',
+          'reasoningEffort',
+          'chatMaxChars',
+          'longMaxChars',
+          'maxUploadMb',
+          'dailyCharCap',
+          'dailyCallCap',
+          'defaultTarget',
+          'uiLang',
+          'theme',
+          'updatedAt'
+        ])
+        && (!('llmModels' in data)
+          || (data.llmModels is list && data.llmModels.size() <= 20)
+          || (data.llmModels is map && data.llmModels.keys().size() <= 20))
+        && (!('reasoningEffort' in data)
+          || (data.reasoningEffort is string && data.reasoningEffort.size() <= 32)
+          || (data.reasoningEffort is map && data.reasoningEffort.keys().size() <= 20))
+        && (!('chatMaxChars' in data)
+          || (data.chatMaxChars is int && data.chatMaxChars > 0 && data.chatMaxChars <= 5000))
+        && (!('longMaxChars' in data)
+          || (data.longMaxChars is int && data.longMaxChars > 0 && data.longMaxChars <= 60000))
+        && (!('maxUploadMb' in data)
+          || (data.maxUploadMb is int && data.maxUploadMb > 0 && data.maxUploadMb <= 50))
+        && (!('dailyCharCap' in data)
+          || (data.dailyCharCap is int && data.dailyCharCap > 0 && data.dailyCharCap <= 1000000000))
+        && (!('dailyCallCap' in data)
+          || (data.dailyCallCap is int && data.dailyCallCap > 0 && data.dailyCallCap <= 10000000))
+        && (!('defaultTarget' in data) || data.defaultTarget in ['id', 'en'])
+        && (!('uiLang' in data) || data.uiLang in ['id', 'en'])
+        && (!('theme' in data) || data.theme in ['system', 'light', 'dark'])
+        && isOptionalTimeValue(data, 'updatedAt');
+    }
+
+    function isValidTitleStyle(style) {
+      return style is map
+        && style.keys().size() <= 20
+        && 'honorific_style' in style
+        && style.honorific_style in ['keep', 'localize', 'drop']
+        && (!('name_order' in style) || style.name_order == null || style.name_order in ['jp', 'western'])
+        && 'romanization' in style
+        && style.romanization in ['macron', 'kana', 'plain'];
+    }
+
+    function isValidTitle(data) {
+      return data.keys().size() <= 25
+        && 'name' in data
+        && data.name is string
+        && data.name.size() > 0
+        && data.name.size() <= 300
+        && 'kind' in data
+        && data.kind in ['novel', 'komik', 'dokumen', 'subtitle', 'web', 'lepas']
+        && (!('style' in data) || isValidTitleStyle(data.style))
+        && isOptionalBoundedString(data, 'description', 5000)
+        && isOptionalBoundedString(data, 'notes', 5000);
+    }
+
+    function isValidGlossaryEntry(data) {
+      return hasOnlyAllowedFields(data, [
+          'surface',
+          'kind',
+          'reading',
+          'romaji',
+          'render_id',
+          'render_en',
+          'gloss_id',
+          'gloss_en',
+          'gender',
+          'aliases',
+          'allow_compound',
+          'confirmed',
+          'source',
+          'score',
+          'updatedAt'
+        ])
+        && 'surface' in data
+        && data.surface is string
+        && data.surface.size() > 0
+        && data.surface.size() <= 300
+        && 'kind' in data
+        && data.kind in ['PERSON', 'PLACE', 'ORG', 'TERM', 'CULTURE']
+        && 'source' in data
+        && data.source == 'user'
+        && 'confirmed' in data
+        && data.confirmed is bool
+        && data.confirmed == true
+        && (!('gender' in data) || data.gender in ['m', 'f', ''])
+        && isOptionalBoundedString(data, 'reading', 300)
+        && isOptionalBoundedString(data, 'romaji', 300)
+        && isOptionalBoundedString(data, 'render_id', 500)
+        && isOptionalBoundedString(data, 'render_en', 500)
+        && isOptionalBoundedString(data, 'gloss_id', 1000)
+        && isOptionalBoundedString(data, 'gloss_en', 1000)
+        && (!('aliases' in data) || (data.aliases is list && data.aliases.size() <= 50))
+        && (!('allow_compound' in data) || data.allow_compound is bool)
+        && (!('score' in data) || (data.score is number && data.score >= 0 && data.score <= 1))
+        && isOptionalTimeValue(data, 'updatedAt');
+    }
+
+    function isValidConversationFields(data) {
+      return 'pinned' in data
+        && data.pinned is bool
+        && 'mode' in data
+        && data.mode in ['ja-id', 'ja-en']
+        && 'activeTab' in data
+        && data.activeTab in ['teks', 'gambar', 'dokumen', 'link']
+        && isOptionalBoundedString(data, 'title', 500)
+        && isOptionalBoundedString(data, 'titleId', 200)
+        && isOptionalBoundedString(data, 'preview', 2000)
+        && isOptionalTimeValue(data, 'pinnedAt')
+        && isOptionalTimeValue(data, 'createdAt')
+        && isOptionalTimeValue(data, 'updatedAt');
+    }
+
+    function isValidJobCreate(data) {
+      return data.keys().size() <= 30
+        && 'state' in data
+        && data.state == 'uploading'
+        && 'fileSize' in data
+        && data.fileSize is int
+        && data.fileSize > 0
+        && data.fileSize <= 52428800
+        && isOptionalBoundedString(data, 'fileName', 500)
+        && isOptionalBoundedString(data, 'storagePath', 1024)
+        && isOptionalBoundedString(data, 'mimeType', 200)
+        && isOptionalBoundedString(data, 'contentType', 200)
+        && isOptionalBoundedString(data, 'cid', 200)
+        && isOptionalBoundedString(data, 'conversationId', 200)
+        && isOptionalBoundedString(data, 'titleId', 200);
+    }
+
+    function isValidJobUpdate(prev, next) {
+      return next.diff(prev).affectedKeys().hasOnly(['state', 'updatedAt'])
+        && 'state' in next
+        && next.state in ['queued', 'stopped']
+        && isOptionalTimeValue(next, 'updatedAt');
+    }
+
+    function isValidMetric(data) {
+      return data.keys().size() <= 30
+        && isOptionalBoundedString(data, 'name', 200)
+        && isOptionalBoundedString(data, 'event', 200)
+        && isOptionalBoundedString(data, 'kind', 200)
+        && isOptionalBoundedString(data, 'route', 500);
+    }
+
+    function isValidDevice(data) {
+      return data.keys().size() <= 25
+        && isOptionalBoundedString(data, 'name', 200)
+        && isOptionalBoundedString(data, 'label', 200)
+        && isOptionalBoundedString(data, 'platform', 100)
+        && isOptionalBoundedString(data, 'userAgent', 1000);
+    }
+
+    // Written exclusively by Admin SDK on first owner login.
+    match /settings/owner {
+      allow read: if isOwner();
+      allow write: if false;
+    }
+
+    match /settings/app {
+      allow read: if isOwner();
+      allow create, update: if isOwner() && isValidAppSettings(request.resource.data);
+      allow delete: if false;
+    }
+
+    // Engine availability snapshots are maintained by Admin SDK.
+    match /settings/engineStatus {
+      allow read: if isOwner();
+      allow write: if false;
+    }
+
+    match /titles/{titleId} {
+      allow read, delete: if isOwner();
+      allow create: if isOwner() && isValidTitle(request.resource.data);
+      allow update: if isOwner()
+        && isValidTitle(request.resource.data)
+        && isCreatedAtUnchanged();
+
+      match /glossary/{key} {
+        allow read, delete: if isOwner();
+        allow create, update: if isOwner() && isValidGlossaryEntry(request.resource.data);
+      }
+    }
+
+    // Deletion runs via DELETE /v1/conversations/{cid} (Admin SDK) to clean subcollections and Storage blobs atomically.
+    match /conversations/{cid} {
+      allow read: if isOwner();
+      allow create: if isOwner()
+        && hasOnlyAllowedFields(request.resource.data, [
+          'title',
+          'titleId',
+          'mode',
+          'activeTab',
+          'pinned',
+          'pinnedAt',
+          'preview',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidConversationFields(request.resource.data);
+      allow update: if isOwner()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'title',
+          'titleId',
+          'mode',
+          'activeTab',
+          'pinned',
+          'pinnedAt',
+          'updatedAt'
+        ])
+        && isValidConversationFields(request.resource.data);
+      allow delete: if false;
+
+      // Messages and paragraph chunks are written exclusively by Admin SDK.
+      match /messages/{mid} {
+        allow read: if isOwner();
+        allow write: if false;
+
+        match /paras/{paraId} {
+          allow read: if isOwner();
+          allow write: if false;
+        }
+      }
+    }
+
+    match /jobs/{jobId} {
+      allow read: if isOwner();
+      allow create: if isOwner() && isValidJobCreate(request.resource.data);
+      allow update: if isOwner() && isValidJobUpdate(resource.data, request.resource.data);
+      allow delete: if false;
+    }
+
+    match /usage/{dayId} {
+      allow read: if isOwner();
+      allow write: if false;
+    }
+
+    match /inbox/{inboxId} {
+      allow read: if isOwner();
+      allow write: if false;
+    }
+
+    match /metrics/{metricId} {
+      allow read: if isOwner();
+      allow create: if isOwner() && isValidMetric(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    match /devices/{deviceId} {
+      allow read, delete: if isOwner();
+      allow create: if isOwner() && isValidDevice(request.resource.data);
+      allow update: if isOwner()
+        && isValidDevice(request.resource.data)
+        && isCreatedAtUnchanged();
+    }
+
+    // Internal pairing, webhook token, and translation cache collections are Admin SDK only.
+    match /pairCodes/{code} {
+      allow read, write: if false;
+    }
+
+    match /inboxTokens/{tokenId} {
+      allow read, write: if false;
+    }
+
+    match /cacheEntries/{hash} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
