@@ -2,13 +2,14 @@ rules_version = '2';
 
 // Assumed data model for tranX (single-owner cross-device translator):
 // - settings/owner: Admin-SDK-managed owner bootstrap record; owner read-only.
-// - settings/app: Owner-editable limits, LLM preferences, target language, UI language, and theme.
+// - settings/app: Owner-editable limits, LLM preferences, defaultSource/defaultTarget, UI language, and theme.
+// - settings/secrets: Owner-only cross-device Gemini API key storage (no localStorage exposure).
 // - settings/engineStatus: Admin-SDK-managed engine availability snapshot; owner read-only.
 // - titles/{titleId}: Work metadata (name, kind) and optional rendering style map.
 // - titles/{titleId}/glossary/{key}: User-confirmed glossary entries (surface, kind, renders, glosses).
-// - conversations/{cid}: Thread metadata; deleted exclusively via DELETE /v1/conversations/{cid}.
-// - conversations/{cid}/messages/{mid} and paras/{paraId}: Admin-SDK-written turns; owner read-only.
-// - jobs/{jobId}: Async file/image jobs; client creates as 'uploading' (<= 50 MiB) and updates state to 'queued' or 'stopped'.
+// - conversations/{cid}: Multilingual thread metadata (mode across ja/id/en/auto, detectedSource, preview) managed by owner.
+// - conversations/{cid}/messages/{mid} and paras/{paraId}: Translation turns and paragraph chunks readable and writable by owner.
+// - jobs/{jobId}: Async or client-direct document/image jobs managed by owner (<= 50 MiB).
 // - usage/{dayId} and inbox/{inboxId}: Admin-SDK-written quota counters and inbox captures; owner read-only.
 // - metrics/{metricId}: Append-only owner telemetry records.
 // - devices/{deviceId}: Paired or active owner devices managed by owner.
@@ -61,6 +62,20 @@ service cloud.firestore {
         || (data[field] is int && data[field] >= 0);
     }
 
+    function isValidLanguageMode(mode) {
+      return mode in [
+        'ja-id',
+        'ja-en',
+        'id-ja',
+        'id-en',
+        'en-id',
+        'en-ja',
+        'auto-id',
+        'auto-en',
+        'auto-ja'
+      ];
+    }
+
     function isValidAppSettings(data) {
       return hasOnlyAllowedFields(data, [
           'llmModels',
@@ -70,6 +85,7 @@ service cloud.firestore {
           'maxUploadMb',
           'dailyCharCap',
           'dailyCallCap',
+          'defaultSource',
           'defaultTarget',
           'uiLang',
           'theme',
@@ -91,9 +107,16 @@ service cloud.firestore {
           || (data.dailyCharCap is int && data.dailyCharCap > 0 && data.dailyCharCap <= 1000000000))
         && (!('dailyCallCap' in data)
           || (data.dailyCallCap is int && data.dailyCallCap > 0 && data.dailyCallCap <= 10000000))
-        && (!('defaultTarget' in data) || data.defaultTarget in ['id', 'en'])
+        && (!('defaultSource' in data) || data.defaultSource in ['auto', 'ja', 'id', 'en'])
+        && (!('defaultTarget' in data) || data.defaultTarget in ['id', 'en', 'ja'])
         && (!('uiLang' in data) || data.uiLang in ['id', 'en'])
         && (!('theme' in data) || data.theme in ['system', 'light', 'dark'])
+        && isOptionalTimeValue(data, 'updatedAt');
+    }
+
+    function isValidSecrets(data) {
+      return hasOnlyAllowedFields(data, ['geminiApiKey', 'updatedAt'])
+        && isOptionalBoundedString(data, 'geminiApiKey', 512)
         && isOptionalTimeValue(data, 'updatedAt');
     }
 
@@ -117,7 +140,8 @@ service cloud.firestore {
         && data.kind in ['novel', 'komik', 'dokumen', 'subtitle', 'web', 'lepas']
         && (!('style' in data) || isValidTitleStyle(data.style))
         && isOptionalBoundedString(data, 'description', 5000)
-        && isOptionalBoundedString(data, 'notes', 5000);
+        && isOptionalBoundedString(data, 'notes', 5000)
+        && isOptionalBoundedString(data, 'mergedInto', 200);
     }
 
     function isValidGlossaryEntry(data) {
@@ -166,9 +190,12 @@ service cloud.firestore {
       return 'pinned' in data
         && data.pinned is bool
         && 'mode' in data
-        && data.mode in ['ja-id', 'ja-en']
+        && isValidLanguageMode(data.mode)
         && 'activeTab' in data
         && data.activeTab in ['teks', 'gambar', 'dokumen', 'link']
+        && (!('detectedSource' in data)
+          || data.detectedSource == null
+          || data.detectedSource in ['ja', 'id', 'en', ''])
         && isOptionalBoundedString(data, 'title', 500)
         && isOptionalBoundedString(data, 'titleId', 200)
         && isOptionalBoundedString(data, 'preview', 2000)
@@ -177,27 +204,87 @@ service cloud.firestore {
         && isOptionalTimeValue(data, 'updatedAt');
     }
 
+    function isValidMessage(data) {
+      return data.keys().size() <= 30
+        && 'role' in data
+        && data.role in ['user', 'assistant']
+        && 'kind' in data
+        && data.kind in ['text', 'long', 'image', 'document', 'link']
+        && 'mode' in data
+        && isValidLanguageMode(data.mode)
+        && 'state' in data
+        && data.state in ['running', 'done', 'partial', 'stopped', 'busy', 'error']
+        && isOptionalBoundedString(data, 'text', 250000)
+        && isOptionalBoundedString(data, 'srcText', 250000)
+        && isOptionalBoundedString(data, 'titleId', 200)
+        && isOptionalBoundedString(data, 'fileName', 500)
+        && isOptionalBoundedString(data, 'fmt', 32)
+        && isOptionalBoundedString(data, 'jobId', 200)
+        && isOptionalBoundedString(data, 'storageOutputPath', 1024)
+        && isOptionalBoundedString(data, 'model', 200)
+        && isOptionalBoundedString(data, 'error', 4000)
+        && isOptionalTimeValue(data, 'createdAt')
+        && isOptionalTimeValue(data, 'updatedAt');
+    }
+
+    function isValidPara(data) {
+      return data.keys().size() <= 20
+        && isOptionalBoundedString(data, 'src', 50000)
+        && isOptionalBoundedString(data, 'dst', 50000)
+        && isOptionalBoundedString(data, 'text', 50000)
+        && isOptionalBoundedString(data, 'target', 50000)
+        && isOptionalBoundedString(data, 'source', 50000);
+    }
+
     function isValidJobCreate(data) {
       return data.keys().size() <= 30
         && 'state' in data
-        && data.state == 'uploading'
+        && data.state in ['uploading', 'running', 'done']
         && 'fileSize' in data
         && data.fileSize is int
-        && data.fileSize > 0
+        && data.fileSize >= 0
         && data.fileSize <= 52428800
+        && (!('mode' in data) || isValidLanguageMode(data.mode))
+        && (!('doneParas' in data)
+          || data.doneParas == null
+          || (data.doneParas is int && data.doneParas >= 0 && data.doneParas <= 1000000))
+        && (!('totalParas' in data)
+          || data.totalParas == null
+          || (data.totalParas is int && data.totalParas >= 0 && data.totalParas <= 1000000))
         && isOptionalBoundedString(data, 'fileName', 500)
+        && isOptionalBoundedString(data, 'fmt', 32)
         && isOptionalBoundedString(data, 'storagePath', 1024)
+        && isOptionalBoundedString(data, 'storageOutputPath', 1024)
+        && isOptionalBoundedString(data, 'message', 4000)
         && isOptionalBoundedString(data, 'mimeType', 200)
         && isOptionalBoundedString(data, 'contentType', 200)
         && isOptionalBoundedString(data, 'cid', 200)
+        && isOptionalBoundedString(data, 'mid', 200)
         && isOptionalBoundedString(data, 'conversationId', 200)
-        && isOptionalBoundedString(data, 'titleId', 200);
+        && isOptionalBoundedString(data, 'titleId', 200)
+        && isOptionalTimeValue(data, 'createdAt')
+        && isOptionalTimeValue(data, 'updatedAt');
     }
 
     function isValidJobUpdate(prev, next) {
-      return next.diff(prev).affectedKeys().hasOnly(['state', 'updatedAt'])
+      return next.diff(prev).affectedKeys().hasOnly([
+          'state',
+          'doneParas',
+          'totalParas',
+          'message',
+          'storageOutputPath',
+          'updatedAt'
+        ])
         && 'state' in next
-        && next.state in ['queued', 'stopped']
+        && next.state in ['queued', 'running', 'done', 'partial', 'stopped', 'error']
+        && (!('doneParas' in next)
+          || next.doneParas == null
+          || (next.doneParas is int && next.doneParas >= 0 && next.doneParas <= 1000000))
+        && (!('totalParas' in next)
+          || next.totalParas == null
+          || (next.totalParas is int && next.totalParas >= 0 && next.totalParas <= 1000000))
+        && isOptionalBoundedString(next, 'message', 4000)
+        && isOptionalBoundedString(next, 'storageOutputPath', 1024)
         && isOptionalTimeValue(next, 'updatedAt');
     }
 
@@ -229,6 +316,12 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // Cross-device owner API key storage; accessible only to the verified owner.
+    match /settings/secrets {
+      allow read, delete: if isOwner();
+      allow create, update: if isOwner() && isValidSecrets(request.resource.data);
+    }
+
     // Engine availability snapshots are maintained by Admin SDK.
     match /settings/engineStatus {
       allow read: if isOwner();
@@ -248,14 +341,14 @@ service cloud.firestore {
       }
     }
 
-    // Deletion runs via DELETE /v1/conversations/{cid} (Admin SDK) to clean subcollections and Storage blobs atomically.
     match /conversations/{cid} {
-      allow read: if isOwner();
+      allow read, delete: if isOwner();
       allow create: if isOwner()
         && hasOnlyAllowedFields(request.resource.data, [
           'title',
           'titleId',
           'mode',
+          'detectedSource',
           'activeTab',
           'pinned',
           'pinnedAt',
@@ -269,31 +362,30 @@ service cloud.firestore {
           'title',
           'titleId',
           'mode',
+          'detectedSource',
           'activeTab',
           'pinned',
           'pinnedAt',
+          'preview',
           'updatedAt'
         ])
         && isValidConversationFields(request.resource.data);
-      allow delete: if false;
 
-      // Messages and paragraph chunks are written exclusively by Admin SDK.
       match /messages/{mid} {
-        allow read: if isOwner();
-        allow write: if false;
+        allow read, delete: if isOwner();
+        allow create, update: if isOwner() && isValidMessage(request.resource.data);
 
         match /paras/{paraId} {
-          allow read: if isOwner();
-          allow write: if false;
+          allow read, delete: if isOwner();
+          allow create, update: if isOwner() && isValidPara(request.resource.data);
         }
       }
     }
 
     match /jobs/{jobId} {
-      allow read: if isOwner();
+      allow read, delete: if isOwner();
       allow create: if isOwner() && isValidJobCreate(request.resource.data);
       allow update: if isOwner() && isValidJobUpdate(resource.data, request.resource.data);
-      allow delete: if false;
     }
 
     match /usage/{dayId} {

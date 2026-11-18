@@ -4,6 +4,7 @@ export {
   loginWithCustomPairToken,
   loginWithGoogleOwner,
   logoutSession,
+  normalizeModePair,
   renameConversationTitle,
   requestStopJob,
   subscribeAuth,
@@ -15,9 +16,11 @@ export {
   subscribeTitles,
   toggleConversationPin,
   updateAppSettings,
-  uploadDocumentForJob,
   upsertConversationMeta,
   upsertUserGlossaryEntry,
   type AuthSessionUser,
 } from './firebase';
-export { dismissInboxItem as dismissInboxItemBridge } from './api';
+export {
+  dismissInboxItem as dismissInboxItemBridge,
+  processDocumentSubmission,
+} from './api';

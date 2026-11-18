@@ -21,9 +21,10 @@ from jptrans.readers.aozora import is_aozora, parse_aozora
 from jptrans.textnorm import contains_japanese
 
 from .cache import LayeredTranslationCache
-from .config import AppSettings, TitleStyle, long_config, parse_mode_target
+from .config import AppSettings, TitleStyle, long_config
 from .engines import UsageTracker, build_engine_chain
 from .glossary_store import FirestoreGlossary, glossary_entry_to_dict
+from .multilingual import parse_mode_pair, translate_multilingual_document
 
 MAX_URL_LENGTH = 2048
 MAX_HTML_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -328,25 +329,30 @@ def translate_web_page(
 ) -> dict[str, Any]:
     """Fetch, sanitize, translate DOM text nodes via jptrans, and return preview + full HTML."""
     page = fetcher(url)
-    target_lang = parse_mode_target(mode, settings.default_target)
-
-    def _rewrite_link(abs_url: str) -> str:
-        q_url = quote(abs_url, safe="")
-        q_mode = quote(f"ja-{target_lang}", safe="")
-        tid_part = f"&titleId={quote(title_id, safe='')}" if title_id else ""
-        return f"{viewer_route_prefix}?url={q_url}&mode={q_mode}{tid_part}"
-
     is_aozora_page = page.host.endswith("aozora.gr.jp") or is_aozora(page.text)
     soup = BeautifulSoup(page.text, "html.parser")
     raw_title = (soup.title.string.strip() if soup.title and soup.title.string else "") or page.host
+    req_src, eff_src, target_lang = parse_mode_pair(
+        mode,
+        sample_text=soup.get_text(" ", strip=True)[:3000],
+        default_source=settings.default_source,
+        default_target=settings.default_target,
+    )
+
+    def _rewrite_link(abs_url: str) -> str:
+        q_url = quote(abs_url, safe="")
+        q_mode = quote(f"{req_src}-{target_lang}", safe="")
+        tid_part = f"&titleId={quote(title_id, safe='')}" if title_id else ""
+        return f"{viewer_route_prefix}?url={q_url}&mode={q_mode}{tid_part}"
 
     sanitize_soup(soup, page.final_url, _rewrite_link)
 
-    if view == "orig":
+    if view in ("orig", "original"):
         return {
             "finalUrl": page.final_url,
             "host": page.host,
             "isAozora": is_aozora_page,
+            "detectedSource": eff_src,
             "titleSrc": raw_title,
             "titleDst": raw_title,
             "excerptSrc": "",
@@ -356,7 +362,7 @@ def translate_web_page(
             "html": str(soup),
         }
 
-    # Collect Japanese text nodes in document order
+    # Collect translatable text nodes in document order
     text_nodes: list[NavigableString] = []
     paragraphs: list[Paragraph] = []
     for node in soup.find_all(string=True):
@@ -366,7 +372,11 @@ def translate_web_page(
         if parent is None or parent.name in SKIP_TEXT_PARENTS:
             continue
         stripped = str(node).strip()
-        if not stripped or not contains_japanese(stripped):
+        if not stripped:
+            continue
+        if eff_src == "ja" and not contains_japanese(stripped):
+            continue
+        if eff_src != "ja" and len(stripped) < 2:
             continue
         text_nodes.append(node)
         kind = "heading" if parent.name in ("title", "h1", "h2", "h3") else "text"
@@ -376,23 +386,35 @@ def translate_web_page(
         aozora_doc = parse_aozora(page.text, raw_title)
         paragraphs = aozora_doc.paragraphs
 
-    cfg = long_config(settings, target_lang, style=style)
-    engines = build_engine_chain(
-        cfg,
-        settings,
-        api_key=api_key,
-        usage_tracker=usage_tracker,
-        transport=llm_transport,
-    )
-
     title_dst = raw_title
     excerpt_src = ""
     excerpt_dst = ""
 
     if paragraphs:
         doc = Document(title=glossary.title or raw_title, paragraphs=paragraphs, fmt="html")
-        with Translator(cfg, engines, cache, glossary) as tr:
-            translated = tr.translate_document(doc)
+        if eff_src == "ja" and target_lang in ("id", "en"):
+            cfg = long_config(settings, target_lang, style=style)
+            engines = build_engine_chain(
+                cfg,
+                settings,
+                api_key=api_key,
+                usage_tracker=usage_tracker,
+                transport=llm_transport,
+            )
+            with Translator(cfg, engines, cache, glossary) as tr:
+                translated = tr.translate_document(doc)
+        else:
+            translated, _ = translate_multilingual_document(
+                doc=doc,
+                src_lang=eff_src,
+                tgt_lang=target_lang,
+                settings=settings,
+                glossary_entries=glossary.non_builtin_entries(),
+                cache=cache,
+                api_key=api_key,
+                usage_tracker=usage_tracker,
+                llm_transport=llm_transport,
+            )
 
         if text_nodes and len(translated.paragraphs) == len(text_nodes):
             for node, tpara in zip(text_nodes, translated.paragraphs):

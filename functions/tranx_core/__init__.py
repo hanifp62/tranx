@@ -27,12 +27,21 @@ from .cache import CacheStore, InMemoryCacheStore, LayeredTranslationCache
 from .config import (
     DEFAULT_MODELS,
     SUPPORTED_MODES,
+    SUPPORTED_SOURCES,
+    SUPPORTED_TARGETS,
     SUPPORTED_UI_LANGS,
     AppSettings,
     TitleStyle,
     chat_config,
     long_config,
     parse_mode_target,
+)
+from .multilingual import (
+    ALL_MODE_PAIRS,
+    detect_source_language,
+    parse_mode_pair,
+    translate_multilingual_document,
+    translate_multilingual_paragraphs,
 )
 from .doc_readers import inspect_zip_archive, register_custom_readers
 from .engines import (

@@ -17,9 +17,10 @@ from jptrans.readers.pages import parse_pages
 from PIL import Image
 
 from .cache import LayeredTranslationCache
-from .config import AppSettings, TitleStyle, long_config, parse_mode_target
+from .config import AppSettings, TitleStyle, long_config
 from .engines import UsageTracker, build_engine_chain
 from .glossary_store import FirestoreGlossary, glossary_entry_to_dict
+from .multilingual import parse_mode_pair, translate_multilingual_document
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MB
 ALLOWED_IMAGE_FORMATS = frozenset({"PNG", "JPEG", "WEBP"})
@@ -223,17 +224,36 @@ def translate_image_bytes(
     }
     doc = parse_pages(pages_data, title_name)
 
-    target_lang = parse_mode_target(mode, settings.default_target)
-    cfg = long_config(settings, target_lang, style=style)
-    engines = build_engine_chain(
-        cfg,
-        settings,
-        api_key=api_key,
-        usage_tracker=usage_tracker,
-        transport=llm_transport,
+    sample_src = "\n".join(b.text for b in raw_bubbles[:5])
+    _, eff_src, target_lang = parse_mode_pair(
+        mode,
+        sample_text=sample_src,
+        default_source=settings.default_source,
+        default_target=settings.default_target,
     )
-    with Translator(cfg, engines, cache, glossary) as tr:
-        result = tr.translate_document(doc)
+    if eff_src == "ja" and target_lang in ("id", "en"):
+        cfg = long_config(settings, target_lang, style=style)
+        engines = build_engine_chain(
+            cfg,
+            settings,
+            api_key=api_key,
+            usage_tracker=usage_tracker,
+            transport=llm_transport,
+        )
+        with Translator(cfg, engines, cache, glossary) as tr:
+            result = tr.translate_document(doc)
+    else:
+        result, _ = translate_multilingual_document(
+            doc=doc,
+            src_lang=eff_src,
+            tgt_lang=target_lang,
+            settings=settings,
+            glossary_entries=glossary.non_builtin_entries(),
+            cache=cache,
+            api_key=api_key,
+            usage_tracker=usage_tracker,
+            llm_transport=llm_transport,
+        )
 
     blocks_out: list[dict[str, Any]] = []
     for idx, tpara in enumerate(result.paragraphs, start=1):

@@ -555,12 +555,41 @@ export function SettingsModal({
               </div>
 
               <div className="field-label">
+                <span>{strings.defaultSourceLabel}</span>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  {(
+                    [
+                      ['auto', strings.langAuto],
+                      ['id', strings.langId],
+                      ['en', strings.langEn],
+                      ['ja', strings.langJa],
+                    ] as const
+                  ).map(([srcCode, label]) => (
+                    <button
+                      key={srcCode}
+                      type="button"
+                      className={
+                        settings.defaultSource === srcCode
+                          ? 'btn-primary pressable'
+                          : 'btn-secondary pressable'
+                      }
+                      onClick={() => updateAppSettings({ defaultSource: srcCode })}
+                    >
+                      {settings.defaultSource === srcCode && <IconCheck size={16} />}
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="field-label">
                 <span>{strings.defaultTargetLabel}</span>
                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                   {(
                     [
-                      ['id', strings.langJaId],
-                      ['en', strings.langJaEn],
+                      ['id', strings.langId],
+                      ['en', strings.langEn],
+                      ['ja', strings.langJa],
                     ] as const
                   ).map(([tgt, label]) => (
                     <button

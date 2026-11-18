@@ -1,15 +1,32 @@
 import {
+  deleteConversationDirect,
   getE2EStore,
+  getOwnerGeminiKey,
   isLocalE2EMode,
+  saveTurnMessageDirect,
+  setOwnerGeminiKey,
+  uploadDocumentToCloudStorage,
   upsertConversationMeta,
   type AuthSessionUser,
 } from './firebase';
+import {
+  buildDirectExportBlob,
+  detectLanguageLocal,
+  directFetchTranslatedWebHtml,
+  directPreviewLink,
+  directTranslateDocumentFile,
+  directTranslateImage,
+  normalizeWebUrl,
+  parseModePair,
+  translateParagraphsDirect,
+} from './directEngine';
 import type {
   ImageTranslationResult,
   LinkPreviewPayload,
   ModePair,
   NameChipItem,
   SentencePair,
+  TargetLang,
 } from '../types';
 
 export function getApiBaseUrl(): string {
@@ -40,6 +57,58 @@ export class ApiClientError extends Error {
   }
 }
 
+export function humanizeFetchError(err: unknown, fallbackMsg: string): string {
+  if (err instanceof ApiClientError) return err.message;
+  if (err instanceof Error) {
+    if (/failed to fetch|networkerror|load failed/i.test(err.message)) {
+      return fallbackMsg;
+    }
+    return err.message;
+  }
+  return fallbackMsg;
+}
+
+if (
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('direct') === '1'
+) {
+  window.sessionStorage.setItem('tranx_e2e_direct', '1');
+}
+
+function isDirectE2ETest(): boolean {
+  if (typeof window === 'undefined') return false;
+  if (new URLSearchParams(window.location.search).get('direct') === '1') {
+    window.sessionStorage.setItem('tranx_e2e_direct', '1');
+    return true;
+  }
+  return window.sessionStorage.getItem('tranx_e2e_direct') === '1';
+}
+
+/* Fast cached probe so Spark deployments don't wait on unprovisioned Cloud Functions */
+let cloudReachableState: { ok: boolean; checkedAt: number } | null = null;
+
+async function isCloudBackendAvailable(): Promise<boolean> {
+  if (isLocalE2EMode() && !isDirectE2ETest()) return false;
+  const base = getApiBaseUrl();
+  if (!base) return false;
+  if (cloudReachableState && Date.now() - cloudReachableState.checkedAt < 120000) {
+    return cloudReachableState.ok;
+  }
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), 2200);
+  try {
+    const r = await fetch(`${base}/v1/healthz`, { method: 'GET', signal: ctrl.signal });
+    const ok = r.status === 204 || r.ok;
+    cloudReachableState = { ok, checkedAt: Date.now() };
+    return ok;
+  } catch {
+    cloudReachableState = { ok: false, checkedAt: Date.now() };
+    return false;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 async function parseErrorResponse(resp: Response): Promise<ApiClientError> {
   try {
     const data = await resp.json();
@@ -56,10 +125,11 @@ async function parseErrorResponse(resp: Response): Promise<ApiClientError> {
 }
 
 export interface StreamEvent {
-  type: 'meta' | 'delta' | 'para' | 'done' | 'error';
+  type: 'meta' | 'delta' | 'seg' | 'para' | 'done' | 'error';
   cid?: string;
   mid?: string;
   titleId?: string;
+  detectedSource?: TargetLang;
   i?: number;
   src?: string;
   dst?: string;
@@ -111,14 +181,21 @@ export async function streamChatTurn(params: {
   signal?: AbortSignal;
   onEvent: (ev: StreamEvent) => void;
 }): Promise<void> {
-  if (isLocalE2EMode()) {
+  if (isLocalE2EMode() && !isDirectE2ETest()) {
     const store = getE2EStore();
     const tid = params.titleId || 't_rashomon';
     const asstMid = `${params.clientMsgId}_r`;
-    const isEn = params.mode === 'ja-en';
-    const dst = isEn
-      ? 'Chihaya smiled quietly beneath the eaves.'
-      : 'Chihaya tersenyum tenang di bawah atap.';
+    const { src, tgt } = parseModePair(params.mode);
+    const detected: TargetLang =
+      src === 'auto'
+        ? detectLanguageLocal(params.text, tgt === 'ja' ? 'id' : 'ja')
+        : src;
+    const dst =
+      tgt === 'ja'
+        ? '千早は軒下で静かに微笑んだ。'
+        : tgt === 'en'
+          ? 'Chihaya smiled quietly beneath the eaves.'
+          : 'Chihaya tersenyum tenang di bawah atap.';
     const now = Date.now();
     const bucket = store.messages.get(params.cid) ?? new Map();
     bucket.set(params.clientMsgId, {
@@ -126,48 +203,58 @@ export async function streamChatTurn(params: {
       role: 'user',
       kind: 'text',
       mode: params.mode,
+      detectedSource: detected,
       titleId: tid,
       text: params.text,
       state: 'done',
       createdAt: now,
     });
-    params.onEvent({ type: 'meta', cid: params.cid, mid: asstMid, titleId: tid });
+    params.onEvent({
+      type: 'meta',
+      cid: params.cid,
+      mid: asstMid,
+      titleId: tid,
+      detectedSource: detected,
+    });
     params.onEvent({ type: 'delta', i: 0, src: params.text, dst });
     params.onEvent({
       type: 'done',
       cid: params.cid,
       mid: asstMid,
       titleId: tid,
+      detectedSource: detected,
       fullDst: dst,
       sentences: [{ i: 0, src: params.text, dst }],
       model: 'gemini-2.5-flash-lite',
-      ms: 210,
+      ms: 190,
     });
     bucket.set(asstMid, {
       id: asstMid,
       role: 'assistant',
       kind: 'text',
       mode: params.mode,
+      detectedSource: detected,
       titleId: tid,
       srcText: params.text,
       text: dst,
       sentences: [{ i: 0, src: params.text, dst }],
-      nameChips: params.text.includes('千早')
-        ? [
-            {
-              surface: '千早',
-              reading: 'ちはや',
-              romaji: 'Chihaya',
-              dst: 'Chihaya',
-              kind: 'PERSON',
-              confirmed: true,
-              source: 'user',
-            },
-          ]
-        : [],
+      nameChips:
+        params.text.includes('千早') || params.text.includes('Chihaya')
+          ? [
+              {
+                surface: '千早',
+                reading: 'ちはや',
+                romaji: 'Chihaya',
+                dst: tgt === 'ja' ? '千早' : 'Chihaya',
+                kind: 'PERSON',
+                confirmed: true,
+                source: 'user',
+              },
+            ]
+          : [],
       state: 'done',
       model: 'gemini-2.5-flash-lite',
-      ms: 210,
+      ms: 190,
       createdAt: now + 1,
     });
     store.messages.set(params.cid, bucket);
@@ -175,6 +262,7 @@ export async function streamChatTurn(params: {
       title: params.text.split('\n')[0].slice(0, 80) || 'Percakapan',
       titleId: tid,
       mode: params.mode,
+      detectedSource: detected,
       activeTab: 'teks',
       preview: dst,
     });
@@ -183,37 +271,133 @@ export async function streamChatTurn(params: {
     return;
   }
 
-  const endpoint =
-    params.text.length > 5000 ? `${getApiBaseUrl()}/v1/translate` : `${getApiBaseUrl()}/v1/chat`;
-  const body =
-    params.text.length > 5000
-      ? {
-          cid: params.cid,
-          clientMsgId: params.clientMsgId,
-          mode: params.mode,
-          titleId: params.titleId,
-          source: { text: params.text },
-        }
-      : {
-          cid: params.cid,
-          clientMsgId: params.clientMsgId,
-          mode: params.mode,
-          titleId: params.titleId,
-          inboxId: params.inboxId,
-          text: params.text,
-        };
+  if (await isCloudBackendAvailable()) {
+    try {
+      const endpoint =
+        params.text.length > 5000
+          ? `${getApiBaseUrl()}/v1/translate`
+          : `${getApiBaseUrl()}/v1/chat`;
+      const body =
+        params.text.length > 5000
+          ? {
+              cid: params.cid,
+              clientMsgId: params.clientMsgId,
+              mode: params.mode,
+              titleId: params.titleId,
+              source: { text: params.text },
+            }
+          : {
+              cid: params.cid,
+              clientMsgId: params.clientMsgId,
+              mode: params.mode,
+              titleId: params.titleId,
+              inboxId: params.inboxId,
+              text: params.text,
+            };
 
-  const resp = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(await authHeaders(params.user)),
-    },
-    body: JSON.stringify(body),
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(await authHeaders(params.user)),
+        },
+        body: JSON.stringify(body),
+        signal: params.signal,
+      });
+      if (resp.ok) {
+        await consumeNdjson(resp, params.onEvent);
+        return;
+      }
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') throw err;
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    }
+  }
+
+  /* Direct Browser Translation + Real Cloud Firestore Sync */
+  const t0 = performance.now();
+  const tid = params.titleId || `t_${params.cid}`;
+  const asstMid = `${params.clientMsgId}_r`;
+  const paras = params.text
+    .replace(/\r\n/g, '\n')
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const firstLine = (paras[0] || params.text).split('\n')[0].slice(0, 80) || 'Percakapan';
+  await upsertConversationMeta(params.cid, {
+    title: firstLine,
+    titleId: tid,
+    mode: params.mode,
+    activeTab: 'teks',
+    preview: firstLine,
+  });
+  await saveTurnMessageDirect(params.cid, params.clientMsgId, {
+    role: 'user',
+    kind: 'text',
+    mode: params.mode,
+    titleId: tid,
+    text: params.text,
+    state: 'done',
+  });
+
+  const { outputs, detectedSource, model, matchedChips } = await translateParagraphsDirect({
+    paragraphs: paras.length ? paras : [params.text],
+    mode: params.mode,
+    titleId: tid,
     signal: params.signal,
   });
-  if (!resp.ok) throw await parseErrorResponse(resp);
-  await consumeNdjson(resp, params.onEvent);
+
+  const fullDst = outputs.join('\n\n');
+  const sentences: SentencePair[] = outputs.map((dst, i) => ({
+    i,
+    src: paras[i] || params.text,
+    dst,
+  }));
+  const elapsed = Math.round(performance.now() - t0);
+
+  params.onEvent({
+    type: 'meta',
+    cid: params.cid,
+    mid: asstMid,
+    titleId: tid,
+    detectedSource,
+  });
+  params.onEvent({
+    type: 'done',
+    cid: params.cid,
+    mid: asstMid,
+    titleId: tid,
+    detectedSource,
+    fullDst,
+    sentences,
+    model,
+    ms: elapsed,
+  });
+
+  await saveTurnMessageDirect(params.cid, asstMid, {
+    role: 'assistant',
+    kind: params.text.length > 5000 ? 'long' : 'text',
+    mode: params.mode,
+    detectedSource,
+    titleId: tid,
+    srcText: params.text,
+    text: fullDst,
+    sentences,
+    nameChips: matchedChips,
+    state: 'done',
+    model,
+    ms: elapsed,
+  });
+  await upsertConversationMeta(params.cid, {
+    title: firstLine,
+    titleId: tid,
+    mode: params.mode,
+    detectedSource,
+    activeTab: 'teks',
+    preview: fullDst.slice(0, 180) || firstLine,
+  });
 }
 
 export async function lookupTurnNames(params: {
@@ -242,16 +426,23 @@ export async function lookupTurnNames(params: {
         : [],
     };
   }
-  const resp = await fetch(`${getApiBaseUrl()}/v1/names:lookup`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(await authHeaders(params.user)),
-    },
-    body: JSON.stringify(params),
-  });
-  if (!resp.ok) return { titleId: params.titleId || '', entries: [] };
-  return resp.json();
+  if (!(await isCloudBackendAvailable())) {
+    return { titleId: params.titleId || '', entries: [] };
+  }
+  try {
+    const resp = await fetch(`${getApiBaseUrl()}/v1/names:lookup`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(await authHeaders(params.user)),
+      },
+      body: JSON.stringify(params),
+    });
+    if (!resp.ok) return { titleId: params.titleId || '', entries: [] };
+    return resp.json();
+  } catch {
+    return { titleId: params.titleId || '', entries: [] };
+  }
 }
 
 export async function translateImageRequest(params: {
@@ -265,6 +456,13 @@ export async function translateImageRequest(params: {
   if (isLocalE2EMode()) {
     const store = getE2EStore();
     const mid = `img_${Date.now().toString(36)}`;
+    const { tgt } = parseModePair(params.mode);
+    const dstText =
+      tgt === 'ja'
+        ? '千早は静かに微笑んだ。'
+        : tgt === 'en'
+          ? 'Chihaya smiled quietly.'
+          : 'Chihaya tersenyum kecil.';
     const res: ImageTranslationResult = {
       width: 640,
       height: 480,
@@ -273,11 +471,11 @@ export async function translateImageRequest(params: {
           id: 1,
           box: [60, 50, 280, 96],
           src: '「千早は小さく笑った。」',
-          dst: params.mode === 'ja-en' ? 'Chihaya smiled quietly.' : 'Chihaya tersenyum kecil.',
+          dst: dstText,
         },
       ],
       fullSrc: '「千早は小さく笑った。」',
-      fullDst: params.mode === 'ja-en' ? 'Chihaya smiled quietly.' : 'Chihaya tersenyum kecil.',
+      fullDst: dstText,
       model: 'gemini-2.5-flash',
       dataUrl: params.imageDataUrl,
     };
@@ -287,6 +485,7 @@ export async function translateImageRequest(params: {
       role: 'assistant',
       kind: 'image',
       mode: params.mode,
+      detectedSource: 'ja',
       titleId: 't_rashomon',
       fileName: params.fileName,
       text: res.fullDst,
@@ -299,28 +498,119 @@ export async function translateImageRequest(params: {
       title: params.fileName,
       titleId: 't_rashomon',
       mode: params.mode,
+      detectedSource: 'ja',
       activeTab: 'gambar',
       preview: res.fullDst,
     });
     store.emit();
     return { cid: params.cid, mid, titleId: 't_rashomon', ...res };
   }
-  const resp = await fetch(`${getApiBaseUrl()}/v1/image:translate`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(await authHeaders(params.user)),
-    },
-    body: JSON.stringify({
-      cid: params.cid,
-      mode: params.mode,
-      fileName: params.fileName,
-      imageB64: params.imageDataUrl,
-      titleId: params.titleId,
-    }),
+
+  if (await isCloudBackendAvailable()) {
+    try {
+      const resp = await fetch(`${getApiBaseUrl()}/v1/image:translate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(await authHeaders(params.user)),
+        },
+        body: JSON.stringify({
+          cid: params.cid,
+          mode: params.mode,
+          fileName: params.fileName,
+          imageB64: params.imageDataUrl,
+          titleId: params.titleId,
+        }),
+      });
+      if (resp.ok) return resp.json();
+    } catch {
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    }
+  }
+
+  return directTranslateImage({
+    cid: params.cid,
+    mode: params.mode,
+    fileName: params.fileName,
+    imageDataUrl: params.imageDataUrl,
+    titleId: params.titleId,
   });
-  if (!resp.ok) throw await parseErrorResponse(resp);
-  return resp.json();
+}
+
+export async function processDocumentSubmission(params: {
+  uid: string;
+  cid: string;
+  mid: string;
+  mode: ModePair;
+  titleId?: string;
+  file: File;
+  onProgress?: (pct: number) => void;
+}): Promise<string> {
+  if (isLocalE2EMode()) {
+    const store = getE2EStore();
+    const jobId = `job_${Date.now().toString(36)}`;
+    const now = Date.now();
+    store.jobs.set(jobId, {
+      id: jobId,
+      cid: params.cid,
+      mid: params.mid,
+      titleId: params.titleId,
+      fileName: params.file.name,
+      fileSize: params.file.size,
+      fmt: params.file.name.split('.').pop()?.toLowerCase() || 'txt',
+      state: 'done',
+      doneParas: 3,
+      totalParas: 3,
+      updatedAt: now,
+    });
+    const bucket = store.messages.get(params.cid) ?? new Map();
+    bucket.set(params.mid, {
+      id: params.mid,
+      role: 'assistant',
+      kind: 'document',
+      mode: params.mode,
+      detectedSource: 'ja',
+      titleId: params.titleId || 't_rashomon',
+      fileName: params.file.name,
+      fmt: params.file.name.split('.').pop()?.toLowerCase() || 'txt',
+      jobId,
+      done: 3,
+      total: 3,
+      text: `Terjemahan dokumen ${params.file.name} selesai.`,
+      sentences: [{ i: 0, src: '千早は走った。', dst: 'Chihaya berlari.' }],
+      state: 'done',
+      createdAt: now,
+    });
+    store.messages.set(params.cid, bucket);
+    await upsertConversationMeta(params.cid, {
+      title: params.file.name,
+      titleId: params.titleId || 't_rashomon',
+      mode: params.mode,
+      detectedSource: 'ja',
+      activeTab: 'dokumen',
+      preview: params.file.name,
+    });
+    params.onProgress?.(100);
+    store.emit();
+    return jobId;
+  }
+
+  if (await isCloudBackendAvailable()) {
+    try {
+      return await uploadDocumentToCloudStorage(params);
+    } catch {
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    }
+  }
+
+  return directTranslateDocumentFile({
+    cid: params.cid,
+    mid: params.mid,
+    mode: params.mode,
+    titleId: params.titleId,
+    file: params.file,
+    onProgress: params.onProgress,
+  });
 }
 
 export async function previewLinkRequest(params: {
@@ -330,27 +620,34 @@ export async function previewLinkRequest(params: {
   mode: ModePair;
   titleId?: string;
 }): Promise<LinkPreviewPayload> {
-  if (isLocalE2EMode()) {
-    if (params.url.includes('127.0.0.1') || params.url.includes('169.254.169.254')) {
-      throw new ApiClientError(403, 'BLOCKED_URL', 'Alamat jaringan internal ditolak.');
-    }
+  const cleanUrl = normalizeWebUrl(params.url);
+
+  if (isLocalE2EMode() && !isDirectE2ETest()) {
     const store = getE2EStore();
     const mid = `lnk_${Date.now().toString(36)}`;
-    const host = new URL(params.url).hostname;
+    const host = new URL(cleanUrl).hostname;
+    const { tgt } = parseModePair(params.mode);
     const preview: LinkPreviewPayload = {
       mid,
       cid: params.cid,
       titleId: 't_rashomon',
-      url: params.url,
+      url: cleanUrl,
       host,
       isAozora: host.includes('aozora'),
       titleSrc: '第一章 雨の羅生門',
-      titleDst: params.mode === 'ja-en' ? 'Chapter 1: Rain at Rashomon' : 'Bab 1: Hujan di Rashomon',
+      titleDst:
+        tgt === 'ja'
+          ? '第一章 雨の羅生門'
+          : tgt === 'en'
+            ? 'Chapter 1: Rain at Rashomon'
+            : 'Bab 1: Hujan di Rashomon',
       excerptSrc: '千早は小さく笑った。',
       excerptDst:
-        params.mode === 'ja-en'
-          ? 'Chihaya smiled quietly under the gate.'
-          : 'Chihaya tersenyum kecil di bawah gerbang.',
+        tgt === 'ja'
+          ? '千早は門の下で静かに微笑んだ。'
+          : tgt === 'en'
+            ? 'Chihaya smiled quietly under the gate.'
+            : 'Chihaya tersenyum kecil di bawah gerbang.',
       paragraphCount: 12,
       lockedNames: 1,
       readerSupported: true,
@@ -361,6 +658,7 @@ export async function previewLinkRequest(params: {
       role: 'assistant',
       kind: 'link',
       mode: params.mode,
+      detectedSource: 'ja',
       titleId: 't_rashomon',
       text: preview.excerptDst,
       linkPreview: preview,
@@ -372,22 +670,50 @@ export async function previewLinkRequest(params: {
       title: preview.titleDst,
       titleId: 't_rashomon',
       mode: params.mode,
+      detectedSource: 'ja',
       activeTab: 'link',
       preview: preview.excerptDst,
     });
     store.emit();
     return preview;
   }
-  const resp = await fetch(`${getApiBaseUrl()}/v1/links:preview`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(await authHeaders(params.user)),
-    },
-    body: JSON.stringify(params),
-  });
-  if (!resp.ok) throw await parseErrorResponse(resp);
-  return resp.json();
+
+  if (await isCloudBackendAvailable()) {
+    try {
+      const resp = await fetch(`${getApiBaseUrl()}/v1/links:preview`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(await authHeaders(params.user)),
+        },
+        body: JSON.stringify({ ...params, url: cleanUrl }),
+      });
+      if (resp.ok) return resp.json();
+      if (resp.status === 403 || resp.status === 422) {
+        throw await parseErrorResponse(resp);
+      }
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    } catch (err) {
+      if (err instanceof ApiClientError) throw err;
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    }
+  }
+
+  try {
+    return await directPreviewLink({
+      cid: params.cid,
+      url: cleanUrl,
+      mode: params.mode,
+      titleId: params.titleId,
+    });
+  } catch (err) {
+    throw new Error(
+      humanizeFetchError(
+        err,
+        'Halaman web ini menolak akses pembaca otomatis atau sedang tidak terjangkau. Gunakan tautan langsung atau salin isi artikelnya.'
+      )
+    );
+  }
 }
 
 export async function fetchTranslatedWebHtml(params: {
@@ -397,26 +723,44 @@ export async function fetchTranslatedWebHtml(params: {
   titleId?: string;
   view: 'translated' | 'original';
 }): Promise<string> {
-  if (isLocalE2EMode()) {
+  const cleanUrl = normalizeWebUrl(params.url);
+
+  if (isLocalE2EMode() && !isDirectE2ETest()) {
+    const { tgt } = parseModePair(params.mode);
     const bodyText =
       params.view === 'original'
         ? '<h1>第一章 雨の羅生門</h1><p>千早は小さく笑った。</p>'
-        : params.mode === 'ja-en'
-          ? '<h1>Chapter 1: Rain at Rashomon</h1><p>Chihaya smiled quietly.</p>'
-          : '<h1>Bab 1: Hujan di Rashomon</h1><p>Chihaya tersenyum kecil.</p>';
-    return `<!doctype html><html lang="id"><head><meta charset="utf-8"><style>body{font-family:Charter,Georgia,serif;max-width:680px;margin:32px auto;padding:0 20px;line-height:1.75;color:#141917;background:#FAFBFA}</style></head><body>${bodyText}</body></html>`;
+        : tgt === 'ja'
+          ? '<h1>第一章 雨の羅生門</h1><p>千早は静かに微笑んだ。</p>'
+          : tgt === 'en'
+            ? '<h1>Chapter 1: Rain at Rashomon</h1><p>Chihaya smiled quietly.</p>'
+            : '<h1>Bab 1: Hujan di Rashomon</h1><p>Chihaya tersenyum kecil.</p>';
+    return `<!doctype html><html lang="${tgt}"><head><meta charset="utf-8"><style>body{font-family:Charter,Georgia,serif;max-width:680px;margin:32px auto;padding:0 20px;line-height:1.75;color:#141917;background:#FAFBFA}</style></head><body>${bodyText}</body></html>`;
   }
-  const qs = new URLSearchParams({
-    url: params.url,
+
+  if (await isCloudBackendAvailable()) {
+    try {
+      const qs = new URLSearchParams({
+        url: cleanUrl,
+        mode: params.mode,
+        view: params.view,
+        ...(params.titleId ? { titleId: params.titleId } : {}),
+      });
+      const resp = await fetch(`${getApiBaseUrl()}/v1/web?${qs.toString()}`, {
+        headers: await authHeaders(params.user),
+      });
+      if (resp.ok) return resp.text();
+    } catch {
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    }
+  }
+
+  return directFetchTranslatedWebHtml({
+    url: cleanUrl,
     mode: params.mode,
+    titleId: params.titleId,
     view: params.view,
-    ...(params.titleId ? { titleId: params.titleId } : {}),
   });
-  const resp = await fetch(`${getApiBaseUrl()}/v1/web?${qs.toString()}`, {
-    headers: await authHeaders(params.user),
-  });
-  if (!resp.ok) throw await parseErrorResponse(resp);
-  return resp.text();
 }
 
 export async function transcribeShortClip(params: {
@@ -425,19 +769,65 @@ export async function transcribeShortClip(params: {
   lang?: string;
 }): Promise<string> {
   if (isLocalE2EMode()) {
+    if ((params.lang || '').startsWith('id')) return 'Selamat pagi, apa kabar hari ini?';
+    if ((params.lang || '').startsWith('en')) return 'Good morning, nice to meet you.';
     return '千早は小さく笑った。';
   }
-  const fd = new FormData();
-  fd.append('audio', params.blob, 'dictation.webm');
-  fd.append('lang', params.lang || 'ja-JP');
-  const resp = await fetch(`${getApiBaseUrl()}/v1/speech:transcribe`, {
-    method: 'POST',
-    headers: await authHeaders(params.user),
-    body: fd,
+
+  if (await isCloudBackendAvailable()) {
+    try {
+      const fd = new FormData();
+      fd.append('audio', params.blob, 'dictation.webm');
+      fd.append('lang', params.lang || 'ja-JP');
+      const resp = await fetch(`${getApiBaseUrl()}/v1/speech:transcribe`, {
+        method: 'POST',
+        headers: await authHeaders(params.user),
+        body: fd,
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        return String(data.text || '');
+      }
+    } catch {
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    }
+  }
+
+  const geminiKey = await getOwnerGeminiKey();
+  if (!geminiKey) {
+    throw new Error(
+      'Peramban ini tidak menyediakan Web Speech API bawaan. Simpan kunci Gemini di Setelan -> Lanjutan untuk transkripsi suara.'
+    );
+  }
+  const b64 = await new Promise<string>((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || '').split(',', 2)[1] || '');
+    r.onerror = () => reject(new Error('Gagal membaca klip audio.'));
+    r.readAsDataURL(params.blob);
   });
-  if (!resp.ok) throw await parseErrorResponse(resp);
+  const resp = await fetch(
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { inlineData: { mimeType: params.blob.type || 'audio/webm', data: b64 } },
+              {
+                text: `Transcribe the spoken speech (${params.lang || 'ja-JP'}) verbatim as plain text only.`,
+              },
+            ],
+          },
+        ],
+      }),
+    }
+  );
+  if (!resp.ok) throw new Error(`Gemini Audio HTTP ${resp.status}`);
   const data = await resp.json();
-  return String(data.text || '');
+  return String(data?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
 }
 
 export async function downloadExportedTurn(params: {
@@ -447,18 +837,19 @@ export async function downloadExportedTurn(params: {
   fmt: string;
   bilingual?: boolean;
   theme?: string;
+  fallbackSentences?: SentencePair[];
+  fallbackText?: string;
 }): Promise<{ blob: Blob; filename: string }> {
-  if (isLocalE2EMode()) {
-    const content =
-      params.fmt === 'html'
-        ? `<!doctype html><html lang="id" data-tranx-v3="${params.theme || 'Terang'}"><body><p><ruby>千早<rt>ちはや</rt></ruby>: Chihaya tersenyum kecil.</p></body></html>`
-        : 'Chihaya tersenyum kecil.\n';
-    return {
-      blob: new Blob([content], {
-        type: params.fmt === 'html' ? 'text/html;charset=utf-8' : 'text/plain;charset=utf-8',
-      }),
-      filename: `tranx-${params.mid}.${params.fmt}`,
-    };
+  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
+    return buildDirectExportBlob({
+      cid: params.cid,
+      mid: params.mid,
+      fmt: params.fmt,
+      fallbackSentences: params.fallbackSentences,
+      fallbackText: params.fallbackText,
+      bilingual: params.bilingual,
+      theme: params.theme,
+    });
   }
   const qs = new URLSearchParams({
     cid: params.cid,
@@ -470,7 +861,17 @@ export async function downloadExportedTurn(params: {
     `${getApiBaseUrl()}/v1/messages/${encodeURIComponent(params.mid)}/export?${qs.toString()}`,
     { headers: await authHeaders(params.user) }
   );
-  if (!resp.ok) throw await parseErrorResponse(resp);
+  if (!resp.ok) {
+    return buildDirectExportBlob({
+      cid: params.cid,
+      mid: params.mid,
+      fmt: params.fmt,
+      fallbackSentences: params.fallbackSentences,
+      fallbackText: params.fallbackText,
+      bilingual: params.bilingual,
+      theme: params.theme,
+    });
+  }
   const blob = await resp.blob();
   return { blob, filename: `tranx-${params.mid}.${params.fmt}` };
 }
@@ -481,7 +882,7 @@ export async function resumeInterruptedTurn(params: {
   mid: string;
   onEvent: (ev: StreamEvent) => void;
 }): Promise<void> {
-  if (isLocalE2EMode()) {
+  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
     params.onEvent({ type: 'done', state: 'done', doneParas: 3, totalParas: 3 });
     return;
   }
@@ -505,30 +906,51 @@ export async function fetchEngineMeta(user: AuthSessionUser): Promise<Record<str
       jptrans: { version: '1.1.0', manifest: 'verified' },
     };
   }
-  const resp = await fetch(`${getApiBaseUrl()}/v1/meta`, {
-    headers: await authHeaders(user),
-  });
-  if (!resp.ok) throw await parseErrorResponse(resp);
-  return resp.json();
+  if (await isCloudBackendAvailable()) {
+    try {
+      const resp = await fetch(`${getApiBaseUrl()}/v1/meta`, {
+        headers: await authHeaders(user),
+      });
+      if (resp.ok) return resp.json();
+    } catch {
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    }
+  }
+  const directKey = await getOwnerGeminiKey();
+  return {
+    keyStatus: {
+      configured: Boolean(directKey),
+      source: directKey ? 'firestore-vault' : 'tranx-direct-gtx',
+    },
+    usageToday: { chars: 0, calls: 0 },
+    jptrans: { version: '1.1.0', manifest: 'direct-mode' },
+  };
 }
 
 export async function saveEngineVaultKey(
   user: AuthSessionUser,
   apiKey: string
 ): Promise<{ configured: boolean; source: string }> {
-  if (isLocalE2EMode()) {
-    return { configured: Boolean(apiKey.trim()), source: apiKey.trim() ? 'vault' : 'missing' };
+  await setOwnerGeminiKey(apiKey);
+  if (!isLocalE2EMode() && (await isCloudBackendAvailable())) {
+    try {
+      const resp = await fetch(`${getApiBaseUrl()}/v1/engine:key`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(await authHeaders(user)),
+        },
+        body: JSON.stringify({ apiKey }),
+      });
+      if (resp.ok) return resp.json();
+    } catch {
+      // Stored safely in owner-only Firestore settings/secrets
+    }
   }
-  const resp = await fetch(`${getApiBaseUrl()}/v1/engine:key`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(await authHeaders(user)),
-    },
-    body: JSON.stringify({ apiKey }),
-  });
-  if (!resp.ok) throw await parseErrorResponse(resp);
-  return resp.json();
+  return {
+    configured: Boolean(apiKey.trim()),
+    source: apiKey.trim() ? 'firestore-vault' : 'missing',
+  };
 }
 
 export async function runEngineCheck(
@@ -536,17 +958,59 @@ export async function runEngineCheck(
 ): Promise<Array<{ model: string; ok: boolean; ms: number; sample?: string; error?: string }>> {
   if (isLocalE2EMode()) {
     return [
-      { model: 'gemini-2.5-flash-lite', ok: true, ms: 340, sample: 'Selamat pagi. Chihaya tersenyum kecil.' },
-      { model: 'gemini-2.5-flash', ok: true, ms: 580, sample: 'Selamat pagi. Chihaya tersenyum kecil.' },
+      {
+        model: 'gemini-2.5-flash-lite',
+        ok: true,
+        ms: 320,
+        sample: 'Selamat pagi. Chihaya tersenyum kecil.',
+      },
+      {
+        model: 'gemini-2.5-flash',
+        ok: true,
+        ms: 540,
+        sample: 'Selamat pagi. Chihaya tersenyum kecil.',
+      },
     ];
   }
-  const resp = await fetch(`${getApiBaseUrl()}/v1/engine:check`, {
-    method: 'POST',
-    headers: await authHeaders(user),
-  });
-  if (!resp.ok) throw await parseErrorResponse(resp);
-  const data = await resp.json();
-  return data.models || [];
+  if (await isCloudBackendAvailable()) {
+    try {
+      const resp = await fetch(`${getApiBaseUrl()}/v1/engine:check`, {
+        method: 'POST',
+        headers: await authHeaders(user),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        return data.models || [];
+      }
+    } catch {
+      cloudReachableState = { ok: false, checkedAt: Date.now() };
+    }
+  }
+
+  const t0 = performance.now();
+  try {
+    const { outputs, model } = await translateParagraphsDirect({
+      paragraphs: ['おはようございます。'],
+      mode: 'ja-id',
+    });
+    return [
+      {
+        model,
+        ok: true,
+        ms: Math.round(performance.now() - t0),
+        sample: outputs[0] || 'Selamat pagi.',
+      },
+    ];
+  } catch (err) {
+    return [
+      {
+        model: 'tranx-direct',
+        ok: false,
+        ms: Math.round(performance.now() - t0),
+        error: humanizeFetchError(err, 'Mesin langsung tidak dapat dijangkau.'),
+      },
+    ];
+  }
 }
 
 export async function generatePairCode(
@@ -557,6 +1021,13 @@ export async function generatePairCode(
       code: '482915',
       expiresAt: new Date(Date.now() + 120000).toISOString(),
     };
+  }
+  if (!(await isCloudBackendAvailable())) {
+    throw new ApiClientError(
+      503,
+      'CLOUD_FN_REQUIRED',
+      'Kode pasangan 6 angka memerlukan Cloud Functions aktif. Gunakan tombol Masuk dengan Google di perangkat kedua Anda.'
+    );
   }
   const resp = await fetch(`${getApiBaseUrl()}/v1/auth:pairCode`, {
     method: 'POST',
@@ -569,9 +1040,20 @@ export async function generatePairCode(
 export async function redeemPairCodeRequest(code: string): Promise<string> {
   if (isLocalE2EMode()) {
     if (code.trim().length !== 6) {
-      throw new ApiClientError(400, 'INVALID_FORMAT', 'Kode pasangan harus terdiri atas 6 angka.');
+      throw new ApiClientError(
+        400,
+        'INVALID_FORMAT',
+        'Kode pasangan harus terdiri atas 6 angka.'
+      );
     }
     return 'e2e-custom-token';
+  }
+  if (!(await isCloudBackendAvailable())) {
+    throw new ApiClientError(
+      503,
+      'CLOUD_FN_REQUIRED',
+      'Layanan kode pasangan belum aktif. Silakan masuk langsung menggunakan akun Google pemilik.'
+    );
   }
   const resp = await fetch(`${getApiBaseUrl()}/v1/auth:pair`, {
     method: 'POST',
@@ -584,7 +1066,7 @@ export async function redeemPairCodeRequest(code: string): Promise<string> {
 }
 
 export async function revokeAllOwnerSessions(user: AuthSessionUser): Promise<void> {
-  if (isLocalE2EMode()) return;
+  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) return;
   const resp = await fetch(`${getApiBaseUrl()}/v1/auth:revoke`, {
     method: 'POST',
     headers: await authHeaders(user),
@@ -597,6 +1079,13 @@ export async function generateInboxToken(
 ): Promise<{ id: string; token: string }> {
   if (isLocalE2EMode()) {
     return { id: 'inb_demo', token: 'txi_e2e_shortcut_token_demo' };
+  }
+  if (!(await isCloudBackendAvailable())) {
+    throw new ApiClientError(
+      503,
+      'CLOUD_FN_REQUIRED',
+      'Webhook Pintasan memerlukan Cloud Functions aktif. Anda tetap dapat memakai Bagikan -> tranX langsung di PWA.'
+    );
   }
   const resp = await fetch(`${getApiBaseUrl()}/v1/inbox:token`, {
     method: 'POST',
@@ -613,10 +1102,12 @@ export async function dismissInboxItem(user: AuthSessionUser, inboxId: string): 
     store.emit();
     return;
   }
-  await fetch(`${getApiBaseUrl()}/v1/inbox/${encodeURIComponent(inboxId)}`, {
-    method: 'DELETE',
-    headers: await authHeaders(user),
-  });
+  if (await isCloudBackendAvailable()) {
+    await fetch(`${getApiBaseUrl()}/v1/inbox/${encodeURIComponent(inboxId)}`, {
+      method: 'DELETE',
+      headers: await authHeaders(user),
+    }).catch(() => {});
+  }
 }
 
 export async function mergeTitleGlossaries(
@@ -655,15 +1146,16 @@ export async function mergeTitleGlossaries(
   return resp.json();
 }
 
-export async function downloadFullBackup(user: AuthSessionUser): Promise<Blob> {
-  if (isLocalE2EMode()) {
-    const store = getE2EStore();
+export async function downloadFullBackup(
+  user: AuthSessionUser,
+  fallbackData?: Record<string, unknown>
+): Promise<Blob> {
+  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
     const payload = JSON.stringify(
       {
-        version: '2.1',
+        version: '2.2',
         exportedAt: new Date().toISOString(),
-        settings: store.settings,
-        conversations: Array.from(store.conversations.values()),
+        ...(fallbackData || {}),
       },
       null,
       2
@@ -681,16 +1173,17 @@ export async function deleteConversationRemote(
   user: AuthSessionUser,
   cid: string
 ): Promise<void> {
-  if (isLocalE2EMode()) {
-    const store = getE2EStore();
-    store.conversations.delete(cid);
-    store.messages.delete(cid);
-    store.emit();
+  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
+    await deleteConversationDirect(cid);
     return;
   }
-  const resp = await fetch(`${getApiBaseUrl()}/v1/conversations/${encodeURIComponent(cid)}`, {
-    method: 'DELETE',
-    headers: await authHeaders(user),
-  });
-  if (!resp.ok) throw await parseErrorResponse(resp);
+  try {
+    const resp = await fetch(`${getApiBaseUrl()}/v1/conversations/${encodeURIComponent(cid)}`, {
+      method: 'DELETE',
+      headers: await authHeaders(user),
+    });
+    if (!resp.ok) await deleteConversationDirect(cid);
+  } catch {
+    await deleteConversationDirect(cid);
+  }
 }

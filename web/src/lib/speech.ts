@@ -1,27 +1,48 @@
 import { transcribeShortClip } from './api';
 import { isLocalE2EMode, type AuthSessionUser } from './firebase';
+import type { SourceLang, TargetLang } from '../types';
 
 export interface DictationHandle {
   stop: () => void;
 }
 
+export function speechBcp47ForSource(
+  src: SourceLang,
+  detected?: TargetLang | ''
+): string {
+  const effective = src === 'auto' ? detected || 'ja' : src;
+  if (effective === 'id') return 'id-ID';
+  if (effective === 'en') return 'en-US';
+  return 'ja-JP';
+}
+
 export function startVoiceDictation(params: {
   user: AuthSessionUser;
+  sourceLang: SourceLang;
+  detectedLang?: TargetLang | '';
   onInterim: (text: string) => void;
   onLevels: (bars: number[]) => void;
   onDone: (finalText: string) => void;
   onError: (message: string) => void;
 }): DictationHandle {
+  const bcp47 = speechBcp47ForSource(params.sourceLang, params.detectedLang);
+
   if (isLocalE2EMode()) {
+    const sample =
+      bcp47 === 'id-ID'
+        ? 'Selamat pagi, senang bertemu denganmu.'
+        : bcp47 === 'en-US'
+          ? 'Good morning, nice to meet you.'
+          : '千早は小さく笑った。';
     params.onLevels([8, 16, 12, 18, 10]);
-    params.onInterim('千早は小さく...');
+    params.onInterim(sample.slice(0, 8));
     const timer = window.setTimeout(() => {
-      params.onDone('千早は小さく笑った。');
-    }, 350);
+      params.onDone(sample);
+    }, 320);
     return {
       stop: () => {
         window.clearTimeout(timer);
-        params.onDone('千早は小さく笑った。');
+        params.onDone(sample);
       },
     };
   }
@@ -29,7 +50,7 @@ export function startVoiceDictation(params: {
   const SpeechCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (SpeechCtor) {
     const rec = new SpeechCtor();
-    rec.lang = 'ja-JP';
+    rec.lang = bcp47;
     rec.continuous = true;
     rec.interimResults = true;
     let accumulated = '';
@@ -83,7 +104,7 @@ export function startVoiceDictation(params: {
     };
   }
 
-  /* Fallback: MediaRecorder -> POST /v1/speech:transcribe (<= 60s, <= 4 MB) */
+  /* Fallback: MediaRecorder -> transcribeShortClip */
   let mediaStream: MediaStream | null = null;
   let recorder: MediaRecorder | null = null;
   let rafId = 0;
@@ -127,7 +148,7 @@ export function startVoiceDictation(params: {
           const transcript = await transcribeShortClip({
             user: params.user,
             blob,
-            lang: 'ja-JP',
+            lang: bcp47,
           });
           params.onDone(transcript);
         } catch (err) {

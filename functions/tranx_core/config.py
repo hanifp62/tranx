@@ -23,7 +23,19 @@ from jptrans.config import (  # noqa: E402
 )
 
 DEFAULT_MODELS: tuple[str, ...] = ("gemini-2.5-flash-lite", "gemini-2.5-flash")
-SUPPORTED_MODES: tuple[str, ...] = ("ja-id", "ja-en")
+SUPPORTED_SOURCES: tuple[str, ...] = ("auto", "ja", "id", "en")
+SUPPORTED_TARGETS: tuple[str, ...] = ("id", "en", "ja")
+SUPPORTED_MODES: tuple[str, ...] = (
+    "auto-id",
+    "auto-en",
+    "auto-ja",
+    "ja-id",
+    "ja-en",
+    "id-ja",
+    "id-en",
+    "en-id",
+    "en-ja",
+)
 SUPPORTED_UI_LANGS: tuple[str, ...] = ("id", "en")
 
 
@@ -66,6 +78,7 @@ class AppSettings:
     max_upload_mb: int = 50
     daily_char_cap: int = 300000
     daily_call_cap: int = 2000
+    default_source: str = "auto"
     default_target: str = "id"
     ui_lang: str = "id"
     theme: str = "system"
@@ -85,8 +98,11 @@ class AppSettings:
             if isinstance(effort_raw, dict)
             else {}
         )
+        source = str(raw.get("defaultSource") or "auto")
+        if source not in SUPPORTED_SOURCES:
+            source = "auto"
         target = str(raw.get("defaultTarget") or "id")
-        if target not in LANGS:
+        if target not in SUPPORTED_TARGETS:
             target = "id"
         ui_lang = str(raw.get("uiLang") or "id")
         if ui_lang not in SUPPORTED_UI_LANGS:
@@ -103,6 +119,7 @@ class AppSettings:
             max_upload_mb=min(max(int(raw.get("maxUploadMb", 50)), 1), 50),
             daily_char_cap=max(int(raw.get("dailyCharCap", 300000)), 1000),
             daily_call_cap=max(int(raw.get("dailyCallCap", 2000)), 10),
+            default_source=source,
             default_target=target,
             ui_lang=ui_lang,
             theme=theme,
@@ -117,6 +134,7 @@ class AppSettings:
             "maxUploadMb": self.max_upload_mb,
             "dailyCharCap": self.daily_char_cap,
             "dailyCallCap": self.daily_call_cap,
+            "defaultSource": self.default_source,
             "defaultTarget": self.default_target,
             "uiLang": self.ui_lang,
             "theme": self.theme,
@@ -125,11 +143,13 @@ class AppSettings:
 
 def parse_mode_target(mode: str, default_target: str = "id") -> str:
     clean = (mode or "").strip().lower()
-    if clean in ("ja-en", "en"):
-        return "en"
-    if clean in ("ja-id", "id"):
-        return "id"
-    if default_target in LANGS:
+    if clean in SUPPORTED_TARGETS:
+        return clean
+    if "-" in clean:
+        _, right = clean.split("-", 1)
+        if right in SUPPORTED_TARGETS:
+            return right
+    if default_target in SUPPORTED_TARGETS:
         return default_target
     raise ValueError(f"Mode bahasa tidak didukung: {mode!r}")
 

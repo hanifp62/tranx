@@ -12,9 +12,10 @@ from jptrans.readers import read_text
 from jptrans.style import Renderer
 
 from .cache import LayeredTranslationCache
-from .config import AppSettings, TitleStyle, chat_config, long_config, parse_mode_target
+from .config import AppSettings, TitleStyle, chat_config, long_config
 from .engines import DailyCapExceeded, UsageTracker, build_engine_chain
 from .glossary_store import FirestoreGlossary, glossary_entry_to_dict
+from .multilingual import parse_mode_pair, translate_multilingual_document
 
 DEFAULT_CHUNK_PARAS = 8
 
@@ -46,26 +47,45 @@ def stream_fast_chat(
         return
 
     started = time.monotonic()
-    target_lang = parse_mode_target(mode, settings.default_target)
-    cfg = chat_config(settings, target_lang, style=style)
-    engines = build_engine_chain(
-        cfg,
-        settings,
-        api_key=api_key,
-        usage_tracker=usage_tracker,
-        transport=llm_transport,
+    req_src, eff_src, target_lang = parse_mode_pair(
+        mode,
+        sample_text=clean,
+        default_source=settings.default_source,
+        default_target=settings.default_target,
     )
     doc = read_text(clean, title_name)
     yield {
         "type": "meta",
-        "mode": f"ja-{target_lang}",
+        "mode": f"{req_src}-{target_lang}",
+        "detectedSource": eff_src,
         "totalParas": len(doc.paragraphs),
         "model": settings.llm_models[0],
     }
 
     try:
-        with Translator(cfg, engines, cache, glossary) as tr:
-            result = tr.translate_document(doc)
+        if eff_src == "ja" and target_lang in ("id", "en"):
+            cfg = chat_config(settings, target_lang, style=style)
+            engines = build_engine_chain(
+                cfg,
+                settings,
+                api_key=api_key,
+                usage_tracker=usage_tracker,
+                transport=llm_transport,
+            )
+            with Translator(cfg, engines, cache, glossary) as tr:
+                result = tr.translate_document(doc)
+        else:
+            result, _ = translate_multilingual_document(
+                doc=doc,
+                src_lang=eff_src,
+                tgt_lang=target_lang,
+                settings=settings,
+                glossary_entries=glossary.non_builtin_entries(),
+                cache=cache,
+                api_key=api_key,
+                usage_tracker=usage_tracker,
+                llm_transport=llm_transport,
+            )
     except DailyCapExceeded as exc:
         yield {
             "type": "error",
@@ -109,6 +129,7 @@ def stream_fast_chat(
     yield {
         "type": "done",
         "fullDst": result.target,
+        "detectedSource": eff_src,
         "sentences": sentences_flat,
         "ms": elapsed_ms,
         "model": used_model,
@@ -128,9 +149,16 @@ def lookup_new_names_for_text(
     usage_tracker: UsageTracker | None = None,
     llm_transport: Any = None,
 ) -> list[dict[str, Any]]:
-    """Run jptrans.Translator.prepare(doc) after chat completes to resolve new kanji names for NameChip."""
+    """Run jptrans.Translator.prepare(doc) after Japanese chat completes to resolve new kanji names for NameChip."""
+    _, eff_src, target_lang = parse_mode_pair(
+        mode,
+        sample_text=text,
+        default_source=settings.default_source,
+        default_target=settings.default_target,
+    )
+    if eff_src != "ja" or target_lang not in ("id", "en"):
+        return []
     before_surfaces = {e.surface for e in glossary.non_builtin_entries()}
-    target_lang = parse_mode_target(mode, settings.default_target)
     cfg = long_config(settings, target_lang, style=style)
     engines = build_engine_chain(
         cfg,
@@ -175,7 +203,109 @@ def stream_document_chunks(
 ) -> Iterator[dict[str, Any]]:
     """Translate a Document in resumable paragraph chunks, skipping already persisted paragraphs."""
     started = time.monotonic()
-    target_lang = parse_mode_target(mode, settings.default_target)
+    sample_text = "\n".join(p.text for p in doc.paragraphs[:6])
+    req_src, eff_src, target_lang = parse_mode_pair(
+        mode,
+        sample_text=sample_text,
+        default_source=settings.default_source,
+        default_target=settings.default_target,
+    )
+    persisted = dict(existing_paras or {})
+    total = len(doc.paragraphs)
+
+    yield {
+        "type": "meta",
+        "mode": f"{req_src}-{target_lang}",
+        "detectedSource": eff_src,
+        "title": doc.title,
+        "fmt": doc.fmt,
+        "totalParas": total,
+        "resumedFrom": len(persisted),
+    }
+
+    if not (eff_src == "ja" and target_lang in ("id", "en")):
+        pending_indices = [i for i in range(total) if i not in persisted]
+        done_count = len(persisted)
+        for offset in range(0, len(pending_indices), max(chunk_size, 1)):
+            if should_stop is not None and should_stop():
+                yield {
+                    "type": "done",
+                    "state": "stopped",
+                    "doneParas": done_count,
+                    "totalParas": total,
+                    "ms": round((time.monotonic() - started) * 1000),
+                }
+                return
+            batch_indices = pending_indices[offset : offset + max(chunk_size, 1)]
+            sub_doc = Document(
+                title=doc.title,
+                paragraphs=[doc.paragraphs[idx] for idx in batch_indices],
+                ruby=doc.ruby,
+                source_path=doc.source_path,
+                fmt=doc.fmt,
+            )
+            try:
+                sub_result, used_m = translate_multilingual_document(
+                    doc=sub_doc,
+                    src_lang=eff_src,
+                    tgt_lang=target_lang,
+                    settings=settings,
+                    glossary_entries=glossary.non_builtin_entries(),
+                    cache=cache,
+                    api_key=api_key,
+                    usage_tracker=usage_tracker,
+                    llm_transport=llm_transport,
+                )
+            except DailyCapExceeded as exc:
+                yield {
+                    "type": "error",
+                    "code": "DAILY_CAP_REACHED",
+                    "state": "partial",
+                    "doneParas": done_count,
+                    "totalParas": total,
+                    "message": "Batas pemakaian harian tercapai.",
+                    "charsUsed": exc.chars_used,
+                    "charCap": exc.char_cap,
+                }
+                return
+            except Exception as exc:
+                yield {
+                    "type": "error",
+                    "code": "ENGINE_FAILED",
+                    "state": "partial" if done_count > 0 else "error",
+                    "doneParas": done_count,
+                    "totalParas": total,
+                    "message": str(exc),
+                }
+                return
+            for global_idx, tpara in zip(batch_indices, sub_result.paragraphs):
+                para_payload = {
+                    "i": global_idx,
+                    "src": tpara.source.text,
+                    "dst": tpara.target or tpara.source.text,
+                    "kind": tpara.source.kind,
+                    "meta": dict(tpara.source.meta),
+                    "sentences": [
+                        {"src": s.source, "dst": s.target, "status": s.status, "engine": s.engine, "turn": s.turn}
+                        for s in tpara.sentences
+                    ],
+                    "model": used_m,
+                }
+                persisted[global_idx] = para_payload
+                done_count += 1
+                if on_para_saved is not None:
+                    on_para_saved(global_idx, para_payload)
+                yield {"type": "para", **para_payload, "doneParas": done_count, "totalParas": total}
+        yield {
+            "type": "done",
+            "state": "done",
+            "detectedSource": eff_src,
+            "doneParas": done_count,
+            "totalParas": total,
+            "ms": round((time.monotonic() - started) * 1000),
+        }
+        return
+
     cfg = long_config(settings, target_lang, style=style)
     engines = build_engine_chain(
         cfg,
@@ -184,17 +314,6 @@ def stream_document_chunks(
         usage_tracker=usage_tracker,
         transport=llm_transport,
     )
-    persisted = dict(existing_paras or {})
-    total = len(doc.paragraphs)
-
-    yield {
-        "type": "meta",
-        "mode": f"ja-{target_lang}",
-        "title": doc.title,
-        "fmt": doc.fmt,
-        "totalParas": total,
-        "resumedFrom": len(persisted),
-    }
 
     with Translator(cfg, engines, cache, glossary) as tr:
         try:

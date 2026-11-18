@@ -336,6 +336,15 @@ export function IconChevronDown(props: IconProps) {
   );
 }
 
+export function IconArrowsSwitch(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <path d="M7 10h13l-3.5-3.5" />
+      <path d="M17 14H4l3.5 3.5" />
+    </Svg20>
+  );
+}
+
 export function IconText(props: IconProps) {
   return (
     <Svg20 {...props}>

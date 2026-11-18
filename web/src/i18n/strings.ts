@@ -1,4 +1,4 @@
-import type { UiLang } from '../types';
+import type { SourceLang, TargetLang, UiLang } from '../types';
 
 export interface UiStrings {
   greeting: string;
@@ -11,6 +11,15 @@ export interface UiStrings {
   modeImage: string;
   modeDocument: string;
   modeLink: string;
+  langAuto: string;
+  langAutoShort: string;
+  langId: string;
+  langEn: string;
+  langJa: string;
+  swapLanguages: string;
+  sourceLangTitle: string;
+  targetLangTitle: string;
+  detectedPrefix: string;
   langJaId: string;
   langJaEn: string;
   langMenuTitle: string;
@@ -99,6 +108,7 @@ export interface UiStrings {
   themeSystem: string;
   themeLight: string;
   themeDark: string;
+  defaultSourceLabel: string;
   defaultTargetLabel: string;
   inboxFromShortcut: string;
   translateNow: string;
@@ -112,15 +122,24 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     composerPlaceholder: 'Ketik atau tempel teks, atau mulai bicara...',
     composerImagePlaceholder: 'Tambahkan catatan konteks tokoh bila perlu...',
     composerDocPlaceholder: 'Tambahkan petunjuk judul karya bila perlu...',
-    composerLinkPlaceholder: 'Tempel tautan artikel atau bab web Jepang (https://...)',
+    composerLinkPlaceholder: 'Tempel tautan artikel atau halaman web (https://...)',
     modeText: 'Teks',
     modeImage: 'Gambar',
     modeDocument: 'Dokumen',
     modeLink: 'Link',
+    langAuto: 'Deteksi bahasa',
+    langAutoShort: 'Deteksi',
+    langId: 'Indonesia',
+    langEn: 'Inggris',
+    langJa: 'Jepang',
+    swapLanguages: 'Tukar bahasa',
+    sourceLangTitle: 'Bahasa sumber',
+    targetLangTitle: 'Bahasa tujuan',
+    detectedPrefix: 'Terdeteksi',
     langJaId: 'Jepang \u2192 Indonesia',
     langJaEn: 'Jepang \u2192 Inggris',
-    langMenuTitle: 'Bahasa terjemahan',
-    sourceAutoHint: 'Sumber bahasa Jepang dikenali otomatis.',
+    langMenuTitle: 'Pasangan bahasa',
+    sourceAutoHint: 'Mendeteksi otomatis Indonesia, Inggris, atau Jepang.',
     sidebarNew: 'Baru',
     sidebarSearch: 'Cari',
     sidebarSearchPlaceholder: 'Cari judul atau isi bacaan...',
@@ -155,7 +174,7 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     unpinnedToast: 'Sematan dilepas',
     langChangedToast: 'Bahasa tampilan diubah ke Indonesia',
     deletedToast: 'Percakapan dihapus',
-    dictationListening: 'Mendengarkan bahasa Jepang...',
+    dictationListening: 'Mendengarkan suara...',
     dictationStop: 'Selesai bicara',
     dictationStart: 'Dikte suara',
     send: 'Kirim',
@@ -176,8 +195,8 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     pickDocument: 'Pilih berkas',
     dropFilesHere: 'Lepaskan berkas di sini untuk diterjemahkan',
     supportedDocHint: 'Mendukung .epub, .pdf, .docx, .srt, .vtt, .ass, .html, .md, .txt hingga 50 MB.',
-    supportedImageHint: 'Tarik tangkapan layar, halaman manga, atau foto teks Jepang (.png, .jpg, .webp).',
-    pasteLinkLabel: 'Alamat halaman web Jepang',
+    supportedImageHint: 'Tarik tangkapan layar, halaman manga, atau foto teks (.png, .jpg, .webp).',
+    pasteLinkLabel: 'Alamat halaman web',
     translateLinkBtn: 'Terjemahkan halaman',
     openFullTranslatedPage: 'Buka halaman terjemahan penuh',
     openOriginalSite: 'Buka situs asli',
@@ -188,7 +207,7 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     pickAnotherFile: 'Pilih berkas lain',
     lockName: 'Kunci ejaan nama',
     lockedBadge: 'Terkunci',
-    loginSubtitle: 'Ruang baca lintas perangkat untuk teks, gambar, dokumen, dan tautan berbahasa Jepang.',
+    loginSubtitle: 'Ruang baca lintas perangkat untuk teks, gambar, dokumen, dan tautan dalam bahasa Indonesia, Inggris, serta Jepang.',
     loginWithGoogle: 'Masuk dengan Google',
     loginWithPairCode: 'Masuk dengan kode pasangan 6 angka',
     pairCodeTitle: 'Pasangkan perangkat',
@@ -205,6 +224,7 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     themeSystem: 'Ikuti sistem',
     themeLight: 'Terang',
     themeDark: 'Gelap',
+    defaultSourceLabel: 'Bahasa sumber bawaan',
     defaultTargetLabel: 'Bahasa tujuan bawaan',
     inboxFromShortcut: 'Kiriman baru dari Pintasan',
     translateNow: 'Terjemahkan sekarang',
@@ -213,18 +233,27 @@ export const STRINGS: Record<UiLang, UiStrings> = {
   en: {
     greeting: 'What would you like to read today?',
     pasteAndTranslate: 'Paste and translate',
-    composerPlaceholder: 'Type or paste Japanese text, or start speaking...',
+    composerPlaceholder: 'Type or paste text, or start speaking...',
     composerImagePlaceholder: 'Add character context notes if needed...',
     composerDocPlaceholder: 'Add series or work title hint if needed...',
-    composerLinkPlaceholder: 'Paste a Japanese article or chapter URL (https://...)',
+    composerLinkPlaceholder: 'Paste an article or web page URL (https://...)',
     modeText: 'Text',
     modeImage: 'Image',
     modeDocument: 'Document',
     modeLink: 'Link',
+    langAuto: 'Detect language',
+    langAutoShort: 'Detect',
+    langId: 'Indonesian',
+    langEn: 'English',
+    langJa: 'Japanese',
+    swapLanguages: 'Swap languages',
+    sourceLangTitle: 'Source language',
+    targetLangTitle: 'Target language',
+    detectedPrefix: 'Detected',
     langJaId: 'Japanese \u2192 Indonesian',
     langJaEn: 'Japanese \u2192 English',
-    langMenuTitle: 'Target language',
-    sourceAutoHint: 'Japanese source is detected automatically.',
+    langMenuTitle: 'Language pair',
+    sourceAutoHint: 'Automatically detects Indonesian, English, or Japanese.',
     sidebarNew: 'New',
     sidebarSearch: 'Search',
     sidebarSearchPlaceholder: 'Search titles or reading history...',
@@ -259,7 +288,7 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     unpinnedToast: 'Conversation unpinned',
     langChangedToast: 'Display language changed to English',
     deletedToast: 'Conversation deleted',
-    dictationListening: 'Listening in Japanese...',
+    dictationListening: 'Listening...',
     dictationStop: 'Finish speaking',
     dictationStart: 'Voice dictation',
     send: 'Send',
@@ -280,8 +309,8 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     pickDocument: 'Choose file',
     dropFilesHere: 'Drop file here to translate',
     supportedDocHint: 'Supports .epub, .pdf, .docx, .srt, .vtt, .ass, .html, .md, .txt up to 50 MB.',
-    supportedImageHint: 'Drop a screenshot, manga page, or photo with Japanese text (.png, .jpg, .webp).',
-    pasteLinkLabel: 'Japanese web page URL',
+    supportedImageHint: 'Drop a screenshot, manga page, or photo with text (.png, .jpg, .webp).',
+    pasteLinkLabel: 'Web page URL',
     translateLinkBtn: 'Translate page',
     openFullTranslatedPage: 'Open full translated page',
     openOriginalSite: 'Open original site',
@@ -292,7 +321,7 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     pickAnotherFile: 'Choose another file',
     lockName: 'Lock name spelling',
     lockedBadge: 'Locked',
-    loginSubtitle: 'Cross-device reading workspace for Japanese text, images, documents, and web links.',
+    loginSubtitle: 'Cross-device reading workspace for Indonesian, English, and Japanese text, images, documents, and links.',
     loginWithGoogle: 'Sign in with Google',
     loginWithPairCode: 'Sign in with 6-digit pair code',
     pairCodeTitle: 'Pair this device',
@@ -309,9 +338,23 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     themeSystem: 'Match system',
     themeLight: 'Light',
     themeDark: 'Dark',
+    defaultSourceLabel: 'Default source language',
     defaultTargetLabel: 'Default target language',
     inboxFromShortcut: 'New capture from Shortcuts',
     translateNow: 'Translate now',
     dismiss: 'Dismiss',
   },
 };
+
+export function labelForLang(lang: SourceLang | TargetLang, s: UiStrings): string {
+  switch (lang) {
+    case 'auto':
+      return s.langAuto;
+    case 'id':
+      return s.langId;
+    case 'en':
+      return s.langEn;
+    case 'ja':
+      return s.langJa;
+  }
+}

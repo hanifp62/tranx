@@ -378,26 +378,61 @@ textarea {
   color: var(--text);
 }
 
-/* K/Pil bahasa */
-.lang-pill-btn {
-  height: 36px;
-  padding: 0 10px 0 12px;
-  border-radius: var(--r-pill-lang);
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 20px;
+/* K/Pil bahasa Split Bidirectional Selector (Sumber <-> Tujuan) */
+.lang-pair-bar {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+  padding: 2px;
+  border-radius: 14px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+}
+
+.lang-pill-btn {
+  min-height: 34px;
+  padding: 0 10px 0 12px;
+  border-radius: var(--r-control);
+  border: 1px solid transparent;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   cursor: pointer;
   box-shadow: 0 1px 2px rgba(20, 25, 23, 0.04);
+  white-space: nowrap;
 }
 
 .lang-pill-btn:hover {
   background: var(--surface-hover);
+}
+
+.lang-swap-btn {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0 6px;
+  border-radius: var(--r-menu-item);
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 180ms var(--ease-spring), background-color 120ms ease, color 120ms ease;
+}
+
+.lang-swap-btn:hover {
+  background: var(--surface-hover);
+  color: var(--accent);
+}
+
+.lang-swap-btn.flipped svg {
+  transform: rotate(180deg);
 }
 
 /* Offline status banner */
@@ -821,12 +856,19 @@ textarea {
   border-radius: var(--r-popover);
   background: var(--bubble-user);
   color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 16px;
+  line-height: 26px;
+  font-weight: 400;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.user-bubble.is-jp {
   font-family: var(--font-jp);
   font-size: 17px;
   line-height: 30px;
   font-weight: 300;
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
 .turn-assistant-wrap {
@@ -837,7 +879,7 @@ textarea {
   width: 100%;
 }
 
-/* Aturan Pemisahan Suara Serif: Charter ONLY on translated prose */
+/* Aturan Pemisahan Suara Serif: Charter on Latin translated prose, Hiragino Sans on Japanese output */
 .assistant-prose {
   width: 100%;
   max-width: 720px;
@@ -847,6 +889,13 @@ textarea {
   color: var(--text);
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.assistant-prose.is-jp {
+  font-family: var(--font-jp);
+  font-size: 18px;
+  line-height: 32px;
+  font-weight: 400;
 }
 
 .turn-action-bar {
@@ -1298,12 +1347,28 @@ textarea {
   }
 
   .icon-square-btn,
-  .lang-pill-btn,
   .btn-primary,
   .btn-secondary,
   .btn-danger,
   .action-chip-btn {
     min-height: 44px;
+  }
+
+  .lang-pair-bar {
+    gap: 2px;
+    max-width: calc(100vw - 116px);
+  }
+
+  .lang-pill-btn {
+    min-height: 40px;
+    padding: 0 8px;
+    font-size: 12.5px;
+  }
+
+  .lang-swap-btn {
+    min-width: 36px;
+    min-height: 40px;
+    padding: 0 4px;
   }
 
   .mic-round-btn,

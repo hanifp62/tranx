@@ -9,8 +9,8 @@ function createTinyPngBuffer(): Buffer {
   );
 }
 
-test.describe('tranX v3 Full Click-Through, Responsive & Accessibility Gate', () => {
-  test('Desktop 1280x800: Terang & Gelap, 4 modes, IME guard, Pin+Undo, Glossary, Settings & Axe AA', async ({
+test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine & Accessibility Gate', () => {
+  test('Desktop 1280x800: Terang & Gelap, 9-pair Bidirectional + Auto-Detect Matrix, 4 modes, IME guard, Pin+Undo, Glossary, Settings & Axe AA', async ({
     page,
   }) => {
     const consoleErrors: string[] = [];
@@ -50,21 +50,41 @@ test.describe('tranX v3 Full Click-Through, Responsive & Accessibility Gate', ()
     await expect(page.getByText('Percakapan disematkan ke atas')).toBeVisible();
     await page.getByRole('button', { name: 'Urungkan' }).click();
 
-    // 5. Verify Japanese IME composition guard vs real Enter submit
+    // 5. Verify live Auto-Detection (ID, EN, JA) + Japanese IME composition guard vs real Enter submit
+    await expect(
+      page.getByRole('button', { name: 'Bahasa sumber: Deteksi bahasa' })
+    ).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa tujuan: Indonesia' })
+    ).toBeVisible();
+
     const textarea = page.locator('textarea.composer-textarea');
+    await textarea.fill('Selamat pagi, bagaimana kabar hari ini?');
+    await expect(
+      page.getByRole('button', { name: 'Bahasa sumber: Deteksi · Indonesia' })
+    ).toBeVisible();
+
+    await textarea.fill('Good morning, what are we reading today?');
+    await expect(
+      page.getByRole('button', { name: 'Bahasa sumber: Deteksi · Inggris' })
+    ).toBeVisible();
+
     await textarea.fill('千早は小さく笑った。');
+    await expect(
+      page.getByRole('button', { name: 'Bahasa sumber: Deteksi · Jepang' })
+    ).toBeVisible();
+
     await textarea.dispatchEvent('keydown', {
       key: 'Enter',
       isComposing: true,
       keyCode: 229,
     });
-    // Still on empty home because IME composition was active
     await expect(page.locator('textarea.composer-textarea')).toHaveValue('千早は小さく笑った。');
 
     // Real Enter sends turn and renders Charter prose + NameChip
     await textarea.press('Enter');
     await expect(page.locator('.assistant-prose').first()).toContainText('Chihaya');
-    await expect(page.getByRole('button', { name: '千早 → Chihaya' })).toBeVisible();
+    await expect(page.getByRole('button', { name: '千早 \u2192 Chihaya' })).toBeVisible();
     await page.screenshot({
       path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_desktop_terang.png',
     });
@@ -74,11 +94,75 @@ test.describe('tranX v3 Full Click-Through, Responsive & Accessibility Gate', ()
     await expect(page.locator('textarea.composer-textarea')).toHaveValue(/千早/, {
       timeout: 4000,
     });
+    await page.locator('textarea.composer-textarea').fill('');
 
-    // 7. Verify Target Language Pill (Jepang -> Inggris)
-    await page.getByRole('button', { name: /Jepang → Indonesia/ }).click();
-    await page.getByRole('menuitemradio', { name: 'Jepang → Inggris' }).click();
-    await expect(page.getByRole('button', { name: /Jepang → Inggris/ })).toBeVisible();
+    // 7. Verify Full Bidirectional Pairs (ID->JA, Swap JA->ID, EN->ID, ID->EN, EN->JA, Auto->EN)
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Indonesia' }).click();
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Jepang' }).click();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa sumber: Indonesia' })
+    ).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa tujuan: Jepang' })
+    ).toBeVisible();
+
+    // Send Indonesia -> Jepang turn
+    await page
+      .locator('textarea.composer-textarea')
+      .fill('Chihaya tersenyum tenang di bawah atap.');
+    await page.locator('textarea.composer-textarea').press('Enter');
+    await expect(page.locator('.assistant-prose').last()).toContainText('千早');
+
+    // Swap button flips Indonesia -> Jepang into Jepang -> Indonesia
+    await page.getByRole('button', { name: 'Tukar bahasa' }).click();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa sumber: Jepang' })
+    ).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa tujuan: Indonesia' })
+    ).toBeVisible();
+
+    // Inggris -> Indonesia (en-id)
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Inggris' }).click();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa sumber: Inggris' })
+    ).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa tujuan: Indonesia' })
+    ).toBeVisible();
+
+    // Swap into Indonesia -> Inggris (id-en)
+    await page.getByRole('button', { name: 'Tukar bahasa' }).click();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa sumber: Indonesia' })
+    ).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa tujuan: Inggris' })
+    ).toBeVisible();
+
+    // Inggris -> Jepang (en-ja)
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Inggris' }).click();
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Jepang' }).click();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa sumber: Inggris' })
+    ).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa tujuan: Jepang' })
+    ).toBeVisible();
+
+    // Deteksi bahasa -> Inggris (auto-en)
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Deteksi bahasa' }).click();
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Inggris' }).click();
+    await expect(
+      page.getByRole('button', { name: 'Bahasa tujuan: Inggris' })
+    ).toBeVisible();
 
     // 8. Verify Mode Gambar: Berdampingan & Hamparan gambar (<canvas>)
     await page.getByRole('tab', { name: 'Gambar' }).click();
@@ -192,7 +276,114 @@ test.describe('tranX v3 Full Click-Through, Responsive & Accessibility Gate', ()
     expect(consoleErrors).toEqual([]);
   });
 
-  test('Tablet 820x1180 & Mobile 390x844: Zero horizontal overflow, >= 44px tap targets, Mode bar ABOVE Composer, Laci & Bottom Sheet', async ({
+  test('Direct Spark Engine (/?e2e=1&direct=1): Zero "Failed to fetch" when Cloud Functions is unreachable, Link + standalone URL in Teks + reverse glossary', async ({
+    page,
+  }) => {
+    // Simulate Firebase Spark plan: /v1/healthz returns 404 Not Found
+    await page.route('**/v1/healthz', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
+
+    // CORS-enabled Jina Reader mock matching real r.jina.ai JSON schema
+    await page.route('https://r.jina.ai/**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({
+          code: 200,
+          data: {
+            title: 'The Rainy Gate of Kyoto',
+            content:
+              'Chihaya stood quietly under the wooden gate while listening to the rain.\n\nShe opened her notebook and read the letter from Tokyo.',
+            url: 'https://www.aozora.gr.jp/cards/1.html',
+          },
+        }),
+      });
+    });
+
+    // CORS-enabled Google GTX mock preserving [[E0]] glossary shield tokens
+    await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      const reqUrl = new URL(route.request().url());
+      const tl = reqUrl.searchParams.get('tl') || 'id';
+      const q = reqUrl.searchParams.get('q') || '';
+      const lines = q.split('\n');
+      const translatedLines = lines.map((line) => {
+        if (tl === 'ja') {
+          return line
+            .replace(/berjalan pelan di stasiun/gi, '駅を静かに歩いた')
+            .replace(/The Rainy Gate of Kyoto/gi, '京都の雨の門');
+        }
+        if (tl === 'en') {
+          return line.replace(/Selamat pagi/gi, 'Good morning');
+        }
+        return line
+          .replace(/The Rainy Gate of Kyoto/gi, 'Gerbang Hujan di Kyoto')
+          .replace(
+            /stood quietly under the wooden gate while listening to the rain/gi,
+            'berdiri tenang di bawah gerbang kayu sambil mendengarkan hujan'
+          )
+          .replace(
+            /She opened her notebook and read the letter from Tokyo/gi,
+            'Ia membuka buku catatannya dan membaca surat dari Tokyo'
+          );
+      });
+      const segments = translatedLines.map((t, idx) => [
+        idx < translatedLines.length - 1 ? `${t}\n` : t,
+        lines[idx] || '',
+      ]);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([segments, null, 'en']),
+      });
+    });
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto('/?e2e=1&direct=1');
+
+    // 1. Mode Link with bare URL (no https:// prefix) -> zero "Failed to fetch"
+    await page.getByRole('tab', { name: 'Link' }).click();
+    await page.getByPlaceholder(/https:\/\//).fill('www.aozora.gr.jp/cards/1.html');
+    await page.getByRole('button', { name: 'Terjemahkan halaman' }).click();
+
+    await expect(page.getByRole('main').getByText('Gerbang Hujan di Kyoto')).toBeVisible();
+    await expect(page.getByText(/Failed to fetch/i)).toHaveCount(0);
+
+    await page.getByRole('button', { name: 'Buka halaman terjemahan penuh' }).click();
+    const readerFrame = page.frameLocator('iframe[title="Pembaca Halaman Terjemahan"]');
+    await expect(readerFrame.locator('h1')).toContainText('Gerbang Hujan di Kyoto');
+    await page.getByRole('button', { name: 'Kembali' }).click();
+
+    // 2. Standalone URL pasted directly inside Mode Teks -> auto-routed to Link reader cleanly
+    await page.getByRole('button', { name: 'Baru' }).click();
+    await page.getByRole('tab', { name: 'Teks' }).click();
+    await page
+      .locator('textarea.composer-textarea')
+      .fill('https://www.aozora.gr.jp/cards/1.html');
+    await page.locator('textarea.composer-textarea').press('Enter');
+    await expect(
+      page.getByRole('button', { name: 'Buka halaman terjemahan penuh' })
+    ).toBeVisible();
+    await expect(page.getByText(/Failed to fetch/i)).toHaveCount(0);
+
+    // 3. Reverse Glossary Shield in Direct Mode: Indonesia -> Jepang restores locked kanji 千早 from "Chihaya"
+    await page.getByRole('button', { name: 'Baru' }).click();
+    await page.getByRole('tab', { name: 'Teks' }).click();
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Indonesia' }).click();
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Jepang' }).click();
+    await page
+      .locator('textarea.composer-textarea')
+      .fill('Chihaya berjalan pelan di stasiun.');
+    await page.locator('textarea.composer-textarea').press('Enter');
+    await expect(page.locator('.assistant-prose').first()).toContainText('千早');
+    await expect(page.locator('.assistant-prose').first()).toContainText('駅を静かに歩いた');
+  });
+
+  test('Tablet 820x1180 & Mobile 390x844: Zero horizontal overflow, unclipped split language bar, >= 44px tap targets, Mode bar ABOVE Composer, Laci & Bottom Sheets', async ({
     page,
   }) => {
     // 1. Tablet 820x1180 check
@@ -210,6 +401,11 @@ test.describe('tranX v3 Full Click-Through, Responsive & Accessibility Gate', ()
       () => document.documentElement.scrollWidth > document.documentElement.clientWidth
     );
     expect(mobileOverflow).toBe(false);
+
+    // Verify split language bar fits inside 390px mobile header cleanly
+    const langBarBox = await page.locator('.lang-pair-bar').boundingBox();
+    expect(langBarBox).not.toBeNull();
+    expect(langBarBox!.x + langBarBox!.width).toBeLessThanOrEqual(346);
 
     // Verify Mobile geometry: K/Bilah mode sits ABOVE K/Composer (Gemini Mobile ergonomics)
     const composerBox = await page.locator('.composer-slot').boundingBox();
@@ -241,10 +437,22 @@ test.describe('tranX v3 Full Click-Through, Responsive & Accessibility Gate', ()
       .click();
     await expect(page.getByRole('button', { name: 'Lepas sematan' })).toBeVisible();
     await page.keyboard.press('Escape');
-
-    // Mobile Target Language Bottom Sheet (H13)
     await page.keyboard.press('Escape');
-    await page.getByRole('button', { name: /Jepang → Indonesia/ }).click();
-    await expect(page.getByRole('dialog', { name: 'Bahasa terjemahan' })).toBeVisible();
+
+    // Mobile Source & Target Language Bottom Sheets (H13) + Swap button
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await expect(page.getByRole('dialog', { name: 'Bahasa sumber' })).toBeVisible();
+    await page.getByRole('dialog', { name: 'Bahasa sumber' }).getByRole('button', { name: 'Indonesia' }).click();
+
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await expect(page.getByRole('dialog', { name: 'Bahasa tujuan' })).toBeVisible();
+    await page.getByRole('dialog', { name: 'Bahasa tujuan' }).getByRole('button', { name: 'Jepang' }).click();
+
+    await expect(page.getByRole('button', { name: 'Bahasa sumber: Indonesia' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Bahasa tujuan: Jepang' })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Tukar bahasa' }).click();
+    await expect(page.getByRole('button', { name: 'Bahasa sumber: Jepang' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Bahasa tujuan: Indonesia' })).toBeVisible();
   });
 });

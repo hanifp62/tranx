@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { STRINGS } from './i18n/strings';
+import { STRINGS, labelForLang } from './i18n/strings';
 import type {
   AppSettingsDoc,
   ConversationDoc,
@@ -8,6 +8,8 @@ import type {
   ModePair,
   PendingAttachment,
   ResolvedTheme,
+  SourceLang,
+  TargetLang,
   TitleDoc,
   ToastItem,
   TurnMessage,
@@ -20,6 +22,8 @@ import {
   loginWithCustomPairToken,
   loginWithGoogleOwner,
   logoutSession,
+  normalizeModePair,
+  processDocumentSubmission,
   renameConversationTitle,
   requestStopJob,
   subscribeAuth,
@@ -31,7 +35,6 @@ import {
   subscribeTitles,
   toggleConversationPin,
   updateAppSettings,
-  uploadDocumentForJob,
   upsertConversationMeta,
   upsertUserGlossaryEntry,
   type AuthSessionUser,
@@ -39,6 +42,7 @@ import {
 import {
   deleteConversationRemote,
   downloadExportedTurn,
+  humanizeFetchError,
   lookupTurnNames,
   previewLinkRequest,
   redeemPairCodeRequest,
@@ -46,12 +50,20 @@ import {
   streamChatTurn,
   translateImageRequest,
 } from './lib/api';
+import {
+  buildModePair,
+  detectLanguageLocal,
+  isSingleStandaloneUrl,
+  parseModePair,
+  swapModePair,
+} from './lib/directEngine';
 import { startVoiceDictation, type DictationHandle } from './lib/speech';
 import {
   BrandAppTile,
   BrandWordmark,
   IconAlert,
   IconArrowUp,
+  IconArrowsSwitch,
   IconBook,
   IconCamera,
   IconCheck,
@@ -156,10 +168,14 @@ export function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
-  const [activeMode, setActiveMode] = useState<ModePair>('ja-id');
+  const [activeMode, setActiveMode] = useState<ModePair>('auto-id');
+  const [lastDetectedSource, setLastDetectedSource] = useState<TargetLang | ''>('');
+  const [swapFlipped, setSwapFlipped] = useState(false);
+
   const [activeTab, setActiveTab] = useState<WorkTab>('teks');
   const [composerText, setComposerText] = useState('');
   const [linkUrlInput, setLinkUrlInput] = useState('');
+  const [isFetchingLink, setIsFetchingLink] = useState(false);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
@@ -170,8 +186,8 @@ export function App() {
   const dictationRef = useRef<DictationHandle | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
-  /* Floating Glass Menu / Sheet State (strictly max 1 floating popover/sheet open at a time -> R-10 dose cap <= 2!) */
-  const [langMenuOpen, setLangMenuOpen] = useState(false);
+  /* Floating Glass Menu / Sheet State (strictly <= 1 floating menu open at once -> R-10 dose cap) */
+  const [langPickerSide, setLangPickerSide] = useState<'source' | 'target' | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [historyMenuTarget, setHistoryMenuTarget] = useState<{
@@ -208,7 +224,7 @@ export function App() {
     setMobileDrawerOpen(false);
     setMoreMenuOpen(false);
     setAccountMenuOpen(false);
-    setLangMenuOpen(false);
+    setLangPickerSide(null);
     setHistoryMenuTarget(null);
   }, []);
 
@@ -223,7 +239,6 @@ export function App() {
     []
   );
 
-  /* Parse current route */
   const parsedUrl = useMemo(() => new URL(routePath, window.location.origin), [routePath]);
   const pathname = parsedUrl.pathname;
   const activeCid = useMemo(() => {
@@ -239,7 +254,6 @@ export function App() {
     return m ? { titleId: m[1] ? decodeURIComponent(m[1]) : undefined } : null;
   }, [pathname]);
 
-  /* Resolve Theme (Terang vs Gelap) & apply data-tranx-v3 on <html> */
   const resolvedTheme: ResolvedTheme = useMemo(() => {
     if (settings.theme === 'dark') return 'Gelap';
     if (settings.theme === 'light') return 'Terang';
@@ -258,7 +272,6 @@ export function App() {
 
   const strings = STRINGS[settings.uiLang];
 
-  /* Viewport, Online, Popstate & Mobile VisualViewport Keyboard Lift */
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 768);
     const onPop = () => setRoutePath(window.location.pathname + window.location.search);
@@ -291,7 +304,6 @@ export function App() {
     };
   }, []);
 
-  /* Auth subscription */
   useEffect(() => {
     return subscribeAuth((u, err) => {
       setUser(u);
@@ -300,13 +312,14 @@ export function App() {
     });
   }, []);
 
-  /* Firestore real-time subscriptions once owner is signed in */
   useEffect(() => {
     if (!user) return;
     const unsubs = [
       subscribeSettings((s) => {
         setSettings(s);
-        setActiveMode((prev) => prev || (s.defaultTarget === 'en' ? 'ja-en' : 'ja-id'));
+        if (!activeCid) {
+          setActiveMode(buildModePair(s.defaultSource, s.defaultTarget));
+        }
       }),
       subscribeConversations(setConversations),
       subscribeTitles(setTitles),
@@ -314,7 +327,7 @@ export function App() {
       subscribeInbox(setInboxItems),
     ];
     return () => unsubs.forEach((u) => u());
-  }, [user]);
+  }, [user, activeCid]);
 
   useEffect(() => {
     if (!user || !activeCid) {
@@ -324,7 +337,6 @@ export function App() {
     return subscribeMessages(activeCid, setMessages);
   }, [user, activeCid]);
 
-  /* Sync active conversation mode/tab and ?tab=... query */
   useEffect(() => {
     const qTab = parsedUrl.searchParams.get('tab');
     if (qTab && ['teks', 'gambar', 'dokumen', 'link'].includes(qTab)) {
@@ -344,7 +356,6 @@ export function App() {
     }
   }, [pathname, parsedUrl, navigate]);
 
-  /* Desktop File Handler (/open launchQueue) */
   useEffect(() => {
     if (window.launchQueue) {
       window.launchQueue.setConsumer(async (params) => {
@@ -362,7 +373,6 @@ export function App() {
     }
   }, [navigate]);
 
-  /* Sync mode from selected conversation */
   const activeConversation = useMemo(
     () => conversations.find((c) => c.id === activeCid) || null,
     [conversations, activeCid]
@@ -371,10 +381,12 @@ export function App() {
   useEffect(() => {
     if (activeConversation) {
       setActiveMode(activeConversation.mode);
+      if (activeConversation.detectedSource) {
+        setLastDetectedSource(activeConversation.detectedSource);
+      }
     }
   }, [activeConversation]);
 
-  /* Global Keyboard Shortcuts: Cmd/Ctrl+K, Cmd/Ctrl+,, Cmd/Ctrl+/, Cmd/Ctrl+Shift+C, Escape */
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
@@ -397,7 +409,7 @@ export function App() {
           pushToast(strings.copiedToast);
         }
       } else if (e.key === 'Escape') {
-        setLangMenuOpen(false);
+        setLangPickerSide(null);
         setMoreMenuOpen(false);
         setAccountMenuOpen(false);
         setHistoryMenuTarget(null);
@@ -409,7 +421,6 @@ export function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [user, messages, pushToast, strings.copiedToast]);
 
-  /* Dictation timer */
   useEffect(() => {
     if (!isDictating) {
       setDictationSeconds(0);
@@ -419,7 +430,6 @@ export function App() {
     return () => window.clearInterval(id);
   }, [isDictating]);
 
-  /* Pinned strictly above Recent, filtered by searchQuery */
   const { pinnedList, recentList } = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const filtered = q
@@ -437,7 +447,62 @@ export function App() {
     return { pinnedList: pinned, recentList: recent };
   }, [conversations, searchQuery]);
 
-  /* File validation (AC-UI-09: unsupported files like arsip.rar stay visible with Galat reason) */
+  const { src: currentSrcLang, tgt: currentTgtLang } = useMemo(
+    () => parseModePair(activeMode),
+    [activeMode]
+  );
+
+  const liveDetectedLang: TargetLang | '' = useMemo(() => {
+    if (currentSrcLang !== 'auto') return '';
+    if (composerText.trim().length >= 3) {
+      return detectLanguageLocal(
+        composerText,
+        currentTgtLang === 'ja' ? 'id' : 'ja'
+      );
+    }
+    return lastDetectedSource;
+  }, [currentSrcLang, currentTgtLang, composerText, lastDetectedSource]);
+
+  const displayedMessages = useMemo(() => {
+    if (!streamingTurn) return messages;
+    const exists = messages.some((m) => m.id === streamingTurn.id);
+    return exists ? messages : [...messages, streamingTurn];
+  }, [messages, streamingTurn]);
+
+  const applyModeChange = useCallback(
+    (nextMode: ModePair) => {
+      setActiveMode(nextMode);
+      setLangPickerSide(null);
+      if (activeConversation) {
+        upsertConversationMeta(activeConversation.id, {
+          title: activeConversation.title,
+          titleId: activeConversation.titleId,
+          mode: nextMode,
+          activeTab,
+          pinned: activeConversation.pinned,
+          pinnedAt: activeConversation.pinnedAt,
+        });
+      }
+    },
+    [activeConversation, activeTab]
+  );
+
+  const handleSelectSourceLang = (src: SourceLang) => {
+    const next = buildModePair(src, currentTgtLang, activeMode);
+    applyModeChange(next);
+  };
+
+  const handleSelectTargetLang = (tgt: TargetLang) => {
+    const next = buildModePair(currentSrcLang, tgt, activeMode);
+    applyModeChange(next);
+  };
+
+  const handleSwapLanguages = () => {
+    setSwapFlipped((f) => !f);
+    const swapped = swapModePair(activeMode, liveDetectedLang || lastDetectedSource);
+    applyModeChange(swapped);
+  };
+
   const handleStageFiles = (fileList: FileList | File[], targetTab: WorkTab) => {
     const arr = Array.from(fileList);
     const next: PendingAttachment[] = arr.map((f) => {
@@ -481,22 +546,16 @@ export function App() {
     setAttachments((prev) => [...prev, ...next]);
   };
 
-  /* Handle UI Display Language switch with reversible Undo Toast (L9 / H10) */
   const handleChangeUiLang = async (nextLang: UiLang) => {
     const prevLang = settings.uiLang;
     if (prevLang === nextLang) return;
     await updateAppSettings({ uiLang: nextLang });
     setAccountMenuOpen(false);
-    pushToast(
-      STRINGS[nextLang].langChangedToast,
-      STRINGS[nextLang].undo,
-      () => {
-        updateAppSettings({ uiLang: prevLang });
-      }
-    );
+    pushToast(STRINGS[nextLang].langChangedToast, STRINGS[nextLang].undo, () => {
+      updateAppSettings({ uiLang: prevLang });
+    });
   };
 
-  /* Handle Pin / Unpin with reversible Undo Toast (L11, L12, H14, H15) */
   const handleTogglePin = async (conv: ConversationDoc) => {
     const nextPinned = !conv.pinned;
     setHistoryMenuTarget(null);
@@ -510,20 +569,20 @@ export function App() {
     );
   };
 
-  /* Handle Share conversation */
   const handleShareConversation = async (conv: ConversationDoc) => {
     setHistoryMenuTarget(null);
     const shareUrl = `${window.location.origin}/c/${conv.id}`;
     const text = `${conv.title}\n${conv.preview}\n${shareUrl}`;
     if (navigator.share) {
-      await navigator.share({ title: conv.title, text: conv.preview, url: shareUrl }).catch(() => {});
+      await navigator
+        .share({ title: conv.title, text: conv.preview, url: shareUrl })
+        .catch(() => {});
     } else {
       await navigator.clipboard?.writeText(text);
       pushToast(strings.copiedToast);
     }
   };
 
-  /* Handle Delete conversation */
   const handleDeleteConversation = async (conv: ConversationDoc) => {
     if (!user) return;
     setHistoryMenuTarget(null);
@@ -532,11 +591,73 @@ export function App() {
     pushToast(strings.deletedToast);
   };
 
-  /* Send Text Turn (/v1/chat or /v1/translate) */
+  /* Submit Link Preview (L5 / H7): works both from Link tab and standalone URLs in Teks */
+  const handleSubmitLink = async (e?: React.FormEvent, explicitUrl?: string) => {
+    e?.preventDefault();
+    if (!user || isFetchingLink) return;
+    const rawUrl = (explicitUrl ?? (linkUrlInput || composerText)).trim();
+    if (!rawUrl) return;
+
+    const cid = activeCid || `c_${Date.now().toString(36)}`;
+    const tempId = `lnk_wait_${Date.now().toString(36)}`;
+    setLinkUrlInput('');
+    if (!explicitUrl) setComposerText('');
+    setIsFetchingLink(true);
+    if (!activeCid) navigate(`/c/${cid}`);
+
+    setStreamingTurn({
+      id: tempId,
+      role: 'assistant',
+      kind: 'text',
+      mode: activeMode,
+      text: 'Membaca dan menerjemahkan halaman web...',
+      state: 'running',
+      createdAt: Date.now(),
+    });
+
+    try {
+      await previewLinkRequest({
+        user,
+        cid,
+        url: rawUrl,
+        mode: activeMode,
+        titleId: activeConversation?.titleId || undefined,
+      });
+      setStreamingTurn(null);
+    } catch (err) {
+      const msg = humanizeFetchError(
+        err,
+        'Halaman web tersebut menolak pembacaan otomatis atau sedang tidak terjangkau.'
+      );
+      setStreamingTurn({
+        id: tempId,
+        role: 'assistant',
+        kind: 'text',
+        mode: activeMode,
+        srcText: rawUrl,
+        text: '',
+        state: 'error',
+        error: msg,
+        createdAt: Date.now(),
+      });
+      pushToast(msg);
+    } finally {
+      setIsFetchingLink(false);
+    }
+  };
+
+  /* Send Text Turn */
   const handleSendText = async (overrideText?: string, inboxId?: string) => {
     if (!user) return;
     const raw = (overrideText ?? composerText).trim();
     if (!raw) return;
+
+    // If the user pasted a single standalone http(s):// URL directly into chat, treat it as a web link!
+    if (isSingleStandaloneUrl(raw) && !inboxId) {
+      if (!overrideText) setComposerText('');
+      await handleSubmitLink(undefined, raw);
+      return;
+    }
 
     const cid = activeCid || `c_${Date.now().toString(36)}`;
     const clientMsgId = `m_${Date.now().toString(36)}_u`;
@@ -575,13 +696,15 @@ export function App() {
         onEvent: (ev) => {
           if (ev.mid) finalMid = ev.mid;
           if (ev.titleId) finalTid = ev.titleId;
-          if (ev.type === 'delta' && ev.dst) {
+          if (ev.detectedSource) setLastDetectedSource(ev.detectedSource);
+          if ((ev.type === 'delta' || ev.type === 'seg') && ev.dst) {
             setStreamingTurn((prev) =>
               prev
                 ? {
                     ...prev,
                     id: finalMid,
-                    text: prev.text ? `${prev.text} ${ev.dst}` : ev.dst || '',
+                    detectedSource: ev.detectedSource || prev.detectedSource,
+                    text: prev.text ? `${prev.text}\n${ev.dst}` : ev.dst || '',
                   }
                 : null
             );
@@ -603,6 +726,7 @@ export function App() {
                     ...prev,
                     id: finalMid,
                     titleId: finalTid,
+                    detectedSource: ev.detectedSource || prev.detectedSource,
                     text: ev.fullDst || prev.text,
                     sentences: ev.sentences,
                     state: 'done',
@@ -642,10 +766,10 @@ export function App() {
             ? {
                 ...prev,
                 state: 'error',
-                error:
-                  err instanceof Error
-                    ? err.message
-                    : 'Mesin terjemahan awan belum terjangkau. Periksa Setelan -> Lanjutan.',
+                error: humanizeFetchError(
+                  err,
+                  'Koneksi jaringan terganggu saat menerjemahkan. Tekan Coba sekarang.'
+                ),
               }
             : null
         );
@@ -656,7 +780,6 @@ export function App() {
     }
   };
 
-  /* Send Ready Image or Document Attachments */
   const handleSendAttachments = async () => {
     if (!user) return;
     const readyItems = attachments.filter((a) => a.status === 'ready' && a.file);
@@ -683,7 +806,7 @@ export function App() {
         } else if (item.file) {
           const mid = `doc_${Date.now().toString(36)}`;
           setUploadPct(5);
-          await uploadDocumentForJob({
+          await processDocumentSubmission({
             uid: user.uid,
             cid,
             mid,
@@ -703,7 +826,7 @@ export function App() {
               ? {
                   ...a,
                   status: 'error',
-                  reason: err instanceof Error ? err.message : 'Gagal memproses berkas.',
+                  reason: humanizeFetchError(err, 'Gagal memproses berkas.'),
                 }
               : a
           )
@@ -712,34 +835,6 @@ export function App() {
     }
   };
 
-  /* Submit Link Preview (L5 / H7) */
-  const handleSubmitLink = async (e?: React.FormEvent) => {
-    e?.preventDefault();
-    if (!user) return;
-    const rawUrl = (linkUrlInput || composerText).trim();
-    if (!rawUrl) return;
-    if (!/^https?:\/\//i.test(rawUrl)) {
-      pushToast('Masukkan tautan lengkap berawalan https:// atau http://');
-      return;
-    }
-    const cid = activeCid || `c_${Date.now().toString(36)}`;
-    if (!activeCid) navigate(`/c/${cid}`);
-    try {
-      await previewLinkRequest({
-        user,
-        cid,
-        url: rawUrl,
-        mode: activeMode,
-        titleId: activeConversation?.titleId || undefined,
-      });
-      setLinkUrlInput('');
-      setComposerText('');
-    } catch (err) {
-      pushToast(err instanceof Error ? err.message : 'Halaman web tidak dapat dimuat.');
-    }
-  };
-
-  /* Toggle Voice Dictation (L2 / H4) */
   const handleToggleDictation = () => {
     if (!user) return;
     if (isDictating) {
@@ -750,6 +845,8 @@ export function App() {
     setIsDictating(true);
     dictationRef.current = startVoiceDictation({
       user,
+      sourceLang: currentSrcLang,
+      detectedLang: liveDetectedLang || lastDetectedSource,
       onInterim: (txt) => setComposerText(txt),
       onLevels: (bars) => setDictationBars(bars),
       onDone: (finalTxt) => {
@@ -764,12 +861,6 @@ export function App() {
       },
     });
   };
-
-  const displayedMessages = useMemo(() => {
-    if (!streamingTurn) return messages;
-    const exists = messages.some((m) => m.id === streamingTurn.id);
-    return exists ? messages : [...messages, streamingTurn];
-  }, [messages, streamingTurn]);
 
   /* Auth Gate (/masuk & /masuk/kode) */
   if (!authReady) {
@@ -909,7 +1000,7 @@ export function App() {
   /* Full-screen Translated Web Viewer (/web?url=...) */
   if (pathname === '/web') {
     const targetUrl = parsedUrl.searchParams.get('url') || '';
-    const qMode = parsedUrl.searchParams.get('mode') === 'ja-en' ? 'ja-en' : activeMode;
+    const qMode = normalizeModePair(parsedUrl.searchParams.get('mode'), activeMode);
     const qTid = parsedUrl.searchParams.get('titleId') || undefined;
     return (
       <TranslatedWebViewer
@@ -929,10 +1020,31 @@ export function App() {
     activeTab === 'teks'
       ? composerText.trim().length > 0
       : activeTab === 'link'
-        ? (linkUrlInput || composerText).trim().length > 0
+        ? (linkUrlInput || composerText).trim().length > 0 && !isFetchingLink
         : readyAttachmentCount > 0;
 
-  /* Reusable K/Bilah mode + K/Composer Block */
+  const sourcePillLabel =
+    currentSrcLang === 'auto'
+      ? liveDetectedLang
+        ? isMobile
+          ? `${strings.langAutoShort} (${liveDetectedLang.toUpperCase()})`
+          : `${strings.langAutoShort} · ${labelForLang(liveDetectedLang, strings)}`
+        : isMobile
+          ? strings.langAutoShort
+          : strings.langAuto
+      : labelForLang(currentSrcLang, strings);
+
+  const targetPillLabel = labelForLang(currentTgtLang, strings);
+
+  /* Quick helper when Deteksi bahasa detects the same language as current target */
+  const autoSameLangSuggestions: TargetLang[] =
+    currentSrcLang === 'auto' &&
+    liveDetectedLang &&
+    liveDetectedLang === currentTgtLang &&
+    composerText.trim().length >= 4
+      ? (['id', 'en', 'ja'] as const).filter((l) => l !== liveDetectedLang)
+      : [];
+
   const renderComposerAndModeZone = () => (
     <div className="composer-zone-wrapper">
       <div className="composer-slot">
@@ -1009,11 +1121,12 @@ export function App() {
             </button>
           </div>
         ) : activeTab === 'link' && isStageEmpty ? (
-          <form onSubmit={handleSubmitLink} className="composer-island">
+          <form onSubmit={(e) => handleSubmitLink(e)} className="composer-island">
             <label className="field-label">
               <span>{strings.pasteLinkLabel}</span>
               <input
-                type="url"
+                type="text"
+                inputMode="url"
                 className="field-input"
                 placeholder={strings.composerLinkPlaceholder}
                 value={linkUrlInput}
@@ -1022,9 +1135,13 @@ export function App() {
               />
             </label>
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-              <button type="submit" className="btn-primary pressable">
+              <button
+                type="submit"
+                className="btn-primary pressable"
+                disabled={isFetchingLink || !linkUrlInput.trim()}
+              >
                 <IconLink size={18} />
-                {strings.translateLinkBtn}
+                {isFetchingLink ? 'Memuat halaman...' : strings.translateLinkBtn}
               </button>
             </div>
           </form>
@@ -1050,7 +1167,7 @@ export function App() {
                             ? att.reason
                             : att.status === 'reading'
                               ? uploadPct !== null
-                                ? `Mengunggah ${uploadPct}%...`
+                                ? `Memproses ${uploadPct}%...`
                                 : 'Membaca dan menerjemahkan...'
                               : `Siap dikirim (${(att.sizeBytes / 1024).toFixed(1)} KB)`}
                         </div>
@@ -1099,6 +1216,34 @@ export function App() {
               </div>
             ) : null}
 
+            {autoSameLangSuggestions.length > 0 && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  flexWrap: 'wrap',
+                  fontSize: '12px',
+                  color: 'var(--text-muted)',
+                }}
+              >
+                <span>
+                  {strings.detectedPrefix} {labelForLang(liveDetectedLang as TargetLang, strings)} ·
+                  Terjemahkan ke:
+                </span>
+                {autoSameLangSuggestions.map((sug) => (
+                  <button
+                    key={sug}
+                    type="button"
+                    className="name-chip pressable"
+                    onClick={() => handleSelectTargetLang(sug)}
+                  >
+                    {labelForLang(sug, strings)}
+                  </button>
+                ))}
+              </div>
+            )}
+
             <textarea
               className="composer-textarea"
               aria-label={strings.composerPlaceholder}
@@ -1124,7 +1269,6 @@ export function App() {
                 }
               }}
               onKeyDown={(e) => {
-                /* Japanese IME composition guard: never fire Send while kana->kanji candidate menu is open */
                 if (
                   e.key === 'Enter' &&
                   !e.shiftKey &&
@@ -1135,8 +1279,7 @@ export function App() {
                   if (activeTab === 'teks' && composerText.trim()) {
                     handleSendText();
                   } else if (activeTab === 'link' && composerText.trim()) {
-                    setLinkUrlInput(composerText.trim());
-                    handleSubmitLink();
+                    handleSubmitLink(undefined, composerText.trim());
                   } else if (readyAttachmentCount > 0) {
                     handleSendAttachments();
                   }
@@ -1187,7 +1330,7 @@ export function App() {
                   <IconMic size={19} />
                 </button>
 
-                {streamingTurn ? (
+                {streamingTurn && streamingTurn.state === 'running' ? (
                   <button
                     type="button"
                     className="send-round-btn stopping pressable"
@@ -1207,7 +1350,7 @@ export function App() {
                       if (activeTab === 'teks') {
                         handleSendText();
                       } else if (activeTab === 'link') {
-                        handleSubmitLink();
+                        handleSubmitLink(undefined, linkUrlInput || composerText);
                       } else {
                         handleSendAttachments();
                       }
@@ -1222,7 +1365,7 @@ export function App() {
         )}
       </div>
 
-      {/* K/Bilah mode: Segmented Liquid Glass Capsule (4 modes: Teks, Gambar, Dokumen, Link) */}
+      {/* K/Bilah mode: Segmented Liquid Glass Capsule (Teks, Gambar, Dokumen, Link) */}
       <div className="mode-bar-slot">
         <div
           className="mode-tray glass-tray-surface"
@@ -1270,7 +1413,6 @@ export function App() {
         }
       }}
     >
-      {/* Hidden File Inputs */}
       <input
         ref={imageInputRef}
         type="file"
@@ -1303,7 +1445,6 @@ export function App() {
         }}
       />
 
-      {/* Mobile Scrim behind Laci */}
       {isMobile && mobileDrawerOpen && (
         <div
           className="scrim-backdrop"
@@ -1313,7 +1454,6 @@ export function App() {
         />
       )}
 
-      {/* Sidebar Desktop (260px) / Laci Mobile (320px) */}
       <aside
         aria-label="Navigasi riwayat"
         inert={(isMobile && !mobileDrawerOpen) || (!isMobile && sidebarCollapsed) || undefined}
@@ -1348,6 +1488,7 @@ export function App() {
             onClick={() => {
               setAttachments([]);
               setComposerText('');
+              setStreamingTurn(null);
               navigate('/');
             }}
           >
@@ -1376,7 +1517,7 @@ export function App() {
               aria-expanded={moreMenuOpen}
               onClick={() => {
                 setAccountMenuOpen(false);
-                setLangMenuOpen(false);
+                setLangPickerSide(null);
                 setHistoryMenuTarget(null);
                 setMoreMenuOpen((v) => !v);
               }}
@@ -1485,7 +1626,7 @@ export function App() {
                             const rect = e.currentTarget.getBoundingClientRect();
                             setMoreMenuOpen(false);
                             setAccountMenuOpen(false);
-                            setLangMenuOpen(false);
+                            setLangPickerSide(null);
                             setHistoryMenuTarget((prev) =>
                               prev?.conv.id === conv.id ? null : { conv, rect }
                             );
@@ -1525,7 +1666,7 @@ export function App() {
                             const rect = e.currentTarget.getBoundingClientRect();
                             setMoreMenuOpen(false);
                             setAccountMenuOpen(false);
-                            setLangMenuOpen(false);
+                            setLangPickerSide(null);
                             setHistoryMenuTarget((prev) =>
                               prev?.conv.id === conv.id ? null : { conv, rect }
                             );
@@ -1542,7 +1683,6 @@ export function App() {
           )}
         </div>
 
-        {/* Locked Bottom Account Row (K/Baris akun -> K/Menu akun) */}
         <div className="sidebar-account-footer">
           <button
             type="button"
@@ -1550,7 +1690,7 @@ export function App() {
             aria-expanded={accountMenuOpen}
             onClick={() => {
               setMoreMenuOpen(false);
-              setLangMenuOpen(false);
+              setLangPickerSide(null);
               setHistoryMenuTarget(null);
               setAccountMenuOpen((v) => !v);
             }}
@@ -1682,28 +1822,57 @@ export function App() {
               </button>
             )}
 
-            <div style={{ position: 'relative' }}>
+            {/* Split Bidirectional & Auto-Detect Language Selector (Sumber <-> Tujuan) */}
+            <div style={{ position: 'relative' }} className="lang-pair-bar">
               <button
                 type="button"
                 className="lang-pill-btn pressable"
-                aria-expanded={langMenuOpen}
+                aria-label={`${strings.sourceLangTitle}: ${sourcePillLabel}`}
+                aria-expanded={langPickerSide === 'source'}
                 onClick={() => {
                   setMoreMenuOpen(false);
                   setAccountMenuOpen(false);
                   setHistoryMenuTarget(null);
-                  setLangMenuOpen((v) => !v);
+                  setLangPickerSide((p) => (p === 'source' ? null : 'source'));
                 }}
               >
-                <span>{activeMode === 'ja-en' ? strings.langJaEn : strings.langJaId}</span>
-                <IconChevronDown size={16} />
+                <span>{sourcePillLabel}</span>
+                <IconChevronDown size={15} />
               </button>
 
-              {/* Desktop K/Menu bahasa tujuan (L10) */}
-              {!isMobile && langMenuOpen && (
+              <button
+                type="button"
+                className={`lang-swap-btn pressable ${swapFlipped ? 'flipped' : ''}`}
+                aria-label={strings.swapLanguages}
+                title={strings.swapLanguages}
+                onClick={handleSwapLanguages}
+              >
+                <IconArrowsSwitch size={16} />
+              </button>
+
+              <button
+                type="button"
+                className="lang-pill-btn pressable"
+                aria-label={`${strings.targetLangTitle}: ${targetPillLabel}`}
+                aria-expanded={langPickerSide === 'target'}
+                onClick={() => {
+                  setMoreMenuOpen(false);
+                  setAccountMenuOpen(false);
+                  setHistoryMenuTarget(null);
+                  setLangPickerSide((p) => (p === 'target' ? null : 'target'));
+                }}
+              >
+                <span>{targetPillLabel}</span>
+                <IconChevronDown size={15} />
+              </button>
+
+              {/* Desktop Source Language Popover */}
+              {!isMobile && langPickerSide === 'source' && (
                 <div
                   className="context-popover glass-regular-surface"
-                  style={{ position: 'absolute', left: 0, top: '42px', width: '248px' }}
+                  style={{ position: 'absolute', left: 0, top: '42px', width: '240px' }}
                   role="menu"
+                  aria-label={strings.sourceLangTitle}
                 >
                   <div
                     style={{
@@ -1716,33 +1885,54 @@ export function App() {
                   </div>
                   {(
                     [
-                      ['ja-id', strings.langJaId],
-                      ['ja-en', strings.langJaEn],
+                      ['auto', strings.langAuto],
+                      ['id', strings.langId],
+                      ['en', strings.langEn],
+                      ['ja', strings.langJa],
                     ] as const
-                  ).map(([m, label]) => (
+                  ).map(([code, label]) => (
                     <button
-                      key={m}
+                      key={code}
                       type="button"
                       role="menuitemradio"
-                      aria-checked={activeMode === m}
+                      aria-checked={currentSrcLang === code}
                       className="menu-item-btn"
-                      onClick={() => {
-                        setActiveMode(m);
-                        setLangMenuOpen(false);
-                        if (activeConversation) {
-                          upsertConversationMeta(activeConversation.id, {
-                            title: activeConversation.title,
-                            titleId: activeConversation.titleId,
-                            mode: m,
-                            activeTab,
-                            pinned: activeConversation.pinned,
-                            pinnedAt: activeConversation.pinnedAt,
-                          });
-                        }
-                      }}
+                      onClick={() => handleSelectSourceLang(code)}
                     >
                       <span>{label}</span>
-                      {activeMode === m && (
+                      {currentSrcLang === code && (
+                        <IconCheck size={17} style={{ color: 'var(--accent)' }} />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Desktop Target Language Popover */}
+              {!isMobile && langPickerSide === 'target' && (
+                <div
+                  className="context-popover glass-regular-surface"
+                  style={{ position: 'absolute', right: 0, top: '42px', width: '216px' }}
+                  role="menu"
+                  aria-label={strings.targetLangTitle}
+                >
+                  {(
+                    [
+                      ['id', strings.langId],
+                      ['en', strings.langEn],
+                      ['ja', strings.langJa],
+                    ] as const
+                  ).map(([code, label]) => (
+                    <button
+                      key={code}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={currentTgtLang === code}
+                      className="menu-item-btn"
+                      onClick={() => handleSelectTargetLang(code)}
+                    >
+                      <span>{label}</span>
+                      {currentTgtLang === code && (
                         <IconCheck size={17} style={{ color: 'var(--accent)' }} />
                       )}
                     </button>
@@ -1761,6 +1951,7 @@ export function App() {
                 onClick={() => {
                   setComposerText('');
                   setAttachments([]);
+                  setStreamingTurn(null);
                   navigate('/');
                 }}
               >
@@ -1776,7 +1967,6 @@ export function App() {
           </div>
         )}
 
-        {/* Sub-views vs Reading Stage */}
         {pathname === '/berkas' ? (
           <MyFilesView
             user={user}
@@ -1867,6 +2057,9 @@ export function App() {
           <div className="stage-body">
             <div className="stream-column">
               {displayedMessages.map((turn) => {
+                const { src: turnSrc, tgt: turnTgt } = parseModePair(turn.mode);
+                const effectiveTurnSrc = turn.detectedSource || (turnSrc === 'auto' ? 'ja' : turnSrc);
+
                 if (turn.role === 'user') {
                   const isLongSrc = turn.text.length > 280;
                   const isExpanded = Boolean(expandedBubbles[turn.id]);
@@ -1879,7 +2072,7 @@ export function App() {
                         <div className="result-card" style={{ maxWidth: '580px' }}>
                           <textarea
                             className="field-input"
-                            style={{ fontFamily: 'var(--font-jp)', minHeight: '90px' }}
+                            style={{ minHeight: '90px' }}
                             value={editingDraft}
                             onChange={(e) => setEditingDraft(e.target.value)}
                           />
@@ -1906,7 +2099,10 @@ export function App() {
                         </div>
                       ) : (
                         <>
-                          <div className="user-bubble" lang="ja">
+                          <div
+                            className={`user-bubble ${effectiveTurnSrc === 'ja' ? 'is-jp' : ''}`}
+                            lang={effectiveTurnSrc}
+                          >
                             {shownText}
                           </div>
                           <div style={{ display: 'flex', gap: '6px' }}>
@@ -1942,7 +2138,6 @@ export function App() {
                   );
                 }
 
-                /* Assistant Turns: Image, Link, Document, or Text/Long */
                 if (turn.kind === 'image' && turn.imageResult) {
                   return (
                     <div key={turn.id} className="turn-assistant-wrap">
@@ -1966,12 +2161,14 @@ export function App() {
                     <div key={turn.id} className="turn-assistant-wrap">
                       <div className="result-card">
                         <div style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
-                          {lp.host} · {lp.paragraphCount} paragraf · {lp.lockedNames} nama terkunci
+                          {lp.host} · {lp.paragraphCount} paragraf
+                          {lp.lockedNames > 0 ? ` · ${lp.lockedNames} nama terkunci` : ''}
                         </div>
                         <div style={{ fontWeight: 600, fontSize: '17px' }}>{lp.titleDst}</div>
                         <div
-                          className="assistant-prose"
-                          style={{ fontSize: '16px', lineHeight: '24px' }}
+                          className={`assistant-prose ${turnTgt === 'ja' ? 'is-jp' : ''}`}
+                          style={{ fontSize: '16px', lineHeight: '26px' }}
+                          lang={turnTgt}
                         >
                           {lp.excerptDst}
                         </div>
@@ -2022,7 +2219,7 @@ export function App() {
                           }}
                         >
                           <div style={{ fontWeight: 600 }}>
-                            {turn.fileName || 'Dokumen Jepang'}
+                            {turn.fileName || 'Dokumen'}
                           </div>
                           <span
                             className={`status-badge ${
@@ -2100,7 +2297,7 @@ export function App() {
                                 <IconColumns size={16} />
                                 {strings.readSideBySide}
                               </button>
-                              {(['html', 'docx', 'srt', 'txt'] as const).map((fmt) => (
+                              {(['html', 'srt', 'txt', 'md'] as const).map((fmt) => (
                                 <button
                                   key={fmt}
                                   type="button"
@@ -2112,6 +2309,8 @@ export function App() {
                                       mid: turn.id,
                                       fmt,
                                       theme: resolvedTheme,
+                                      fallbackSentences: turn.sentences,
+                                      fallbackText: turn.text,
                                     });
                                     const url = URL.createObjectURL(blob);
                                     const a = document.createElement('a');
@@ -2132,7 +2331,6 @@ export function App() {
                   );
                 }
 
-                /* Standard Text / Long Prose Assistant Turn */
                 return (
                   <div key={turn.id} className="turn-assistant-wrap">
                     {turn.state === 'error' || turn.state === 'busy' ? (
@@ -2143,23 +2341,47 @@ export function App() {
                         <div style={{ fontSize: '14px' }}>
                           {turn.error || 'Terjemahan belum berhasil diselesaikan.'}
                         </div>
-                        {turn.srcText && (
-                          <div>
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                          {turn.srcText && (
                             <button
                               type="button"
                               className="btn-primary pressable"
-                              onClick={() => handleSendText(turn.srcText)}
+                              onClick={() =>
+                                isSingleStandaloneUrl(turn.srcText!)
+                                  ? handleSubmitLink(undefined, turn.srcText!)
+                                  : handleSendText(turn.srcText)
+                              }
                             >
                               <IconRefresh size={16} />
                               {strings.retryNow}
                             </button>
-                          </div>
-                        )}
+                          )}
+                          {turn.srcText && isSingleStandaloneUrl(turn.srcText) && (
+                            <a
+                              href={turn.srcText}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="btn-secondary pressable"
+                            >
+                              <IconLink size={16} />
+                              {strings.openOriginalSite}
+                            </a>
+                          )}
+                        </div>
                       </div>
                     ) : (
                       <>
+                        {turnSrc === 'auto' && turn.detectedSource && (
+                          <div style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
+                            {strings.detectedPrefix}:{' '}
+                            {labelForLang(turn.detectedSource, strings)} {'\u2192'}{' '}
+                            {labelForLang(turnTgt, strings)}
+                          </div>
+                        )}
+
                         <div
-                          className="assistant-prose"
+                          className={`assistant-prose ${turnTgt === 'ja' ? 'is-jp' : ''}`}
+                          lang={turnTgt}
                           onClick={() => {
                             if (isMobile) setMobileTurnSheet(turn);
                           }}
@@ -2263,7 +2485,7 @@ export function App() {
         )}
       </main>
 
-      {/* Desktop K/Menu riwayat (216px Liquid Glass Popover: L11 & L12) */}
+      {/* Desktop K/Menu riwayat (216px Liquid Glass Popover) */}
       {!isMobile && historyMenuTarget && (
         <>
           <div
@@ -2346,7 +2568,7 @@ export function App() {
         </>
       )}
 
-      {/* Mobile K/Lembar bawah for History Context Menu (H14 & H15) */}
+      {/* Mobile K/Lembar bawah for History Context Menu */}
       {isMobile && historyMenuTarget && (
         <div
           className="bottom-sheet-backdrop"
@@ -2432,53 +2654,85 @@ export function App() {
         </div>
       )}
 
-      {/* Mobile K/Lembar bawah for Target Language (H13) */}
-      {isMobile && langMenuOpen && (
-        <div className="bottom-sheet-backdrop" onClick={() => setLangMenuOpen(false)}>
+      {/* Mobile K/Lembar bawah for Source / Target Language Picker (H13) */}
+      {isMobile && langPickerSide && (
+        <div className="bottom-sheet-backdrop" onClick={() => setLangPickerSide(null)}>
           <div
             className="bottom-sheet glass-regular-surface"
             role="dialog"
             aria-modal="true"
-            aria-label={strings.langMenuTitle}
+            aria-label={
+              langPickerSide === 'source'
+                ? strings.sourceLangTitle
+                : strings.targetLangTitle
+            }
             onClick={(e) => e.stopPropagation()}
           >
             <button
               type="button"
               className="sheet-handle-btn"
               aria-label={strings.cancel}
-              onClick={() => setLangMenuOpen(false)}
+              onClick={() => setLangPickerSide(null)}
             >
               <span className="sheet-handle-pill" />
             </button>
-            <div style={{ padding: '0 12px 8px 12px', fontSize: '13px', color: 'var(--text-subtle)' }}>
-              {strings.sourceAutoHint}
+            <div
+              style={{
+                padding: '0 12px 8px 12px',
+                fontSize: '13px',
+                fontWeight: 600,
+                color: 'var(--text-subtle)',
+              }}
+            >
+              {langPickerSide === 'source'
+                ? `${strings.sourceLangTitle} · ${strings.sourceAutoHint}`
+                : strings.targetLangTitle}
             </div>
-            {(
-              [
-                ['ja-id', strings.langJaId],
-                ['ja-en', strings.langJaEn],
-              ] as const
-            ).map(([m, label]) => (
-              <button
-                key={m}
-                type="button"
-                className="sheet-row-btn"
-                onClick={() => {
-                  setActiveMode(m);
-                  setLangMenuOpen(false);
-                }}
-              >
-                <span style={{ flex: 1 }}>{label}</span>
-                {activeMode === m && (
-                  <IconCheck size={20} style={{ color: 'var(--accent)' }} />
-                )}
-              </button>
-            ))}
+            {langPickerSide === 'source'
+              ? (
+                  [
+                    ['auto', strings.langAuto],
+                    ['id', strings.langId],
+                    ['en', strings.langEn],
+                    ['ja', strings.langJa],
+                  ] as const
+                ).map(([code, label]) => (
+                  <button
+                    key={code}
+                    type="button"
+                    className="sheet-row-btn"
+                    onClick={() => handleSelectSourceLang(code)}
+                  >
+                    <span style={{ flex: 1 }}>{label}</span>
+                    {currentSrcLang === code && (
+                      <IconCheck size={20} style={{ color: 'var(--accent)' }} />
+                    )}
+                  </button>
+                ))
+              : (
+                  [
+                    ['id', strings.langId],
+                    ['en', strings.langEn],
+                    ['ja', strings.langJa],
+                  ] as const
+                ).map(([code, label]) => (
+                  <button
+                    key={code}
+                    type="button"
+                    className="sheet-row-btn"
+                    onClick={() => handleSelectTargetLang(code)}
+                  >
+                    <span style={{ flex: 1 }}>{label}</span>
+                    {currentTgtLang === code && (
+                      <IconCheck size={20} style={{ color: 'var(--accent)' }} />
+                    )}
+                  </button>
+                ))}
           </div>
         </div>
       )}
 
-      {/* Mobile K/Lembar bawah for Assistant Turn Actions (H3) */}
+      {/* Mobile K/Lembar bawah for Assistant Turn Actions */}
       {isMobile && mobileTurnSheet && (
         <div
           className="bottom-sheet-backdrop"
@@ -2541,7 +2795,6 @@ export function App() {
         </div>
       )}
 
-      {/* Modals */}
       {settingsOpen && (
         <SettingsModal
           user={user}
@@ -2590,7 +2843,6 @@ export function App() {
         />
       )}
 
-      {/* K/Toast Stack with Undo */}
       {toasts.length > 0 && (
         <div className="toast-container" role="status" aria-live="polite">
           {toasts.map((t) => (

@@ -86,7 +86,17 @@ def test_auth_guard_enforces_single_owner() -> None:
     r_owner = client.get("/v1/meta", headers=_auth_headers("valid-owner-token"))
     assert r_owner.status_code == 200
     meta = r_owner.get_json()
-    assert meta["modes"] == ["ja-id", "ja-en"]
+    assert set(meta["modes"]) == {
+        "auto-id",
+        "auto-en",
+        "auto-ja",
+        "ja-id",
+        "ja-en",
+        "id-ja",
+        "id-en",
+        "en-id",
+        "en-ja",
+    }
     assert meta["uiLangs"] == ["id", "en"]
     assert meta["jptrans"]["version"] == "1.1.0"
 
@@ -431,3 +441,90 @@ def test_pairing_inbox_merge_backup_and_cascade_delete() -> None:
     assert client.delete("/v1/conversations/c_del", headers=_auth_headers()).status_code == 204
     assert "c_del" not in repo.conversations
     assert ("c_del", "m1") not in repo.paras
+
+
+def test_bidirectional_and_autodetect_modes_id_ja_en() -> None:
+    """Verify id->ja, en->id, id->en, en->ja, and auto->ja/id/en modes with reverse glossary protection."""
+    init_tranx_core()
+    repo = InMemoryRepository()
+    tid, _, _ = repo.ensure_title("seri_dwibahasa", "Seri Dwibahasa", kind="novel")
+    repo.glossary_backend.commit_mutations(
+        tid,
+        {
+            "e_chihaya": {
+                "surface": "千早",
+                "kind": "PERSON",
+                "reading": "ちはや",
+                "romaji": "Chihaya",
+                "render_id": "Chihaya",
+                "render_en": "Chihaya",
+                "gloss_id": "",
+                "gloss_en": "",
+                "gender": "f",
+                "aliases": [],
+                "allow_compound": False,
+                "confirmed": True,
+                "source": "user",
+                "score": 1.0,
+            }
+        },
+        set(),
+    )
+
+    class MultilingualStubTransport:
+        def __call__(self, payload: dict[str, Any]) -> dict[str, Any]:
+            items = json.loads(payload["messages"][1]["content"].split("Input:\n", 1)[1])
+            out = []
+            for item in items:
+                txt = item["text"]
+                if "[[E1]]" in txt:
+                    out.append({"id": item["id"], "text": f"「[[E1]]は静かに微笑んだ。」"})
+                elif "Good morning" in txt:
+                    out.append({"id": item["id"], "text": "Selamat pagi dari London."})
+                else:
+                    out.append({"id": item["id"], "text": "Good morning from Jakarta."})
+            return {
+                "choices": [
+                    {
+                        "message": {"content": json.dumps({"translations": out}, ensure_ascii=False)},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+    app = create_flask_app(repo, llm_transport=MultilingualStubTransport())
+    client = app.test_client()
+
+    # 1. Indonesia -> Jepang (id-ja) with reverse glossary Chihaya -> 千早
+    r_id_ja = client.post(
+        "/v1/chat",
+        json={"cid": "c_bi1", "mode": "id-ja", "titleId": tid, "text": "Chihaya tersenyum tenang."},
+        headers=_auth_headers(),
+    )
+    assert r_id_ja.status_code == 200
+    ev_id_ja = _parse_ndjson(r_id_ja.data)
+    assert ev_id_ja[0]["detectedSource"] == "id"
+    assert "千早" in ev_id_ja[-1]["fullDst"]
+
+    # 2. Auto-detect English -> Indonesian (auto-id)
+    r_auto_id = client.post(
+        "/v1/chat",
+        json={"cid": "c_bi2", "mode": "auto-id", "text": "Good morning, the train is arriving at the station."},
+        headers=_auth_headers(),
+    )
+    assert r_auto_id.status_code == 200
+    ev_auto_id = _parse_ndjson(r_auto_id.data)
+    assert ev_auto_id[0]["detectedSource"] == "en"
+    assert "Selamat pagi" in ev_auto_id[-1]["fullDst"]
+
+    # 3. Auto-detect Indonesian -> English (auto-en)
+    r_auto_en = client.post(
+        "/v1/chat",
+        json={"cid": "c_bi3", "mode": "auto-en", "text": "Selamat pagi, saya sedang membaca buku ini di rumah."},
+        headers=_auth_headers(),
+    )
+    assert r_auto_en.status_code == 200
+    ev_auto_en = _parse_ndjson(r_auto_en.data)
+    assert ev_auto_en[0]["detectedSource"] == "id"
+    assert "Good morning" in ev_auto_en[-1]["fullDst"]
+

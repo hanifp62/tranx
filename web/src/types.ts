@@ -1,4 +1,15 @@
-export type ModePair = 'ja-id' | 'ja-en';
+export type SourceLang = 'auto' | 'id' | 'en' | 'ja';
+export type TargetLang = 'id' | 'en' | 'ja';
+export type ModePair =
+  | 'auto-id'
+  | 'auto-en'
+  | 'auto-ja'
+  | 'ja-id'
+  | 'ja-en'
+  | 'id-ja'
+  | 'id-en'
+  | 'en-id'
+  | 'en-ja';
 export type UiLang = 'id' | 'en';
 export type ThemePref = 'system' | 'light' | 'dark';
 export type ResolvedTheme = 'Terang' | 'Gelap';
@@ -45,6 +56,7 @@ export interface ConversationDoc {
   title: string;
   titleId: string;
   mode: ModePair;
+  detectedSource?: TargetLang | '';
   activeTab: WorkTab;
   pinned: boolean;
   pinnedAt: number | null;
@@ -115,6 +127,7 @@ export interface TurnMessage {
   role: 'user' | 'assistant';
   kind: 'text' | 'long' | 'image' | 'document' | 'link';
   mode: ModePair;
+  detectedSource?: TargetLang;
   titleId?: string;
   text: string;
   srcText?: string;
@@ -154,7 +167,8 @@ export interface AppSettingsDoc {
   maxUploadMb: number;
   dailyCharCap: number;
   dailyCallCap: number;
-  defaultTarget: 'id' | 'en';
+  defaultSource: SourceLang;
+  defaultTarget: TargetLang;
   uiLang: UiLang;
   theme: ThemePref;
 }

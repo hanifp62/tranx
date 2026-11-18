@@ -726,8 +726,15 @@ export function TranslatedWebViewer({
             onChange={(e) => setMode(e.target.value as ModePair)}
             aria-label={strings.langMenuTitle}
           >
-            <option value="ja-id">{strings.langJaId}</option>
-            <option value="ja-en">{strings.langJaEn}</option>
+            <option value="auto-id">{strings.langAuto} {'\u2192'} {strings.langId}</option>
+            <option value="auto-en">{strings.langAuto} {'\u2192'} {strings.langEn}</option>
+            <option value="auto-ja">{strings.langAuto} {'\u2192'} {strings.langJa}</option>
+            <option value="ja-id">{strings.langJa} {'\u2192'} {strings.langId}</option>
+            <option value="ja-en">{strings.langJa} {'\u2192'} {strings.langEn}</option>
+            <option value="id-ja">{strings.langId} {'\u2192'} {strings.langJa}</option>
+            <option value="id-en">{strings.langId} {'\u2192'} {strings.langEn}</option>
+            <option value="en-id">{strings.langEn} {'\u2192'} {strings.langId}</option>
+            <option value="en-ja">{strings.langEn} {'\u2192'} {strings.langJa}</option>
           </select>
           {titleId && (
             <button
@@ -819,6 +826,8 @@ export function SideBySideReaderView({
       fmt: 'html',
       bilingual: true,
       theme: resolvedTheme,
+      fallbackSentences: turn?.sentences,
+      fallbackText: turn?.text,
     })
       .then(({ blob }) => blob.text())
       .then((txt) => {

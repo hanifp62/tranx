@@ -15,6 +15,8 @@ import {
   collection,
   deleteDoc,
   doc,
+  getDoc,
+  getDocs,
   initializeFirestore,
   onSnapshot,
   orderBy,
@@ -24,7 +26,9 @@ import {
   serverTimestamp,
   setDoc,
   updateDoc,
+  type DocumentData,
   type Firestore,
+  type UpdateData,
 } from 'firebase/firestore';
 import {
   getDownloadURL,
@@ -40,6 +44,8 @@ import type {
   InboxItem,
   JobDoc,
   ModePair,
+  SourceLang,
+  TargetLang,
   TitleDoc,
   TitleKind,
   TitleStyle,
@@ -49,6 +55,23 @@ import type {
 
 export const OWNER_EMAIL = import.meta.env.VITE_OWNER_EMAIL || 'hanifp633@gmail.com';
 
+export const VALID_MODES: ReadonlySet<string> = new Set<ModePair>([
+  'auto-id',
+  'auto-en',
+  'auto-ja',
+  'ja-id',
+  'ja-en',
+  'id-ja',
+  'id-en',
+  'en-id',
+  'en-ja',
+]);
+
+export function normalizeModePair(raw: unknown, fallback: ModePair = 'auto-id'): ModePair {
+  const s = String(raw || '').trim().toLowerCase();
+  return VALID_MODES.has(s) ? (s as ModePair) : fallback;
+}
+
 export const DEFAULT_SETTINGS: AppSettingsDoc = {
   llmModels: ['gemini-2.5-flash-lite', 'gemini-2.5-flash'],
   reasoningEffort: 'none',
@@ -57,6 +80,7 @@ export const DEFAULT_SETTINGS: AppSettingsDoc = {
   maxUploadMb: 50,
   dailyCharCap: 500000,
   dailyCallCap: 1500,
+  defaultSource: 'auto',
   defaultTarget: 'id',
   uiLang: 'id',
   theme: 'light',
@@ -80,8 +104,10 @@ export function isLocalE2EMode(): boolean {
   if (window.__TRANX_E2E__ === true) return true;
   const host = window.location.hostname;
   if (host !== 'localhost' && host !== '127.0.0.1') return false;
-  return new URLSearchParams(window.location.search).get('e2e') === '1' ||
-    window.sessionStorage.getItem('tranx_e2e') === '1';
+  return (
+    new URLSearchParams(window.location.search).get('e2e') === '1' ||
+    window.sessionStorage.getItem('tranx_e2e') === '1'
+  );
 }
 
 let fbApp: FirebaseApp | null = null;
@@ -89,7 +115,7 @@ let fbAuth: Auth | null = null;
 let fbDb: Firestore | null = null;
 let fbStorage: FirebaseStorage | null = null;
 
-function ensureFirebase(): {
+export function ensureFirebase(): {
   app: FirebaseApp;
   auth: Auth;
   db: Firestore;
@@ -134,11 +160,12 @@ export function glossaryKeyForSurface(surface: string): string {
     hash = Math.imul(hash, 16777619);
   }
   const hex = (hash >>> 0).toString(16).padStart(8, '0');
-  const safePrefix = clean.replace(/[^A-Za-z0-9_\u3040-\u30ff\u3400-\u9fff-]/g, '').slice(0, 40);
+  const safePrefix = clean
+    .replace(/[^A-Za-z0-9_\u3040-\u30ff\u3400-\u9fff-]/g, '')
+    .slice(0, 40);
   return safePrefix ? `${safePrefix}_${hex}` : `e_${hex}`;
 }
 
-/* Deterministic local E2E state container used ONLY on localhost?e2e=1 */
 class LocalE2EStore {
   user: AuthSessionUser | null = {
     uid: 'owner-1',
@@ -147,6 +174,7 @@ class LocalE2EStore {
     getIdToken: async () => 'valid-owner-token',
   };
   settings: AppSettingsDoc = { ...DEFAULT_SETTINGS };
+  geminiKey = '';
   conversations = new Map<string, ConversationDoc>();
   messages = new Map<string, Map<string, TurnMessage>>();
   titles = new Map<string, TitleDoc>();
@@ -187,6 +215,7 @@ class LocalE2EStore {
       title: 'Bab 1: Hujan di Gerbang Rashomon',
       titleId: 't_rashomon',
       mode: 'ja-id',
+      detectedSource: 'ja',
       activeTab: 'teks',
       pinned: true,
       pinnedAt: now - 10000,
@@ -198,7 +227,8 @@ class LocalE2EStore {
       id: 'c_recent_demo',
       title: 'Catatan Dialog Stasiun Kyoto',
       titleId: 't_rashomon',
-      mode: 'ja-id',
+      mode: 'auto-id',
+      detectedSource: 'ja',
       activeTab: 'teks',
       pinned: false,
       pinnedAt: null,
@@ -213,6 +243,7 @@ class LocalE2EStore {
       role: 'user',
       kind: 'text',
       mode: 'ja-id',
+      detectedSource: 'ja',
       titleId: 't_rashomon',
       text: '「千早は小さく笑った。」',
       state: 'done',
@@ -223,6 +254,7 @@ class LocalE2EStore {
       role: 'assistant',
       kind: 'text',
       mode: 'ja-id',
+      detectedSource: 'ja',
       titleId: 't_rashomon',
       srcText: '「千早は小さく笑った。」',
       text: '“Chihaya tersenyum kecil.”',
@@ -370,6 +402,12 @@ export function subscribeSettings(onData: (settings: AppSettingsDoc) => void): (
         return;
       }
       const d = snap.data();
+      const src = ['auto', 'ja', 'id', 'en'].includes(d.defaultSource)
+        ? (d.defaultSource as SourceLang)
+        : DEFAULT_SETTINGS.defaultSource;
+      const tgt = ['id', 'en', 'ja'].includes(d.defaultTarget)
+        ? (d.defaultTarget as TargetLang)
+        : DEFAULT_SETTINGS.defaultTarget;
       onData({
         llmModels: Array.isArray(d.llmModels) ? d.llmModels : DEFAULT_SETTINGS.llmModels,
         reasoningEffort: d.reasoningEffort || DEFAULT_SETTINGS.reasoningEffort,
@@ -378,7 +416,8 @@ export function subscribeSettings(onData: (settings: AppSettingsDoc) => void): (
         maxUploadMb: Number(d.maxUploadMb || DEFAULT_SETTINGS.maxUploadMb),
         dailyCharCap: Number(d.dailyCharCap || DEFAULT_SETTINGS.dailyCharCap),
         dailyCallCap: Number(d.dailyCallCap || DEFAULT_SETTINGS.dailyCallCap),
-        defaultTarget: d.defaultTarget === 'en' ? 'en' : 'id',
+        defaultSource: src,
+        defaultTarget: tgt,
         uiLang: d.uiLang === 'en' ? 'en' : 'id',
         theme: d.theme === 'dark' || d.theme === 'system' ? d.theme : 'light',
       });
@@ -400,6 +439,38 @@ export async function updateAppSettings(patch: Partial<AppSettingsDoc>): Promise
     { ...patch, updatedAt: serverTimestamp() },
     { merge: true }
   );
+}
+
+export async function getOwnerGeminiKey(): Promise<string> {
+  if (isLocalE2EMode()) {
+    return getE2EStore().geminiKey;
+  }
+  try {
+    const { db } = ensureFirebase();
+    const snap = await getDoc(doc(db, 'settings', 'secrets'));
+    if (!snap.exists()) return '';
+    return String(snap.data().geminiApiKey || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+export async function setOwnerGeminiKey(apiKey: string): Promise<void> {
+  const clean = apiKey.trim();
+  if (isLocalE2EMode()) {
+    getE2EStore().geminiKey = clean;
+    return;
+  }
+  const { db } = ensureFirebase();
+  const ref = doc(db, 'settings', 'secrets');
+  if (!clean) {
+    await deleteDoc(ref).catch(() => {});
+    return;
+  }
+  await setDoc(ref, {
+    geminiApiKey: clean.slice(0, 512),
+    updatedAt: serverTimestamp(),
+  });
 }
 
 export function subscribeConversations(
@@ -425,7 +496,10 @@ export function subscribeConversations(
           id: d.id,
           title: String(raw.title || 'Percakapan baru'),
           titleId: String(raw.titleId || ''),
-          mode: raw.mode === 'ja-en' ? 'ja-en' : 'ja-id',
+          mode: normalizeModePair(raw.mode, 'auto-id'),
+          detectedSource: ['ja', 'id', 'en'].includes(raw.detectedSource)
+            ? (raw.detectedSource as TargetLang)
+            : '',
           activeTab: (['teks', 'gambar', 'dokumen', 'link'].includes(raw.activeTab)
             ? raw.activeTab
             : 'teks') as WorkTab,
@@ -448,6 +522,7 @@ export async function upsertConversationMeta(
     title: string;
     titleId?: string;
     mode: ModePair;
+    detectedSource?: TargetLang | '';
     activeTab: WorkTab;
     pinned?: boolean;
     pinnedAt?: number | null;
@@ -463,6 +538,7 @@ export async function upsertConversationMeta(
       title: data.title,
       titleId: data.titleId ?? cur?.titleId ?? '',
       mode: data.mode,
+      detectedSource: data.detectedSource ?? cur?.detectedSource ?? '',
       activeTab: data.activeTab,
       pinned: data.pinned ?? cur?.pinned ?? false,
       pinnedAt: data.pinnedAt !== undefined ? data.pinnedAt : cur?.pinnedAt ?? null,
@@ -474,21 +550,117 @@ export async function upsertConversationMeta(
     return;
   }
   const { db } = ensureFirebase();
-  await setDoc(
-    doc(db, 'conversations', cid),
-    {
+  const ref = doc(db, 'conversations', cid);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) {
+    await setDoc(ref, {
       title: data.title.slice(0, 500),
       titleId: data.titleId || '',
       mode: data.mode,
+      detectedSource: data.detectedSource || '',
       activeTab: data.activeTab,
       pinned: data.pinned ?? false,
       pinnedAt: data.pinnedAt ? Timestamp.fromMillis(data.pinnedAt) : null,
       preview: (data.preview || '').slice(0, 2000),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
-    },
-    { merge: true }
-  );
+    });
+  } else {
+    const patch: Record<string, unknown> = {
+      mode: data.mode,
+      activeTab: data.activeTab,
+      updatedAt: serverTimestamp(),
+    };
+    if (data.title) patch.title = data.title.slice(0, 500);
+    if (data.titleId !== undefined) patch.titleId = data.titleId;
+    if (data.detectedSource !== undefined) patch.detectedSource = data.detectedSource;
+    if (data.pinned !== undefined) patch.pinned = data.pinned;
+    if (data.pinnedAt !== undefined) {
+      patch.pinnedAt = data.pinnedAt ? Timestamp.fromMillis(data.pinnedAt) : null;
+    }
+    if (data.preview !== undefined) patch.preview = data.preview.slice(0, 2000);
+    await updateDoc(ref, patch as UpdateData<DocumentData>);
+  }
+}
+
+export async function saveTurnMessageDirect(
+  cid: string,
+  mid: string,
+  turn: Omit<TurnMessage, 'id' | 'createdAt'>
+): Promise<void> {
+  if (isLocalE2EMode()) {
+    const store = getE2EStore();
+    const bucket = store.messages.get(cid) ?? new Map<string, TurnMessage>();
+    const prev = bucket.get(mid);
+    bucket.set(mid, {
+      ...prev,
+      ...turn,
+      id: mid,
+      createdAt: prev?.createdAt ?? Date.now(),
+    });
+    store.messages.set(cid, bucket);
+    store.emit();
+    return;
+  }
+  const { db } = ensureFirebase();
+  const ref = doc(db, 'conversations', cid, 'messages', mid);
+  const snap = await getDoc(ref);
+  const cleanPayload: Record<string, unknown> = {
+    role: turn.role,
+    kind: turn.kind,
+    mode: turn.mode,
+    text: (turn.text || '').slice(0, 240000),
+    state: turn.state,
+    updatedAt: serverTimestamp(),
+  };
+  if (turn.detectedSource) cleanPayload.detectedSource = turn.detectedSource;
+  if (turn.titleId) cleanPayload.titleId = turn.titleId;
+  if (turn.srcText !== undefined) cleanPayload.srcText = turn.srcText.slice(0, 240000);
+  if (turn.sentences) cleanPayload.sentences = turn.sentences.slice(0, 500);
+  if (turn.nameChips) cleanPayload.nameChips = turn.nameChips.slice(0, 50);
+  if (turn.fileName) cleanPayload.fileName = turn.fileName.slice(0, 500);
+  if (turn.fmt) cleanPayload.fmt = turn.fmt;
+  if (turn.jobId) cleanPayload.jobId = turn.jobId;
+  if (turn.done !== undefined) cleanPayload.done = turn.done;
+  if (turn.total !== undefined) cleanPayload.total = turn.total;
+  if (turn.imageResult) {
+    // Store blocks & text without multi-MB base64 dataUrl if large
+    const { dataUrl, ...restImg } = turn.imageResult;
+    cleanPayload.imageResult =
+      dataUrl && dataUrl.length < 600000 ? turn.imageResult : restImg;
+  }
+  if (turn.linkPreview) cleanPayload.linkPreview = turn.linkPreview;
+  if (turn.model) cleanPayload.model = turn.model;
+  if (turn.ms !== undefined) cleanPayload.ms = turn.ms;
+  if (turn.error) cleanPayload.error = turn.error.slice(0, 1000);
+
+  if (!snap.exists()) {
+    cleanPayload.createdAt = serverTimestamp();
+    await setDoc(ref, cleanPayload);
+  } else {
+    await updateDoc(ref, cleanPayload as UpdateData<DocumentData>);
+  }
+}
+
+export async function deleteConversationDirect(cid: string): Promise<void> {
+  if (isLocalE2EMode()) {
+    const store = getE2EStore();
+    store.conversations.delete(cid);
+    store.messages.delete(cid);
+    store.emit();
+    return;
+  }
+  const { db } = ensureFirebase();
+  const msgCol = collection(db, 'conversations', cid, 'messages');
+  const msgs = await getDocs(msgCol);
+  for (const m of msgs.docs) {
+    const paras = await getDocs(collection(db, 'conversations', cid, 'messages', m.id, 'paras'));
+    for (const p of paras.docs) {
+      await deleteDoc(p.ref).catch(() => {});
+    }
+    await deleteDoc(m.ref).catch(() => {});
+  }
+  await deleteDoc(doc(db, 'conversations', cid));
 }
 
 export async function toggleConversationPin(
@@ -566,11 +738,15 @@ export function subscribeMessages(
           id: d.id,
           role: raw.role === 'user' ? 'user' : 'assistant',
           kind: raw.kind || 'text',
-          mode: raw.mode === 'ja-en' ? 'ja-en' : 'ja-id',
+          mode: normalizeModePair(raw.mode, 'auto-id'),
+          detectedSource: ['ja', 'id', 'en'].includes(raw.detectedSource)
+            ? (raw.detectedSource as TargetLang)
+            : undefined,
           titleId: raw.titleId,
           text: String(raw.text || ''),
           srcText: raw.srcText,
           sentences: raw.sentences,
+          nameChips: raw.nameChips,
           fileName: raw.fileName,
           fmt: raw.fmt,
           jobId: raw.jobId,
@@ -637,17 +813,99 @@ export async function saveTitleDoc(
     return;
   }
   const { db } = ensureFirebase();
+  const ref = doc(db, 'titles', titleId);
+  const snap = await getDoc(ref);
   await setDoc(
-    doc(db, 'titles', titleId),
+    ref,
     {
       name: payload.name.trim().slice(0, 300),
       kind: payload.kind,
       style: payload.style,
       notes: (payload.notes || '').slice(0, 5000),
+      ...(snap.exists() ? {} : { createdAt: serverTimestamp() }),
       updatedAt: serverTimestamp(),
     },
     { merge: true }
   );
+}
+
+function mapGlossaryDoc(r: Record<string, unknown>): GlossaryEntry {
+  return {
+    surface: String(r.surface || ''),
+    kind: (r.kind || 'PERSON') as GlossaryEntry['kind'],
+    reading: String(r.reading || ''),
+    romaji: String(r.romaji || ''),
+    render_id: String(r.render_id || ''),
+    render_en: String(r.render_en || ''),
+    gloss_id: String(r.gloss_id || ''),
+    gloss_en: String(r.gloss_en || ''),
+    gender: (r.gender === 'm' || r.gender === 'f' ? r.gender : '') as GlossaryEntry['gender'],
+    aliases: Array.isArray(r.aliases) ? r.aliases.map(String) : [],
+    allow_compound: Boolean(r.allow_compound),
+    confirmed: Boolean(r.confirmed ?? true),
+    source: String(r.source || 'user'),
+    score: Number(r.score ?? 1.0),
+  };
+}
+
+export async function loadGlossaryEntriesOnce(titleId?: string): Promise<GlossaryEntry[]> {
+  if (isLocalE2EMode()) {
+    const store = getE2EStore();
+    const bySurface = new Map<string, GlossaryEntry>();
+    if (titleId) {
+      const primary = store.glossaries.get(titleId);
+      if (primary) {
+        for (const entry of primary.values()) {
+          if (entry.surface) bySurface.set(entry.surface, entry);
+        }
+      }
+    }
+    for (const [tid, gmap] of store.glossaries.entries()) {
+      if (tid === titleId) continue;
+      for (const entry of gmap.values()) {
+        if (entry.surface && entry.confirmed && !bySurface.has(entry.surface)) {
+          bySurface.set(entry.surface, entry);
+        }
+      }
+    }
+    return Array.from(bySurface.values());
+  }
+  try {
+    const { db } = ensureFirebase();
+    const bySurface = new Map<string, GlossaryEntry>();
+    if (titleId) {
+      const snap = await getDocs(collection(db, 'titles', titleId, 'glossary'));
+      for (const d of snap.docs) {
+        const entry = mapGlossaryDoc(d.data());
+        if (entry.surface) bySurface.set(entry.surface, entry);
+      }
+    }
+    if (titleId !== 't_default') {
+      const defSnap = await getDocs(collection(db, 'titles', 't_default', 'glossary'));
+      for (const d of defSnap.docs) {
+        const entry = mapGlossaryDoc(d.data());
+        if (entry.surface && entry.confirmed && !bySurface.has(entry.surface)) {
+          bySurface.set(entry.surface, entry);
+        }
+      }
+    }
+    if (bySurface.size === 0) {
+      const titlesSnap = await getDocs(collection(db, 'titles'));
+      for (const tDoc of titlesSnap.docs.slice(0, 5)) {
+        if (tDoc.id === titleId || tDoc.id === 't_default') continue;
+        const gSnap = await getDocs(collection(db, 'titles', tDoc.id, 'glossary'));
+        for (const d of gSnap.docs) {
+          const entry = mapGlossaryDoc(d.data());
+          if (entry.surface && entry.confirmed && !bySurface.has(entry.surface)) {
+            bySurface.set(entry.surface, entry);
+          }
+        }
+      }
+    }
+    return Array.from(bySurface.values());
+  } catch {
+    return [];
+  }
 }
 
 export function subscribeGlossary(
@@ -701,7 +959,6 @@ export function subscribeGlossary(
   );
 }
 
-/* Saves exact 14 GlossaryEntry fields + updatedAt matching firestore.rules isValidGlossaryEntry */
 export async function upsertUserGlossaryEntry(
   titleId: string,
   entry: Omit<GlossaryEntry, 'confirmed' | 'source'>
@@ -740,6 +997,17 @@ export async function upsertUserGlossaryEntry(
     return;
   }
   const { db } = ensureFirebase();
+  const titleRef = doc(db, 'titles', titleId);
+  const titleSnap = await getDoc(titleRef);
+  if (!titleSnap.exists()) {
+    await setDoc(titleRef, {
+      name: 'Percakapan',
+      kind: 'lepas',
+      style: { ...DEFAULT_STYLE },
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  }
   await setDoc(doc(db, 'titles', titleId, 'glossary', key), {
     ...fullEntry,
     updatedAt: serverTimestamp(),
@@ -761,9 +1029,7 @@ export function subscribeJobs(onData: (jobs: JobDoc[]) => void): () => void {
   if (isLocalE2EMode()) {
     const store = getE2EStore();
     return store.subscribe(() => {
-      onData(
-        Array.from(store.jobs.values()).sort((a, b) => b.updatedAt - a.updatedAt)
-      );
+      onData(Array.from(store.jobs.values()).sort((a, b) => b.updatedAt - a.updatedAt));
     });
   }
   const { db } = ensureFirebase();
@@ -797,6 +1063,39 @@ export function subscribeJobs(onData: (jobs: JobDoc[]) => void): () => void {
   );
 }
 
+export async function saveDirectJobRecord(job: JobDoc): Promise<void> {
+  if (isLocalE2EMode()) {
+    const store = getE2EStore();
+    store.jobs.set(job.id, job);
+    store.emit();
+    return;
+  }
+  const { db } = ensureFirebase();
+  const ref = doc(db, 'jobs', job.id);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) {
+    await setDoc(ref, {
+      state: job.state === 'done' || job.state === 'running' ? job.state : 'running',
+      fileSize: Math.max(1, job.fileSize),
+      fileName: job.fileName.slice(0, 500),
+      cid: job.cid,
+      mid: job.mid,
+      titleId: job.titleId || '',
+      doneParas: job.doneParas ?? 0,
+      totalParas: job.totalParas ?? 0,
+      updatedAt: serverTimestamp(),
+    });
+  } else {
+    await updateDoc(ref, {
+      state: job.state === 'uploading' ? 'running' : job.state,
+      doneParas: job.doneParas ?? 0,
+      totalParas: job.totalParas ?? 0,
+      ...(job.message ? { message: job.message.slice(0, 1000) } : {}),
+      updatedAt: serverTimestamp(),
+    });
+  }
+}
+
 export function subscribeInbox(onData: (items: InboxItem[]) => void): () => void {
   if (isLocalE2EMode()) {
     const store = getE2EStore();
@@ -823,7 +1122,7 @@ export function subscribeInbox(onData: (items: InboxItem[]) => void): () => void
   );
 }
 
-export async function uploadDocumentForJob(params: {
+export async function uploadDocumentToCloudStorage(params: {
   uid: string;
   cid: string;
   mid: string;
@@ -834,58 +1133,11 @@ export async function uploadDocumentForJob(params: {
 }): Promise<string> {
   const jobId = `job_${Date.now().toString(36)}`;
   const storagePath = `uploads/${params.uid}/${jobId}/${params.file.name}`;
-
-  if (isLocalE2EMode()) {
-    const store = getE2EStore();
-    const now = Date.now();
-    store.jobs.set(jobId, {
-      id: jobId,
-      cid: params.cid,
-      mid: params.mid,
-      titleId: params.titleId,
-      fileName: params.file.name,
-      fileSize: params.file.size,
-      fmt: params.file.name.split('.').pop()?.toLowerCase() || 'txt',
-      state: 'done',
-      doneParas: 3,
-      totalParas: 3,
-      storagePath,
-      storageOutputPath: `outputs/${params.uid}/${jobId}/${params.file.name}`,
-      updatedAt: now,
-    });
-    const bucket = store.messages.get(params.cid) ?? new Map<string, TurnMessage>();
-    bucket.set(params.mid, {
-      id: params.mid,
-      role: 'assistant',
-      kind: 'document',
-      mode: params.mode,
-      titleId: params.titleId || 't_rashomon',
-      fileName: params.file.name,
-      fmt: params.file.name.split('.').pop()?.toLowerCase() || 'txt',
-      jobId,
-      done: 3,
-      total: 3,
-      text: `Terjemahan dokumen ${params.file.name} selesai.`,
-      state: 'done',
-      createdAt: now,
-    });
-    store.messages.set(params.cid, bucket);
-    await upsertConversationMeta(params.cid, {
-      title: params.file.name,
-      titleId: params.titleId || 't_rashomon',
-      mode: params.mode,
-      activeTab: 'dokumen',
-      preview: params.file.name,
-    });
-    params.onProgress?.(100);
-    store.emit();
-    return jobId;
-  }
-
   const { db, storage } = ensureFirebase();
+
   await setDoc(doc(db, 'jobs', jobId), {
     state: 'uploading',
-    fileSize: params.file.size,
+    fileSize: Math.max(1, params.file.size),
     fileName: params.file.name.slice(0, 500),
     storagePath,
     mimeType: (params.file.type || 'application/octet-stream').slice(0, 200),
