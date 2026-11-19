@@ -437,17 +437,15 @@ export function App() {
   }, [inlineChaptersNav]);
 
   const handleInstallAppClick = useCallback(async () => {
+    // Invoke Chrome's native install prompt FIRST (synchronously when ready) before closing menus
+    // so UserActivation is preserved and stale React state can never drop a ready prompt.
+    const outcome = await triggerNativePwaInstall();
     setAccountMenuOpen(false);
     setMobileDrawerOpen(false);
-    if (pwaState.canNativePrompt) {
-      const outcome = await triggerNativePwaInstall();
-      if (outcome === 'unavailable') {
-        setInstallGuideOpen(true);
-      }
-      return;
+    if (outcome === 'unavailable') {
+      setInstallGuideOpen(true);
     }
-    setInstallGuideOpen(true);
-  }, [pwaState.canNativePrompt]);
+  }, []);
 
   // Idle pre-warm: probe backend & preload lazy UI chunks so Web and Installed PWA feel instant on every tap
   useEffect(() => {

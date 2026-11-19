@@ -7,15 +7,6 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: 'autoUpdate',
-      includeAssets: [
-        'favicon.svg',
-        'pwa-capture.js',
-        'icons/icon-192.png',
-        'icons/icon-512.png',
-        'icons/apple-touch-icon.png',
-        'screenshots/desktop-wide.png',
-        'screenshots/mobile-narrow.png',
-      ],
       manifest: {
         id: '/',
         name: 'tranX',
@@ -107,6 +98,7 @@ export default defineConfig({
         share_target: {
           action: '/share',
           method: 'GET',
+          enctype: 'application/x-www-form-urlencoded',
           params: {
             title: 'title',
             text: 'text',

@@ -16,6 +16,8 @@ export interface PwaInstallState {
 interface EarlyPwaStore {
   deferredPrompt: BeforeInstallPromptEvent | null;
   appInstalled: boolean;
+  capturedAt?: number;
+  promptCount?: number;
 }
 
 const LEGACY_INSTALLED_KEY = 'tranx_pwa_installed_device_v1';
@@ -26,11 +28,45 @@ const RELATED_APP_ORIGINS = new Set([
 ]);
 const POST_INSTALL_GRACE_MS = 20_000;
 const FALLBACK_STORAGE_TTL_MS = 24 * 60 * 60 * 1000;
+const LATE_PROMPT_WAIT_MS = 1_200;
 
 let deferredPrompt: BeforeInstallPromptEvent | null = null;
 let installedFlag = false;
 let initialized = false;
+let triggerInFlight: Promise<'accepted' | 'dismissed' | 'unavailable'> | null = null;
 const listeners = new Set<(state: PwaInstallState) => void>();
+
+function getEarlyStore(): EarlyPwaStore | null {
+  if (typeof window === 'undefined') return null;
+  return (window as unknown as { __tranxEarlyPwa?: EarlyPwaStore }).__tranxEarlyPwa ?? null;
+}
+
+function getActivePrompt(): BeforeInstallPromptEvent | null {
+  if (deferredPrompt) return deferredPrompt;
+  const earlyPrompt = getEarlyStore()?.deferredPrompt ?? null;
+  if (earlyPrompt) {
+    deferredPrompt = earlyPrompt;
+    return earlyPrompt;
+  }
+  return null;
+}
+
+function setActivePrompt(ev: BeforeInstallPromptEvent): void {
+  deferredPrompt = ev;
+  const early = getEarlyStore();
+  if (early) {
+    early.deferredPrompt = ev;
+    early.appInstalled = false;
+  }
+}
+
+function clearActivePrompt(): void {
+  deferredPrompt = null;
+  const early = getEarlyStore();
+  if (early) {
+    early.deferredPrompt = null;
+  }
+}
 
 function detectStandaloneInstalled(): boolean {
   if (typeof window === 'undefined') return false;
@@ -89,9 +125,16 @@ function detectPlatform(): {
   isMacSafari: boolean;
   isAndroid: boolean;
   isChromiumDesktop: boolean;
+  isChromiumBrowser: boolean;
 } {
   if (typeof navigator === 'undefined') {
-    return { isIosSafari: false, isMacSafari: false, isAndroid: false, isChromiumDesktop: false };
+    return {
+      isIosSafari: false,
+      isMacSafari: false,
+      isAndroid: false,
+      isChromiumDesktop: false,
+      isChromiumBrowser: false,
+    };
   }
   const ua = navigator.userAgent || '';
   const isAndroid = /Android/i.test(ua);
@@ -100,26 +143,27 @@ function detectPlatform(): {
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const isWebKitSafari = /Safari/i.test(ua) && !/Chrome|CriOS|FxiOS|Edg|OPR|Android/i.test(ua);
   const isMac = /Macintosh|Mac OS X/i.test(ua) && !isIos;
-  const isChromium = /Chrome|Chromium|Edg\/|OPR\//i.test(ua) && !/Firefox|FxiOS/i.test(ua);
-  const isChromiumDesktop = isChromium && !isAndroid && !isIos;
+  const isChromiumBrowser = /Chrome|Chromium|Edg\/|OPR\/|SamsungBrowser/i.test(ua) && !/Firefox|FxiOS/i.test(ua);
+  const isChromiumDesktop = isChromiumBrowser && !isAndroid && !isIos;
   return {
     isIosSafari: isIos && isWebKitSafari,
     isMacSafari: isMac && isWebKitSafari,
     isAndroid,
     isChromiumDesktop,
+    isChromiumBrowser,
   };
 }
 
 export function getPwaInstallState(): PwaInstallState {
   const { isIosSafari, isMacSafari, isAndroid, isChromiumDesktop } = detectPlatform();
   const isStandalone = detectStandaloneInstalled();
-  const canNativePrompt = deferredPrompt !== null;
-  const isInstalled = installedFlag || isStandalone || readInstalledDeviceFlag();
+  const canNativePrompt = getActivePrompt() !== null;
+  const isInstalled = installedFlag || isStandalone || (!canNativePrompt && readInstalledDeviceFlag());
 
   // On Desktop Chrome/Edge/Brave, Chrome fires beforeinstallprompt when uninstalled and suppresses it
   // when already installed ("Open in app" in address bar). Showing Install only when canNativePrompt is true
-  // guarantees 1-click direct native installation and hides the button automatically when already installed!
-  // On Android & Safari/Firefox, show when !isInstalled (1-click when prompt ready, platform guide otherwise).
+  // guarantees 1-click direct native installation and hides the button automatically when already installed.
+  // On Android & Safari/Firefox, show when !isInstalled (1-click native prompt when available, guide fallback otherwise).
   const shouldShowInstallButton =
     !isInstalled && (canNativePrompt || !isChromiumDesktop);
 
@@ -143,7 +187,7 @@ export function refreshInstalledRelatedApps(): void {
   if (detectStandaloneInstalled()) {
     installedFlag = true;
     writeInstalledDeviceFlag(true);
-    deferredPrompt = null;
+    clearActivePrompt();
     emit();
     return;
   }
@@ -169,7 +213,7 @@ export function refreshInstalledRelatedApps(): void {
       if (apps.length > 0) {
         installedFlag = true;
         writeInstalledDeviceFlag(true);
-        deferredPrompt = null;
+        clearActivePrompt();
         emit();
         return;
       }
@@ -191,10 +235,9 @@ export function initPwaInstallCapture(): void {
   initialized = true;
 
   // Adopt any beforeinstallprompt / appinstalled captured synchronously by /pwa-capture.js in <head>
-  const early = (window as unknown as { __tranxEarlyPwa?: EarlyPwaStore }).__tranxEarlyPwa;
+  const early = getEarlyStore();
   if (early?.deferredPrompt) {
-    deferredPrompt = early.deferredPrompt;
-    early.deferredPrompt = null;
+    setActivePrompt(early.deferredPrompt);
     installedFlag = false;
     writeInstalledDeviceFlag(false);
   } else if (early?.appInstalled) {
@@ -219,28 +262,42 @@ export function initPwaInstallCapture(): void {
     });
   }
 
-  // Browser fires beforeinstallprompt ONLY when the app is NOT currently installed on this device
-  window.addEventListener('beforeinstallprompt', (ev: Event) => {
-    ev.preventDefault();
-    deferredPrompt = ev as BeforeInstallPromptEvent;
-    installedFlag = false;
-    writeInstalledDeviceFlag(false);
-    emit();
-  });
+  const handlePromptAvailable = (ev: Event) => {
+    if (ev.type === 'beforeinstallprompt') {
+      ev.preventDefault();
+      setActivePrompt(ev as BeforeInstallPromptEvent);
+    } else {
+      const earlyPrompt = getEarlyStore()?.deferredPrompt;
+      if (earlyPrompt) {
+        deferredPrompt = earlyPrompt;
+      }
+    }
+    if (getActivePrompt()) {
+      installedFlag = false;
+      writeInstalledDeviceFlag(false);
+      emit();
+    }
+  };
 
-  window.addEventListener('appinstalled', () => {
-    deferredPrompt = null;
+  const handleAppInstalled = () => {
+    clearActivePrompt();
     installedFlag = true;
     writeInstalledDeviceFlag(true);
     emit();
-  });
+  };
+
+  // Browser fires beforeinstallprompt ONLY when the app is NOT currently installed on this device
+  window.addEventListener('beforeinstallprompt', handlePromptAvailable);
+  window.addEventListener('tranx:pwa-prompt-ready', handlePromptAvailable);
+  window.addEventListener('appinstalled', handleAppInstalled);
+  window.addEventListener('tranx:pwa-installed', handleAppInstalled);
 
   const mq = window.matchMedia?.('(display-mode: standalone)');
   mq?.addEventListener?.('change', (e) => {
     if (e.matches) {
       installedFlag = true;
       writeInstalledDeviceFlag(true);
-      deferredPrompt = null;
+      clearActivePrompt();
       emit();
     } else {
       refreshInstalledRelatedApps();
@@ -257,12 +314,44 @@ export function subscribePwaInstallState(fn: (state: PwaInstallState) => void): 
   };
 }
 
-export async function triggerNativePwaInstall(): Promise<'accepted' | 'dismissed' | 'unavailable'> {
-  if (!deferredPrompt) return 'unavailable';
-  const promptEvent = deferredPrompt;
-  deferredPrompt = null;
-  emit();
+function waitForNativePrompt(timeoutMs: number): Promise<BeforeInstallPromptEvent | null> {
+  const existing = getActivePrompt();
+  if (existing) return Promise.resolve(existing);
+  if (typeof window === 'undefined' || timeoutMs <= 0) return Promise.resolve(null);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ev: BeforeInstallPromptEvent | null) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      window.removeEventListener('beforeinstallprompt', onPrompt);
+      window.removeEventListener('tranx:pwa-prompt-ready', onReady);
+      resolve(ev);
+    };
+    const onPrompt = (ev: Event) => {
+      ev.preventDefault();
+      const promptEv = ev as BeforeInstallPromptEvent;
+      setActivePrompt(promptEv);
+      finish(promptEv);
+    };
+    const onReady = () => {
+      const promptEv = getActivePrompt();
+      if (promptEv) finish(promptEv);
+    };
+    const timer = window.setTimeout(() => finish(getActivePrompt()), timeoutMs);
+    window.addEventListener('beforeinstallprompt', onPrompt);
+    window.addEventListener('tranx:pwa-prompt-ready', onReady);
+  });
+}
+
+async function runNativePrompt(
+  promptEvent: BeforeInstallPromptEvent
+): Promise<'accepted' | 'dismissed' | 'unavailable'> {
+  clearActivePrompt();
   try {
+    // Invoke prompt() synchronously inside the user gesture BEFORE emitting state updates
+    // that may hide or unmount the trigger button.
     await promptEvent.prompt();
     const choice = await promptEvent.userChoice;
     if (choice?.outcome === 'accepted') {
@@ -271,8 +360,40 @@ export async function triggerNativePwaInstall(): Promise<'accepted' | 'dismissed
       emit();
       return 'accepted';
     }
+    emit();
     return 'dismissed';
   } catch {
+    emit();
     return 'unavailable';
   }
+}
+
+export function triggerNativePwaInstall(): Promise<'accepted' | 'dismissed' | 'unavailable'> {
+  if (triggerInFlight) return triggerInFlight;
+
+  const immediatePrompt = getActivePrompt();
+  if (immediatePrompt) {
+    const task = runNativePrompt(immediatePrompt).finally(() => {
+      triggerInFlight = null;
+    });
+    triggerInFlight = task;
+    return task;
+  }
+
+  const { isChromiumBrowser } = detectPlatform();
+  if (!isChromiumBrowser) {
+    return Promise.resolve('unavailable');
+  }
+
+  // If the user clicked right after page load before Chrome finished SW + manifest installability checks,
+  // wait briefly (well inside Chrome's 5s transient user activation window) to launch the native prompt directly.
+  const task = (async (): Promise<'accepted' | 'dismissed' | 'unavailable'> => {
+    const latePrompt = await waitForNativePrompt(LATE_PROMPT_WAIT_MS);
+    if (!latePrompt) return 'unavailable';
+    return runNativePrompt(latePrompt);
+  })().finally(() => {
+    triggerInFlight = null;
+  });
+  triggerInFlight = task;
+  return task;
 }

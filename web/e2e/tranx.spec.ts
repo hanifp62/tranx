@@ -1938,6 +1938,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect((await page.request.get('/screenshots/desktop-wide.png')).status()).toBe(200);
     expect((await page.request.get('/screenshots/mobile-narrow.png')).status()).toBe(200);
     expect(manifest.shortcuts?.length).toBeGreaterThanOrEqual(3);
+    expect(manifest.share_target?.enctype).toBe('application/x-www-form-urlencoded');
 
     // 4. Verify persistent Install App button (no notification banner):
     //    - On Desktop Chromium when Chrome suppresses beforeinstallprompt (e.g. already installed "Open in app"), button stays HIDDEN (no fake guide popup!)
@@ -2047,6 +2048,32 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     // Open mobile hamburger drawer -> labeled "Pasang aplikasi" button is clearly visible too!
     await page.getByRole('button', { name: 'Menu', exact: true }).click();
     await expect(page.locator('aside.sidebar').getByRole('button', { name: 'Pasang aplikasi' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    // Late-arriving beforeinstallprompt on Android mobile: tapping Install right before Chrome dispatches the event still invokes native prompt() directly with ZERO guide modal!
+    await page.evaluate(() => {
+      (window as unknown as { __lateMobilePromptCalled?: boolean }).__lateMobilePromptCalled = false;
+      window.setTimeout(() => {
+        const ev = new Event('beforeinstallprompt', { cancelable: true }) as Event & {
+          prompt?: () => Promise<void>;
+          userChoice?: Promise<{ outcome: 'dismissed'; platform: string }>;
+        };
+        ev.prompt = async () => {
+          (window as unknown as { __lateMobilePromptCalled?: boolean }).__lateMobilePromptCalled = true;
+        };
+        ev.userChoice = Promise.resolve({ outcome: 'dismissed', platform: 'web' });
+        window.dispatchEvent(ev);
+      }, 220);
+    });
+    await mobileHeaderInstall.click();
+    await expect
+      .poll(
+        () => page.evaluate(() => Boolean((window as unknown as { __lateMobilePromptCalled?: boolean }).__lateMobilePromptCalled)),
+        { timeout: 3000 }
+      )
+      .toBe(true);
+    await expect(page.getByRole('heading', { name: 'Cara memasang aplikasi tranX' })).toHaveCount(0);
+
     // Simulate OS confirming installed again -> BOTH buttons disappear immediately on focus!
     await page.evaluate(() => {
       Object.defineProperty(navigator, 'getInstalledRelatedApps', {
