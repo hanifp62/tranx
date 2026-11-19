@@ -665,6 +665,7 @@ export function TranslatedWebViewer({
   initialView = 'reader',
   titleId,
   backPath = '/',
+  resolvedTheme,
   strings,
   onNavigate,
 }: {
@@ -674,6 +675,7 @@ export function TranslatedWebViewer({
   initialView?: 'reader' | 'site' | 'original';
   titleId?: string;
   backPath?: string;
+  resolvedTheme?: ResolvedTheme;
   strings: UiStrings;
   onNavigate: (path: string) => void;
 }) {
@@ -748,6 +750,7 @@ export function TranslatedWebViewer({
       mode,
       titleId,
       view,
+      theme: resolvedTheme,
       onProgress: (partial, doneCount, totalCount) => {
         if (!active) return;
         setBundle(partial);
@@ -774,7 +777,7 @@ export function TranslatedWebViewer({
     return () => {
       active = false;
     };
-  }, [user, url, mode, titleId, view]);
+  }, [user, url, mode, titleId, view, resolvedTheme]);
 
   // Passive GPU-composited scroll reading progress bar (0 React re-renders while scrolling)
   useEffect(() => {
@@ -1153,6 +1156,7 @@ export function TranslatedWebViewer({
           </div>
         ) : view === 'site' && bundle?.siteHtml ? (
           <iframe
+            key={`${bundle.url}::${mode}::${resolvedTheme || 'auto'}::site`}
             title="Pembaca Halaman Terjemahan"
             sandbox="allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
             srcDoc={bundle.siteHtml}
@@ -1417,10 +1421,22 @@ export function TranslatedWebViewer({
                   className="btn-primary pressable"
                   aria-label={nav.isTocPage ? strings.startReadingCh1 : strings.nextChapter}
                   onMouseEnter={() =>
-                    prefetchNextChapterTranslatedDirect(nav.nextUrl!, mode, effectiveTitleId)
+                    prefetchNextChapterTranslatedDirect(
+                      nav.nextUrl!,
+                      mode,
+                      effectiveTitleId,
+                      view === 'site' ? 'site' : 'reader',
+                      resolvedTheme
+                    )
                   }
                   onFocus={() =>
-                    prefetchNextChapterTranslatedDirect(nav.nextUrl!, mode, effectiveTitleId)
+                    prefetchNextChapterTranslatedDirect(
+                      nav.nextUrl!,
+                      mode,
+                      effectiveTitleId,
+                      view === 'site' ? 'site' : 'reader',
+                      resolvedTheme
+                    )
                   }
                   onClick={() => openChapterUrl(nav.nextUrl!)}
                 >

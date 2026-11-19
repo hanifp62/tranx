@@ -19,6 +19,7 @@ import {
   saveTurnMessageDirect,
   upsertConversationMeta,
 } from './firebase';
+import { idbGet, idbLoadRecent, idbPut, idbPutMany } from './perfCache';
 
 const CJK_RE = /[\u3040-\u309f\u30a0-\u30ff\u3400-\u9fff]/;
 const CJK_SPAN_RE = /[\u3000-\u30ff\u3400-\u9fff\uff01-\uff60]+/g;
@@ -352,9 +353,10 @@ async function runConcurrentPool<T>(
 }
 
 const PARA_CACHE_STORAGE_KEY = 'tranx_para_cache_v2';
-const MAX_PARA_CACHE_MEM = 900;
-const MAX_PARA_CACHE_LS = 450;
+const MAX_PARA_CACHE_MEM = 2400;
+const MAX_PARA_CACHE_LS = 320;
 const paraTranslationCache = new Map<string, string>();
+const pendingIdbParaWrites = new Map<string, string>();
 let paraCacheHydrated = false;
 let paraCacheFlushTimer: number | null = null;
 
@@ -363,31 +365,45 @@ function hydrateParaCacheOnce(): void {
   paraCacheHydrated = true;
   try {
     const raw = window.localStorage.getItem(PARA_CACHE_STORAGE_KEY);
-    if (!raw) return;
-    const entries = JSON.parse(raw);
-    if (Array.isArray(entries)) {
-      for (const pair of entries) {
-        if (Array.isArray(pair) && typeof pair[0] === 'string' && typeof pair[1] === 'string') {
-          paraTranslationCache.set(pair[0], pair[1]);
+    if (raw) {
+      const entries = JSON.parse(raw);
+      if (Array.isArray(entries)) {
+        for (const pair of entries) {
+          if (Array.isArray(pair) && typeof pair[0] === 'string' && typeof pair[1] === 'string') {
+            paraTranslationCache.set(pair[0], pair[1]);
+          }
         }
       }
     }
   } catch {
     // Ignore storage read issues
   }
+  // Background-hydrate up to 2,400 entries from IndexedDB so Web & Installed PWA share instant warm cache
+  void idbLoadRecent<string>('paras', MAX_PARA_CACHE_MEM).then((rows) => {
+    for (const [k, v] of rows) {
+      if (!paraTranslationCache.has(k) && typeof v === 'string') {
+        paraTranslationCache.set(k, v);
+      }
+    }
+  });
 }
 
 function scheduleParaCacheFlush(): void {
   if (typeof window === 'undefined' || paraCacheFlushTimer !== null) return;
   paraCacheFlushTimer = window.setTimeout(() => {
     paraCacheFlushTimer = null;
+    if (pendingIdbParaWrites.size > 0) {
+      const batch = Array.from(pendingIdbParaWrites.entries());
+      pendingIdbParaWrites.clear();
+      void idbPutMany('paras', batch);
+    }
     try {
       const recent = Array.from(paraTranslationCache.entries()).slice(-MAX_PARA_CACHE_LS);
       window.localStorage.setItem(PARA_CACHE_STORAGE_KEY, JSON.stringify(recent));
     } catch {
       // Ignore storage quota errors
     }
-  }, 1500);
+  }, 1200);
 }
 
 function makeParaCacheKey(
@@ -415,11 +431,17 @@ function setCachedParaTranslation(key: string, translated: string): void {
   hydrateParaCacheOnce();
   paraTranslationCache.delete(key);
   paraTranslationCache.set(key, translated);
+  pendingIdbParaWrites.set(key, translated);
   if (paraTranslationCache.size > MAX_PARA_CACHE_MEM) {
     const oldestKey = paraTranslationCache.keys().next().value;
     if (oldestKey !== undefined) paraTranslationCache.delete(oldestKey);
   }
   scheduleParaCacheFlush();
+}
+
+// Kick off non-blocking L2 cache hydration immediately on module load
+if (typeof window !== 'undefined') {
+  hydrateParaCacheOnce();
 }
 
 function hasTranslatableLetters(text: string): boolean {
@@ -431,6 +453,30 @@ function cleanCjkSpacing(raw: string): string {
     /([\u3000-\u30ff\u3400-\u9fff\uff00-\uffef])\s+(?=[\u3000-\u30ff\u3400-\u9fff\uff00-\uffef])/g,
     '$1'
   );
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  outerSignal?: AbortSignal
+): Promise<Response> {
+  const ctrl = new AbortController();
+  const onOuterAbort = () => ctrl.abort();
+  if (outerSignal) {
+    if (outerSignal.aborted) {
+      ctrl.abort();
+    } else {
+      outerSignal.addEventListener('abort', onOuterAbort, { once: true });
+    }
+  }
+  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    window.clearTimeout(timer);
+    if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
+  }
 }
 
 async function requestGtxSingleChunk(
@@ -453,14 +499,15 @@ async function requestGtxSingleChunk(
   const bodyForm = new URLSearchParams({ q: clean });
 
   try {
-    const resp = await fetch(
+    const resp = await fetchWithTimeout(
       `https://translate.googleapis.com/translate_a/single?${queryMeta.toString()}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
         body: bodyForm.toString(),
-        signal,
-      }
+      },
+      9500,
+      signal
     );
     if (resp.ok) {
       const data = await resp.json();
@@ -479,10 +526,48 @@ async function requestGtxSingleChunk(
       return { translated: pieces.join(''), detected };
     }
   } catch (err) {
-    if ((err as { name?: string })?.name === 'AbortError') throw err;
+    if (signal?.aborted) throw err;
   }
 
-  // Fallback 1: GET for short payloads or alternate Google endpoint
+  // Fallback 1: Alternate fast Google Translate edge (clients5.google.com, already whitelisted in CSP)
+  try {
+    const altMeta = new URLSearchParams({
+      client: 'dict-chrome-ex',
+      sl: src,
+      tl: tgt,
+    });
+    const respAlt = await fetchWithTimeout(
+      `https://clients5.google.com/translate_a/t?${altMeta.toString()}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        body: bodyForm.toString(),
+      },
+      7500,
+      signal
+    );
+    if (respAlt.ok) {
+      const altData = await respAlt.json();
+      if (Array.isArray(altData)) {
+        const first = altData[0];
+        if (typeof first === 'string' && first.trim()) {
+          return { translated: first };
+        }
+        if (Array.isArray(first) && typeof first[0] === 'string' && first[0].trim()) {
+          const detRaw = String(first[1] || '').toLowerCase();
+          const detected =
+            detRaw === 'ja' || detRaw === 'id' || detRaw === 'en'
+              ? (detRaw as TargetLang)
+              : undefined;
+          return { translated: first[0], detected };
+        }
+      }
+    }
+  } catch (err) {
+    if (signal?.aborted) throw err;
+  }
+
+  // Fallback 2: GET for short payloads
   if (clean.length <= 450) {
     try {
       const qs = new URLSearchParams({
@@ -492,9 +577,11 @@ async function requestGtxSingleChunk(
         dt: 't',
         q: clean,
       });
-      const respGet = await fetch(
+      const respGet = await fetchWithTimeout(
         `https://translate.googleapis.com/translate_a/single?${qs.toString()}`,
-        { method: 'GET', signal }
+        { method: 'GET' },
+        7500,
+        signal
       );
       if (respGet.ok) {
         const data = await respGet.json();
@@ -508,11 +595,11 @@ async function requestGtxSingleChunk(
         return { translated: pieces.join('') };
       }
     } catch (err) {
-      if ((err as { name?: string })?.name === 'AbortError') throw err;
+      if (signal?.aborted) throw err;
     }
   }
 
-  // Fallback 2: MyMemory public translation API for short chunks
+  // Fallback 3: MyMemory public translation API for short chunks
   if (clean.length <= 480) {
     try {
       const effSrc = src === 'auto' ? detectLanguageLocal(clean, tgt === 'ja' ? 'id' : 'ja') : src;
@@ -520,9 +607,11 @@ async function requestGtxSingleChunk(
         q: clean,
         langpair: `${effSrc}|${tgt}`,
       });
-      const mmResp = await fetch(
+      const mmResp = await fetchWithTimeout(
         `https://api.mymemory.translated.net/get?${mmQs.toString()}`,
-        { signal }
+        { method: 'GET' },
+        7500,
+        signal
       );
       if (mmResp.ok) {
         const mmData = await mmResp.json();
@@ -530,7 +619,7 @@ async function requestGtxSingleChunk(
         if (mmText) return { translated: mmText, detected: effSrc };
       }
     } catch (err) {
-      if ((err as { name?: string })?.name === 'AbortError') throw err;
+      if (signal?.aborted) throw err;
     }
   }
 
@@ -577,16 +666,21 @@ async function translateBatchViaGoogleGtx(
     }
   };
 
-  // Pack optimal request batches (<= 18 items, <= 1,750 chars each)
+  // Pack optimal request batches:
+  // Batch 0 is a priority micro-batch (<= 8 items, <= 950 chars) for ~250ms Time-To-First-Paragraph,
+  // followed by dense throughput batches (<= 24 items, <= 2,400 chars) executed across 6 parallel workers!
   const batches: Array<Array<{ text: string; slots: number[] }>> = [];
   let cursor = 0;
   while (cursor < work.length) {
+    const isFirstFastBatch = batches.length === 0 && work.length > 8;
+    const maxItems = isFirstFastBatch ? 8 : 24;
+    const maxChars = isFirstFastBatch ? 950 : 2400;
     const batch: Array<{ text: string; slots: number[] }> = [];
     let charCount = 0;
     while (
       cursor < work.length &&
-      batch.length < 18 &&
-      charCount + work[cursor].text.length <= 1750
+      batch.length < maxItems &&
+      charCount + work[cursor].text.length <= maxChars
     ) {
       batch.push(work[cursor]);
       charCount += work[cursor].text.length + 12;
@@ -599,16 +693,16 @@ async function translateBatchViaGoogleGtx(
     batches.push(batch);
   }
 
-  // Execute up to 3 batches concurrently for ~3.5x faster chapter & document translation!
-  await runConcurrentPool(batches, 3, async (batch) => {
+  // Execute up to 6 batches concurrently for ~3x faster chapter, site & document translation!
+  await runConcurrentPool(batches, 6, async (batch) => {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-    if (batch.length === 1 && batch[0].text.length > 1750) {
+    if (batch.length === 1 && batch[0].text.length > 2400) {
       const parts = batch[0].text.split(/(?<=[。！？.!?\n])/);
       const subChunks: string[] = [];
       let acc = '';
       for (const part of parts) {
-        if ((acc + part).length > 1300 && acc) {
+        if ((acc + part).length > 1500 && acc) {
           subChunks.push(acc);
           acc = part;
         } else {
@@ -617,7 +711,7 @@ async function translateBatchViaGoogleGtx(
       }
       if (acc) subChunks.push(acc);
       const translatedSubs = new Array<string>(subChunks.length).fill('');
-      await runConcurrentPool(subChunks, 2, async (sc, scIdx) => {
+      await runConcurrentPool(subChunks, 4, async (sc, scIdx) => {
         const r = await requestGtxSingleChunk(sc, src, tgt, signal);
         if (r.detected) detected = r.detected;
         translatedSubs[scIdx] = r.translated;
@@ -697,14 +791,17 @@ async function translateViaGeminiDirect(
     `Keep placeholders like [[E1]] verbatim in their natural grammatical position. Preserve line breaks. ` +
     `Return strict JSON: {"translations":[{"id":1,"text":"..."}]}`;
 
-  const chunkSize = 40;
+  // Fast first chunk (14 items) for instant initial stream, followed by 40-item parallel chunks across 4 workers
   const chunks: Array<{ start: number; slice: string[] }> = [];
-  for (let i = 0; i < paragraphs.length; i += chunkSize) {
-    chunks.push({ start: i, slice: paragraphs.slice(i, i + chunkSize) });
+  let pos = 0;
+  while (pos < paragraphs.length) {
+    const size = chunks.length === 0 && paragraphs.length > 16 ? 14 : 40;
+    chunks.push({ start: pos, slice: paragraphs.slice(pos, pos + size) });
+    pos += size;
   }
 
   const allOut = new Array<string>(paragraphs.length);
-  await runConcurrentPool(chunks, 2, async ({ start, slice }) => {
+  await runConcurrentPool(chunks, 4, async ({ start, slice }) => {
     const items = slice.map((text, idx) => ({ id: idx + 1, text }));
     const resp = await fetch(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',
@@ -1028,7 +1125,7 @@ export async function translateParagraphsDirect(params: {
   );
 
   if (mixedJaItems.length > 0) {
-    await runConcurrentPool(mixedJaItems, 3, async (item) => {
+    await runConcurrentPool(mixedJaItems, 6, async (item) => {
       const tr = await translateMixedCjkLineToTarget(item.masked, tgt, params.signal);
       const finalTxt = polishTranslatedProse(unmaskWithGlossary(tr, item.map), tgt);
       setCachedParaTranslation(item.cacheKey, finalTxt);
@@ -2450,6 +2547,15 @@ async function fetchSeriesTocDirect(
   if (mem && mem.chapters.length >= 2) {
     return applyChapterListToCurrentUrl(mem, currentUrl);
   }
+  const persistedToc = await idbGet<{
+    seriesTitle?: string;
+    tocUrl: string;
+    chapters: NovelChapterLink[];
+  }>('tocs', `toc::${cacheKey}`, 12 * 60 * 60 * 1000);
+  if (persistedToc && Array.isArray(persistedToc.chapters) && persistedToc.chapters.length >= 2) {
+    seriesTocCache.set(cacheKey, persistedToc);
+    return applyChapterListToCurrentUrl(persistedToc, currentUrl);
+  }
   if (typeof window !== 'undefined') {
     try {
       const saved = window.sessionStorage.getItem(`tranx_toc_v2::${cacheKey}`);
@@ -2461,6 +2567,7 @@ async function fetchSeriesTocDirect(
         };
         if (Array.isArray(parsed.chapters) && parsed.chapters.length >= 2) {
           seriesTocCache.set(cacheKey, parsed);
+          void idbPut('tocs', `toc::${cacheKey}`, parsed);
           return applyChapterListToCurrentUrl(parsed, currentUrl);
         }
       }
@@ -2541,6 +2648,7 @@ async function fetchSeriesTocDirect(
       chapters: bestChapters,
     };
     seriesTocCache.set(cacheKey, tocRecord);
+    void idbPut('tocs', `toc::${cacheKey}`, tocRecord);
     if (typeof window !== 'undefined') {
       try {
         window.sessionStorage.setItem(`tranx_toc_v2::${cacheKey}`, JSON.stringify(tocRecord));
@@ -2566,7 +2674,19 @@ export async function translateChapterTitlesDirect(params: {
   const { chapters, mode, titleId, tocKey, seriesTitle, signal, onProgress } = params;
   if (!chapters.length) return {};
   const cacheKey = `${tocKey}::${mode}`;
-  const map: Record<string, string> = { ...(translatedChapterTitlesCache.get(cacheKey) || {}) };
+  let initialMap = translatedChapterTitlesCache.get(cacheKey);
+  if (!initialMap) {
+    const idbTitles = await idbGet<Record<string, string>>(
+      'tocs',
+      `titles::${cacheKey}`,
+      24 * 60 * 60 * 1000
+    );
+    if (idbTitles && typeof idbTitles === 'object') {
+      initialMap = idbTitles;
+      translatedChapterTitlesCache.set(cacheKey, { ...idbTitles });
+    }
+  }
+  const map: Record<string, string> = { ...(initialMap || {}) };
 
   const uniqueChapters: NovelChapterLink[] = [];
   const seenUrls = new Set<string>();
@@ -2615,17 +2735,19 @@ export async function translateChapterTitlesDirect(params: {
     enqueueRange(0, uniqueChapters.length);
   }
 
-  // Process ALL pending chapters in fast 45-chapter waves (using 3-worker parallel GTX + L1/L2 cache!)
-  const WAVE_SIZE = 45;
-  let seriesPending = needsSeries;
-
+  // Process ALL pending chapters in fast 60-chapter parallel waves (2 concurrent waves x 6 GTX workers + L1/L2 cache!)
+  const WAVE_SIZE = 60;
+  const waveSpecs: Array<{ chapters: NovelChapterLink[]; includeSeries: boolean }> = [];
   const waveCount = Math.max(1, Math.ceil(priorityOrdered.length / WAVE_SIZE));
   for (let w = 0; w < waveCount; w += 1) {
-    if (signal?.aborted) break;
     const waveChapters = priorityOrdered.slice(w * WAVE_SIZE, (w + 1) * WAVE_SIZE);
-    const includeSeries = seriesPending && Boolean(seriesTitle?.trim());
+    const includeSeries = w === 0 && needsSeries && Boolean(seriesTitle?.trim());
     if (waveChapters.length === 0 && !includeSeries) break;
+    waveSpecs.push({ chapters: waveChapters, includeSeries });
+  }
 
+  await runConcurrentPool(waveSpecs, 2, async ({ chapters: waveChapters, includeSeries }) => {
+    if (signal?.aborted) return;
     const inputs = includeSeries
       ? [seriesTitle!.trim(), ...waveChapters.map((c) => c.title.trim())]
       : waveChapters.map((c) => c.title.trim());
@@ -2637,11 +2759,10 @@ export async function translateChapterTitlesDirect(params: {
         titleId,
         signal,
       });
-      if (signal?.aborted) break;
+      if (signal?.aborted) return;
       let offset = 0;
       if (includeSeries) {
         if (outputs[0]) map.__seriesTitle__ = outputs[0];
-        seriesPending = false;
         offset = 1;
       }
       waveChapters.forEach((ch, idx) => {
@@ -2651,11 +2772,14 @@ export async function translateChapterTitlesDirect(params: {
       translatedChapterTitlesCache.set(cacheKey, { ...map });
       onProgress?.({ ...map }, countTranslated(), totalCount);
     } catch (err) {
-      if ((err as { name?: string })?.name === 'AbortError' || signal?.aborted) break;
+      if ((err as { name?: string })?.name === 'AbortError' || signal?.aborted) return;
       // Continue remaining waves gracefully if a single wave fails transiently
     }
-  }
+  });
 
+  if (Object.keys(map).length > 0) {
+    void idbPut('tocs', `titles::${cacheKey}`, { ...map });
+  }
   return { ...map };
 }
 
@@ -2818,9 +2942,25 @@ async function fetchWebArticleDirect(
   options?: { needRawHtml?: boolean }
 ): Promise<CachedWebEntry> {
   const cleanUrl = normalizeWebUrl(rawUrl);
-  const cached = webArticleCache.get(cleanUrl);
+  let cached = webArticleCache.get(cleanUrl);
   if (cached && (!options?.needRawHtml || cached.rawHtml)) {
     return cached;
+  }
+
+  if (!cached) {
+    const idbArticle = await idbGet<CachedWebEntry>(
+      'articles',
+      `art::${cleanUrl}`,
+      6 * 60 * 60 * 1000
+    );
+    if (idbArticle && Array.isArray(idbArticle.srcParas) && idbArticle.srcParas.length > 0) {
+      webArticleCache.set(cleanUrl, idbArticle);
+      webArticleCache.set(idbArticle.url, idbArticle);
+      cached = idbArticle;
+      if (!options?.needRawHtml || cached.rawHtml) {
+        return cached;
+      }
+    }
   }
 
   const inflightKey = `${cleanUrl}::${Boolean(options?.needRawHtml)}`;
@@ -3041,6 +3181,16 @@ async function fetchWebArticleDirectInner(
     };
     webArticleCache.set(cleanUrl, entry);
     webArticleCache.set(finalUrl, entry);
+    // Persist lightweight copy to IndexedDB so Web & Installed PWA reopen chapters in < 25ms
+    const persistCopy: CachedWebEntry = {
+      ...entry,
+      rawHtml: entry.rawHtml && entry.rawHtml.length <= 1_500_000 ? entry.rawHtml : undefined,
+      rawMarkdown: undefined,
+    };
+    void idbPut('articles', `art::${cleanUrl}`, persistCopy);
+    if (finalUrl !== cleanUrl) {
+      void idbPut('articles', `art::${finalUrl}`, persistCopy);
+    }
     return entry;
   } catch (err) {
     if ((err as { name?: string })?.name === 'AbortError') {
@@ -3066,33 +3216,57 @@ export function prefetchWebArticleDirect(rawUrl?: string | null): void {
 export function prefetchNextChapterTranslatedDirect(
   rawUrl?: string | null,
   mode: ModePair = 'auto-id',
-  titleId?: string
+  titleId?: string,
+  view: 'reader' | 'site' = 'reader',
+  theme?: 'Terang' | 'Gelap'
 ): void {
   if (!rawUrl) return;
   const safe = toSafeHttpUrl(rawUrl);
   if (!safe) return;
-  const cacheKey = `${safe}::${mode}`;
-  if (translatedWebCache.has(cacheKey) || inFlightPreTranslations.has(cacheKey)) return;
+  const cacheKey = `${safe}::${mode}::${view}`;
+  if (
+    inFlightPreTranslations.has(cacheKey) ||
+    (view === 'reader' && translatedWebCache.has(`${safe}::${mode}`)) ||
+    (view === 'site' && translatedSiteHtmlCache.has(`${safe}::${mode}::${theme || 'auto'}::site`))
+  ) {
+    return;
+  }
 
   inFlightPreTranslations.add(cacheKey);
   const runTask = () => {
     (async () => {
       try {
-        const article = await fetchWebArticleDirect(safe);
+        const article = await fetchWebArticleDirect(safe, { needRawHtml: view === 'site' });
         const articleCacheKey = `${article.url}::${mode}`;
-        if (translatedWebCache.has(articleCacheKey)) return;
-        const tid = titleId || article.titleId;
-        const cappedSrc = article.srcParas.slice(0, 180);
-        const batch = [article.titleSrc, ...cappedSrc];
-        const { outputs } = await translateParagraphsDirect({
-          paragraphs: batch,
-          mode,
-          titleId: tid,
-        });
-        const heading = outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
-        const paras = outputs.slice(1).map((s) => s.replace(/^#{1,6}\s+/, ''));
-        translatedWebCache.set(articleCacheKey, { heading, paras });
-        translatedWebCache.set(cacheKey, { heading, paras });
+        let heading = article.titleSrc;
+        let paras = article.srcParas.slice(0, 180);
+        const existingTr = translatedWebCache.get(articleCacheKey);
+        if (existingTr) {
+          heading = existingTr.heading;
+          paras = existingTr.paras;
+        } else {
+          const tid = titleId || article.titleId;
+          const batch = [article.titleSrc, ...paras];
+          const { outputs } = await translateParagraphsDirect({
+            paragraphs: batch,
+            mode,
+            titleId: tid,
+          });
+          heading = outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
+          paras = outputs.slice(1).map((s) => s.replace(/^#{1,6}\s+/, ''));
+          translatedWebCache.set(articleCacheKey, { heading, paras });
+          translatedWebCache.set(`${safe}::${mode}`, { heading, paras });
+        }
+        if (view === 'site') {
+          await buildTranslatedSiteHtmlDirect({
+            article,
+            mode,
+            titleId: titleId || article.titleId,
+            translatedHeading: heading,
+            translatedParas: paras,
+            theme,
+          });
+        }
       } catch {
         // Silent background optimization
       } finally {
@@ -3108,9 +3282,41 @@ export function prefetchNextChapterTranslatedDirect(
       }
     ).requestIdleCallback;
     if (typeof idleCb === 'function') {
-      idleCb(runTask, { timeout: 1400 });
+      idleCb(runTask, { timeout: 900 });
     } else {
-      window.setTimeout(runTask, 300);
+      window.setTimeout(runTask, 200);
+    }
+  }
+}
+
+function prewarmCurrentSiteHtmlDirect(params: {
+  article: CachedWebEntry;
+  mode: ModePair;
+  titleId?: string;
+  translatedHeading: string;
+  translatedParas: string[];
+  theme?: 'Terang' | 'Gelap';
+}): void {
+  const cacheKey = `${params.article.url}::${params.mode}::${params.theme || 'auto'}::site`;
+  if (translatedSiteHtmlCache.has(cacheKey) || inFlightPreTranslations.has(cacheKey)) return;
+  inFlightPreTranslations.add(cacheKey);
+  const run = () => {
+    void buildTranslatedSiteHtmlDirect(params)
+      .catch(() => {})
+      .finally(() => {
+        inFlightPreTranslations.delete(cacheKey);
+      });
+  };
+  if (typeof window !== 'undefined') {
+    const idleCb = (
+      window as unknown as {
+        requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      }
+    ).requestIdleCallback;
+    if (typeof idleCb === 'function') {
+      idleCb(run, { timeout: 1200 });
+    } else {
+      window.setTimeout(run, 350);
     }
   }
 }
@@ -3246,9 +3452,10 @@ async function buildTranslatedSiteHtmlDirect(params: {
   titleId?: string;
   translatedHeading: string;
   translatedParas: string[];
+  theme?: 'Terang' | 'Gelap';
 }): Promise<string> {
-  const { article, mode, translatedHeading, translatedParas } = params;
-  const cacheKey = `${article.url}::${mode}::site`;
+  const { article, mode, translatedHeading, translatedParas, theme } = params;
+  const cacheKey = `${article.url}::${mode}::${theme || 'auto'}::site`;
   const cachedHtml = translatedSiteHtmlCache.get(cacheKey);
   if (cachedHtml) return cachedHtml;
 
@@ -3284,10 +3491,10 @@ async function buildTranslatedSiteHtmlDirect(params: {
   if (article.rawHtml) {
     const doc = new DOMParser().parseFromString(article.rawHtml, 'text/html');
 
-    // Remove all executable/embedded/redirect tags strictly (zero JS in translated site iframe)
+    // Remove all executable/embedded/redirect tags AND JS-only loading curtains that stay white without JS
     doc
       .querySelectorAll(
-        'script, noscript, iframe, frame, frameset, object, embed, applet, base, meta[http-equiv="refresh"], meta[http-equiv="Content-Security-Policy"]'
+        'script, noscript, iframe, frame, frameset, object, embed, applet, base, meta[http-equiv="refresh"], meta[http-equiv="Content-Security-Policy"], [id*="preloader"], [class*="preloader"], .page-loader, #loading-screen, .loading-overlay'
       )
       .forEach((el) => el.remove());
 
@@ -3385,7 +3592,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
     // Strip ruby readings (<rt>/<rp>) so translated text nodes don't mix furigana beside Latin prose
     doc.querySelectorAll('rt, rp').forEach((el) => el.remove());
 
-    // Force responsive viewport + mobile reflow CSS so translated desktop websites fit phones cleanly without clipping right edges
+    // Force responsive viewport + safe mobile reflow CSS without EVER hiding body/content wrappers (e.g. WordPress body.no-sidebar / .has-sidebar!)
     const head = doc.head || doc.createElement('head');
     if (!doc.head && doc.documentElement) {
       doc.documentElement.insertBefore(head, doc.body);
@@ -3398,7 +3605,8 @@ async function buildTranslatedSiteHtmlDirect(params: {
     const safeStyle = doc.createElement('style');
     safeStyle.textContent = [
       '*,*::before,*::after{box-sizing:border-box !important;}',
-      'html,body{max-width:100% !important;overflow-x:clip !important;}',
+      'html,body{display:block !important;visibility:visible !important;opacity:1 !important;max-width:100% !important;overflow-x:clip !important;overflow-y:auto !important;}',
+      '[data-aos],.aos-init,.wow,.fade-in,.invisible-until-loaded{opacity:1 !important;visibility:visible !important;transform:none !important;}',
       'img,video,svg{max-width:100% !important;height:auto !important;}',
       '@media (max-width:767px){',
       '  html,body{margin:0 !important;padding:0 !important;width:100% !important;}',
@@ -3408,12 +3616,12 @@ async function buildTranslatedSiteHtmlDirect(params: {
       '  header,nav,[class*="breadcrumb"],[class*="Header"],[class*="header"]{flex-wrap:wrap !important;white-space:normal !important;overflow-wrap:anywhere !important;height:auto !important;}',
       '  h1,h2,h3,.widget-episodeTitle{font-size:clamp(18px,5.4vw,24px) !important;line-height:1.35 !important;white-space:normal !important;margin-left:0 !important;margin-right:0 !important;padding-left:0 !important;padding-right:0 !important;text-align:left !important;}',
       '  #contentMain,#contentMain-inner,.widget-episode,.widget-episodeTitle,.widget-episodeBody,#novel_honbun,.p-novel__body,#honbun,article,main{width:100% !important;max-width:100% !important;margin-left:0 !important;margin-right:0 !important;padding-left:2px !important;padding-right:2px !important;left:auto !important;right:auto !important;transform:none !important;}',
-      '  aside,.sidebar,[class*="sidebar"],[class*="Sidebar"],#works-sidebar,.tranx-site-nav-bar{display:none !important;}',
+      '  #works-sidebar,.tranx-site-nav-bar,aside.sidebar:not(:has(article)):not(:has(main)){display:none !important;}',
       '}',
     ].join('\n');
     head.appendChild(safeStyle);
 
-    // Collect visible text nodes prioritizing main article content FIRST (up to 750 nodes) so long Wikipedia/news/novel pages never stop halfway
+    // Collect visible text nodes prioritizing main article content FIRST (smart cap 360 nodes for 4x faster rendering)
     const skipParentTags = new Set([
       'SCRIPT',
       'STYLE',
@@ -3426,10 +3634,29 @@ async function buildTranslatedSiteHtmlDirect(params: {
       'RT',
       'RP',
     ]);
-    const MAX_SITE_NODES = 750;
+    const MAX_SITE_NODES = 360;
     const textNodes: Text[] = [];
     const seenTextNodes = new Set<Text>();
-    const collectFromSubtree = (rootEl: Node | null) => {
+    let totalRawTextChars = 0;
+
+    const isSkippableChromeNode = (el: Element | null, allowFooter: boolean): boolean => {
+      let cur = el;
+      let depth = 0;
+      while (cur && depth < 6) {
+        if (
+          cur.hasAttribute('hidden') ||
+          cur.getAttribute('aria-hidden') === 'true' ||
+          (!allowFooter && cur.tagName === 'FOOTER')
+        ) {
+          return true;
+        }
+        cur = cur.parentElement;
+        depth += 1;
+      }
+      return false;
+    };
+
+    const collectFromSubtree = (rootEl: Node | null, allowFooter: boolean) => {
       if (!rootEl || textNodes.length >= MAX_SITE_NODES) return;
       const walker = doc.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT);
       let node = walker.nextNode();
@@ -3441,10 +3668,11 @@ async function buildTranslatedSiteHtmlDirect(params: {
           if (
             val.length >= 2 &&
             hasTranslatableLetters(val) &&
-            (!parent || !skipParentTags.has(parent.tagName))
+            (!parent || (!skipParentTags.has(parent.tagName) && !isSkippableChromeNode(parent, allowFooter)))
           ) {
             seenTextNodes.add(tn);
             textNodes.push(tn);
+            totalRawTextChars += val.length;
           }
         }
         node = walker.nextNode();
@@ -3452,18 +3680,50 @@ async function buildTranslatedSiteHtmlDirect(params: {
     };
 
     const mainRegion = doc.querySelector(MAIN_CONTENT_SELECTORS);
-    if (mainRegion) collectFromSubtree(mainRegion);
-    collectFromSubtree(doc.body || doc.documentElement);
+    if (mainRegion) collectFromSubtree(mainRegion, true);
+    collectFromSubtree(doc.body || doc.documentElement, !mainRegion);
 
-    // Guard against blank JS-only SPA shells (<div id="root"></div>): fall back to clean semantic translated view!
-    if (textNodes.length >= 2 || translatedParas.length < 2) {
-      if (textNodes.length > 0) {
+    // Guard against blank JS-only SPA shells (<div id="root"></div> with only 2 tiny nav links): require substantial body text mass!
+    const expectedProseChars = translatedParas.reduce((acc, p) => acc + p.length, 0);
+    const hasSubstantialDomBody =
+      textNodes.length >= 2 &&
+      (translatedParas.length < 2 ||
+        totalRawTextChars >= Math.min(140, Math.floor(expectedProseChars * 0.28)));
+
+    if (hasSubstantialDomBody) {
+      // Cross-view 0ms reuse: resolve any DOM text node already translated in Ebook mode without re-calling GTX/Gemini!
+      const normKey = (s: string) => s.replace(/\s+/g, ' ').trim();
+      const ebookReuseMap = new Map<string, string>();
+      if (article.titleSrc && translatedHeading) {
+        ebookReuseMap.set(normKey(article.titleSrc), translatedHeading);
+      }
+      article.srcParas.forEach((srcP, idx) => {
+        const dstP = translatedParas[idx];
+        if (srcP && dstP) {
+          ebookReuseMap.set(normKey(srcP.replace(/^#{1,6}\s+/, '')), dstP);
+        }
+      });
+
+      const pendingNodes: Text[] = [];
+      const pendingTexts: string[] = [];
+      for (const tn of textNodes) {
+        const cleaned = normKey(tn.nodeValue || '');
+        const hit = ebookReuseMap.get(cleaned);
+        if (hit) {
+          tn.nodeValue = hit;
+        } else {
+          pendingNodes.push(tn);
+          pendingTexts.push((tn.nodeValue || '').trim());
+        }
+      }
+
+      if (pendingTexts.length > 0) {
         const { outputs } = await translateParagraphsDirect({
-          paragraphs: textNodes.map((n) => (n.nodeValue || '').trim()),
+          paragraphs: pendingTexts,
           mode,
           titleId: params.titleId || article.titleId,
         });
-        textNodes.forEach((tn, idx) => {
+        pendingNodes.forEach((tn, idx) => {
           if (outputs[idx]) {
             tn.nodeValue = outputs[idx];
           }
@@ -3485,11 +3745,17 @@ async function buildTranslatedSiteHtmlDirect(params: {
     }
   }
 
-  // Clean semantic fallback when CORS HTML proxy was blocked: still rewrites chapter links into /web!
+  // Clean semantic fallback when CORS HTML proxy was blocked or page is a blank JS-only shell: matches active Light/Dark theme!
   const isJpBody = tgt === 'ja';
   const fontStack = isJpBody
     ? '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif'
     : 'Charter, Georgia, Cambria, serif';
+  const isDarkFallback = theme === 'Gelap';
+  const bgHex = isDarkFallback ? '#171B1A' : '#FAFBFA';
+  const textHex = isDarkFallback ? '#E7ECEA' : '#141917';
+  const borderHex = isDarkFallback ? '#2B3230' : '#DEE3E0';
+  const metaHex = isDarkFallback ? '#A5AEAA' : '#4F5855';
+  const linkHex = isDarkFallback ? '#5DC3AC' : '#17695B';
   const renderedParas = translatedParas
     .map((p) =>
       /^#{1,3}\s+/.test(p)
@@ -3511,13 +3777,13 @@ async function buildTranslatedSiteHtmlDirect(params: {
 
   const chaptersHtml =
     nav.chapters && nav.chapters.length > 0
-      ? `<section style="margin-top:32px;padding-top:20px;border-top:1px solid #DEE3E0;">
+      ? `<section style="margin-top:32px;padding-top:20px;border-top:1px solid ${borderHex};">
           <h2 style="font-family:Inter,-apple-system,sans-serif;font-size:16px;">${navLabels.toc} (${nav.chapters.length})</h2>
           <ul style="list-style:none;padding:0;margin:12px 0;display:flex;flex-direction:column;gap:8px;font-family:Inter,-apple-system,sans-serif;font-size:14px;">
             ${nav.chapters
               .map(
                 (ch) =>
-                  `<li><a href="${escapeHtml(buildTranxWebHref(ch.url, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#17695B;font-weight:${ch.current ? '700' : '500'};text-decoration:none;">${escapeHtml(translatedChapMap[ch.url] || ch.titleDst || ch.title)}</a></li>`
+                  `<li><a href="${escapeHtml(buildTranxWebHref(ch.url, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:${linkHex};font-weight:${ch.current ? '700' : '500'};text-decoration:none;">${escapeHtml(translatedChapMap[ch.url] || ch.titleDst || ch.title)}</a></li>`
               )
               .join('')}
           </ul>
@@ -3531,14 +3797,18 @@ async function buildTranslatedSiteHtmlDirect(params: {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${escapeHtml(translatedHeading)}</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { margin: 0; padding: 28px 20px 0; background: #FAFBFA; color: #141917; font-family: ${fontStack}; font-size: 18px; line-height: 1.78; }
-  @media (prefers-color-scheme: dark) { body { background: #171B1A; color: #E7ECEA; } header { border-bottom-color: #2B3230 !important; } .meta { color: #A5AEAA !important; } }
-  article { max-width: 700px; margin: 0 auto 40px; }
-  header { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #DEE3E0; }
-  h1 { font-size: 26px; line-height: 1.3; margin: 0 0 8px 0; }
+  :root { color-scheme: ${isDarkFallback ? 'dark' : 'light dark'}; }
+  body { margin: 0; padding: 24px 18px 24px; background: ${bgHex}; color: ${textHex}; font-family: ${fontStack}; font-size: 18px; line-height: 1.78; word-break: break-word; overflow-wrap: anywhere; }
+  ${
+    !theme
+      ? '@media (prefers-color-scheme: dark) { body { background: #171B1A; color: #E7ECEA; } header { border-bottom-color: #2B3230 !important; } .meta { color: #A5AEAA !important; } }'
+      : ''
+  }
+  article { max-width: 700px; margin: 0 auto 32px; }
+  header { margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid ${borderHex}; }
+  h1 { font-size: clamp(20px, 5.2vw, 26px); line-height: 1.32; margin: 0 0 8px 0; }
   p { margin: 0 0 16px 0; }
-  .meta { font-family: Inter, -apple-system, sans-serif; font-size: 13px; color: #4F5855; }
+  .meta { font-family: Inter, -apple-system, sans-serif; font-size: 13px; color: ${metaHex}; }
   @media (max-width: 767px) { .tranx-site-nav-bar { display: none !important; } }
 </style>
 </head>
@@ -3563,6 +3833,7 @@ export async function directFetchWebReaderBundle(params: {
   mode: ModePair;
   titleId?: string;
   view: 'reader' | 'site' | 'original';
+  theme?: 'Terang' | 'Gelap';
   onProgress?: (partialBundle: WebReaderBundle, doneCount: number, totalCount: number) => void;
 }): Promise<WebReaderBundle> {
   const article = await fetchWebArticleDirect(params.url, {
@@ -3651,6 +3922,17 @@ export async function directFetchWebReaderBundle(params: {
       titleId: tid,
       translatedHeading: titleDst,
       translatedParas,
+      theme: params.theme,
+    });
+  } else if (params.view === 'reader' && article.rawHtml) {
+    // Silently pre-warm Site HTML in background idle time so tapping Ebook -> Site switches instantaneously!
+    prewarmCurrentSiteHtmlDirect({
+      article,
+      mode: params.mode,
+      titleId: tid,
+      translatedHeading: titleDst,
+      translatedParas,
+      theme: params.theme,
     });
   }
 
@@ -3663,7 +3945,13 @@ export async function directFetchWebReaderBundle(params: {
     });
   }
   if (article.novelNav.nextUrl) {
-    prefetchNextChapterTranslatedDirect(article.novelNav.nextUrl, params.mode, tid);
+    prefetchNextChapterTranslatedDirect(
+      article.novelNav.nextUrl,
+      params.mode,
+      tid,
+      params.view === 'site' ? 'site' : 'reader',
+      params.theme
+    );
   }
 
   return {

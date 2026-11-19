@@ -130,6 +130,31 @@ export default defineConfig({
         globIgnores: ['**/pdf.worker*', '**/worker.min*'],
         navigateFallback: '/index.html',
         navigateFallbackDenylist: [/^\/v1\//],
+        runtimeCaching: [
+          {
+            urlPattern: /^https:\/\/cdn\.jsdelivr\.net\//i,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'tranx-ocr-cdn-v1',
+              expiration: {
+                maxEntries: 24,
+                maxAgeSeconds: 30 * 24 * 60 * 60,
+              },
+            },
+          },
+          {
+            urlPattern: ({ sameOrigin, url }) =>
+              sameOrigin && /\.(?:png|jpg|jpeg|webp|svg|woff2?)$/i.test(url.pathname),
+            handler: 'StaleWhileRevalidate',
+            options: {
+              cacheName: 'tranx-media-assets-v1',
+              expiration: {
+                maxEntries: 64,
+                maxAgeSeconds: 14 * 24 * 60 * 60,
+              },
+            },
+          },
+        ],
       },
     }),
   ],

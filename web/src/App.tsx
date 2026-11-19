@@ -58,6 +58,7 @@ import {
   resumeInterruptedTurn,
   streamChatTurn,
   translateImageRequest,
+  warmCloudBackendProbe,
 } from './lib/api';
 import {
   buildModePair,
@@ -447,6 +448,25 @@ export function App() {
     }
     setInstallGuideOpen(true);
   }, [pwaState.canNativePrompt]);
+
+  // Idle pre-warm: probe backend & preload lazy UI chunks so Web and Installed PWA feel instant on every tap
+  useEffect(() => {
+    const warm = () => {
+      warmCloudBackendProbe();
+      void import('./components/SubViews').catch(() => {});
+      void import('./components/Modals').catch(() => {});
+    };
+    const idleCb = (
+      window as unknown as {
+        requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      }
+    ).requestIdleCallback;
+    if (typeof idleCb === 'function') {
+      idleCb(warm, { timeout: 1500 });
+    } else {
+      window.setTimeout(warm, 400);
+    }
+  }, []);
 
   // Lock background page scroll while a mobile drawer or sheet is active
   useEffect(() => {
@@ -1356,6 +1376,7 @@ export function App() {
             initialView={qView}
             titleId={qTid}
             backPath={lastNonWebPathRef.current || '/'}
+            resolvedTheme={resolvedTheme}
             strings={strings}
             onNavigate={navigate}
           />

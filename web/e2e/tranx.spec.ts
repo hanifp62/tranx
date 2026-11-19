@@ -1069,6 +1069,53 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await page.screenshot({
       path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_web_site_390.png',
     });
+
+    // 5. Regression Test for Blank Site Mode on Mobile: WordPress body.has-sidebar / .no-sidebar + .preloader curtain + .fade-in opacity:0 MUST render visible translated content!
+    await page.route('https://r.jina.ai/**', async (route) => {
+      const reqUrl = route.request().url();
+      if (reqUrl.includes('wp-novel-mobile.example.com')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: 'Bab 1: Legenda Danau',
+              url: 'https://wp-novel-mobile.example.com/bab-1/',
+              finalUrl: 'https://wp-novel-mobile.example.com/bab-1/',
+              html: `<!doctype html><html><head><title>Bab 1: Legenda Danau</title><style>.preloader{position:fixed;inset:0;background:#fff;z-index:99999;} .fade-in{opacity:0;}</style></head><body class="post-template-default single right-sidebar has-sidebar no-sidebar"><div class="preloader">Loading...</div><div id="page" class="site-wrapper has-sidebar"><main id="main"><article class="entry-content fade-in"><h1>Cerita pendek: 杉澤達也の知られざる努力</h1><p>Pada suatu pagi berkabut di tepi danau tenang, seorang pengelana membuka buku catatannya.</p><p>Angin berembus pelan membawa aroma pinus dari lereng bukit utara.</p></article></main></div></body></html>`,
+              links: {
+                'Bab 2': 'https://wp-novel-mobile.example.com/bab-2/',
+              },
+            },
+          }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fwp-novel-mobile.example.com%2Fbab-1%2F&mode=auto-id&view=site'
+    );
+    const wpIframe = page.locator('iframe[title="Pembaca Halaman Terjemahan"]');
+    await expect(wpIframe).toBeVisible({ timeout: 15000 });
+    const wpFrame = page.frameLocator('iframe[title="Pembaca Halaman Terjemahan"]');
+    await expect(wpFrame.locator('.preloader')).toHaveCount(0);
+    await expect(wpFrame.getByText(/Upaya Tatsuya Sugisawa yang tidak diketahui/)).toBeVisible();
+    await expect(wpFrame.getByText(/seorang pengelana membuka buku catatannya/)).toBeVisible();
+    const wpBodyVisible = await wpFrame.locator('body').evaluate((el) => {
+      const st = getComputedStyle(el);
+      return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) > 0.5;
+    });
+    expect(wpBodyVisible).toBe(true);
+    const wpArticleOpacity = await wpFrame.locator('article.fade-in').evaluate((el) => {
+      return Number(getComputedStyle(el).opacity);
+    });
+    expect(wpArticleOpacity).toBeGreaterThanOrEqual(0.95);
+    await page.screenshot({
+      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_wp_site_390.png',
+    });
   });
 
   test('Claude-BugHunter Security & Complete Menu Readiness Gate: XSS/javascript: URI/SSRF defense + all remaining menus (Cari, Ganti nama, Hapus, Pintasan, Bantuan, Pelajari, Berkas export, Kamus merge, Cadangan JSON)', async ({

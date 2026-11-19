@@ -91,29 +91,79 @@ function isDirectE2ETest(): boolean {
   return window.sessionStorage.getItem('tranx_e2e_direct') === '1';
 }
 
-/* Fast cached probe so Spark deployments don't wait on unprovisioned Cloud Functions */
-let cloudReachableState: { ok: boolean; checkedAt: number } | null = null;
+/* Fast persistent probe so Spark deployments never stall 2.2s on unprovisioned Cloud Functions */
+const CLOUD_PROBE_LS_KEY = 'tranx_cloud_probe_v2';
+const CLOUD_PROBE_OK_TTL_MS = 2 * 60 * 1000;
+const CLOUD_PROBE_MISS_TTL_MS = 30 * 60 * 1000;
+let cloudReachableState: { ok: boolean; checkedAt: number; base: string } | null = null;
+let inFlightCloudProbe: Promise<boolean> | null = null;
+
+function readPersistedCloudProbe(base: string): { ok: boolean; checkedAt: number; base: string } | null {
+  if (typeof window === 'undefined' || isLocalE2EMode()) return null;
+  try {
+    const raw = window.localStorage.getItem(CLOUD_PROBE_LS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { ok?: boolean; checkedAt?: number; base?: string };
+    if (typeof parsed.ok !== 'boolean' || typeof parsed.checkedAt !== 'number') return null;
+    if ((parsed.base || '') !== base) return null;
+    const ttl = parsed.ok ? CLOUD_PROBE_OK_TTL_MS : CLOUD_PROBE_MISS_TTL_MS;
+    if (Date.now() - parsed.checkedAt >= ttl) return null;
+    return { ok: parsed.ok, checkedAt: parsed.checkedAt, base };
+  } catch {
+    return null;
+  }
+}
+
+function writePersistedCloudProbe(state: { ok: boolean; checkedAt: number; base: string }): void {
+  cloudReachableState = state;
+  if (typeof window === 'undefined' || isLocalE2EMode()) return;
+  try {
+    window.localStorage.setItem(CLOUD_PROBE_LS_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore storage quota issues
+  }
+}
 
 async function isCloudBackendAvailable(): Promise<boolean> {
   if (isLocalE2EMode() && !isDirectE2ETest()) return false;
   const base = getApiBaseUrl();
-  if (cloudReachableState && Date.now() - cloudReachableState.checkedAt < 120000) {
-    return cloudReachableState.ok;
+  if (cloudReachableState && cloudReachableState.base === base) {
+    const ttl = cloudReachableState.ok ? CLOUD_PROBE_OK_TTL_MS : CLOUD_PROBE_MISS_TTL_MS;
+    if (Date.now() - cloudReachableState.checkedAt < ttl) {
+      return cloudReachableState.ok;
+    }
+  } else if (!cloudReachableState) {
+    const persisted = readPersistedCloudProbe(base);
+    if (persisted) {
+      cloudReachableState = persisted;
+      return persisted.ok;
+    }
   }
-  const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), 2200);
-  try {
-    const r = await fetch(`${base}/v1/healthz`, { method: 'GET', signal: ctrl.signal });
-    const ctype = (r.headers.get('content-type') || '').toLowerCase();
-    const ok = r.status === 204 || (r.ok && !ctype.includes('text/html'));
-    cloudReachableState = { ok, checkedAt: Date.now() };
-    return ok;
-  } catch {
-    cloudReachableState = { ok: false, checkedAt: Date.now() };
-    return false;
-  } finally {
-    window.clearTimeout(timer);
-  }
+  if (inFlightCloudProbe) return inFlightCloudProbe;
+
+  inFlightCloudProbe = (async () => {
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 1100);
+    try {
+      const r = await fetch(`${base}/v1/healthz`, { method: 'GET', signal: ctrl.signal });
+      const ctype = (r.headers.get('content-type') || '').toLowerCase();
+      const ok = r.status === 204 || (r.ok && !ctype.includes('text/html'));
+      writePersistedCloudProbe({ ok, checkedAt: Date.now(), base });
+      return ok;
+    } catch {
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base });
+      return false;
+    } finally {
+      window.clearTimeout(timer);
+      inFlightCloudProbe = null;
+    }
+  })();
+  return inFlightCloudProbe;
+}
+
+export function warmCloudBackendProbe(): void {
+  if (isLocalE2EMode()) return;
+  void isCloudBackendAvailable();
 }
 
 async function parseErrorResponse(resp: Response): Promise<ApiClientError> {
@@ -318,10 +368,10 @@ export async function streamChatTurn(params: {
         await consumeNdjson(resp, params.onEvent);
         return;
       }
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     } catch (err) {
       if ((err as { name?: string })?.name === 'AbortError') throw err;
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
@@ -565,7 +615,7 @@ export async function translateImageRequest(params: {
       });
       if (resp.ok) return resp.json();
     } catch {
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
@@ -640,7 +690,7 @@ export async function processDocumentSubmission(params: {
     try {
       return await uploadDocumentToCloudStorage(params);
     } catch {
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
@@ -768,10 +818,10 @@ export async function previewLinkRequest(params: {
       if (resp.status === 403 || resp.status === 422) {
         throw await parseErrorResponse(resp);
       }
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     } catch (err) {
       if (err instanceof ApiClientError) throw err;
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
@@ -798,6 +848,7 @@ export async function fetchWebReaderBundle(params: {
   mode: ModePair;
   titleId?: string;
   view: 'reader' | 'site' | 'original';
+  theme?: 'Terang' | 'Gelap';
   onProgress?: (partialBundle: WebReaderBundle, doneCount: number, totalCount: number) => void;
 }): Promise<WebReaderBundle> {
   const cleanUrl = normalizeWebUrl(params.url);
@@ -897,6 +948,7 @@ export async function fetchWebReaderBundle(params: {
     mode: params.mode,
     titleId: params.titleId,
     view: params.view,
+    theme: params.theme,
     onProgress: params.onProgress,
   });
 }
@@ -936,7 +988,7 @@ export async function fetchTranslatedWebHtml(params: {
       });
       if (resp.ok) return resp.text();
     } catch {
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
@@ -974,7 +1026,7 @@ export async function transcribeShortClip(params: {
         return String(data.text || '');
       }
     } catch {
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
@@ -1107,7 +1159,7 @@ export async function fetchEngineMeta(user: AuthSessionUser): Promise<Record<str
       });
       if (resp.ok) return resp.json();
     } catch {
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
   const directKey = await getOwnerGeminiKey();
@@ -1177,7 +1229,7 @@ export async function runEngineCheck(
         return data.models || [];
       }
     } catch {
-      cloudReachableState = { ok: false, checkedAt: Date.now() };
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
@@ -1323,7 +1375,7 @@ export async function mergeTitleGlossaries(
     });
     if (resp.ok) return resp.json();
   } catch {
-    cloudReachableState = { ok: false, checkedAt: Date.now() };
+    writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
   }
   return mergeTitleGlossariesDirect(fromTitleId, toTitleId);
 }
@@ -1343,7 +1395,7 @@ export async function downloadFullBackup(
     });
     if (resp.ok) return resp.blob();
   } catch {
-    cloudReachableState = { ok: false, checkedAt: Date.now() };
+    writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
   }
   const directSnapshot = fallbackData || (await exportFullBackupDirect());
   return new Blob([JSON.stringify(directSnapshot, null, 2)], { type: 'application/json' });

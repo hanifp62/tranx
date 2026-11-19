@@ -414,6 +414,8 @@ export async function logoutSession(): Promise<void> {
     return;
   }
   const { auth } = ensureFirebase();
+  geminiKeyCache = null;
+  glossaryEntriesCache.clear();
   await signOut(auth);
 }
 
@@ -470,18 +472,32 @@ export async function updateAppSettings(patch: Partial<AppSettingsDoc>): Promise
   );
 }
 
+let geminiKeyCache: { value: string; checkedAt: number } | null = null;
+let geminiKeyInFlight: Promise<string> | null = null;
+const GEMINI_KEY_CACHE_TTL_MS = 5 * 60 * 1000;
+
 export async function getOwnerGeminiKey(): Promise<string> {
   if (isLocalE2EMode()) {
     return getE2EStore().geminiKey;
   }
-  try {
-    const { db } = ensureFirebase();
-    const snap = await getDoc(doc(db, 'settings', 'secrets'));
-    if (!snap.exists()) return '';
-    return String(snap.data().geminiApiKey || '').trim();
-  } catch {
-    return '';
+  if (geminiKeyCache && Date.now() - geminiKeyCache.checkedAt < GEMINI_KEY_CACHE_TTL_MS) {
+    return geminiKeyCache.value;
   }
+  if (geminiKeyInFlight) return geminiKeyInFlight;
+  geminiKeyInFlight = (async () => {
+    try {
+      const { db } = ensureFirebase();
+      const snap = await getDoc(doc(db, 'settings', 'secrets'));
+      const val = snap.exists() ? String(snap.data().geminiApiKey || '').trim() : '';
+      geminiKeyCache = { value: val, checkedAt: Date.now() };
+      return val;
+    } catch {
+      return geminiKeyCache?.value || '';
+    } finally {
+      geminiKeyInFlight = null;
+    }
+  })();
+  return geminiKeyInFlight;
 }
 
 export async function setOwnerGeminiKey(apiKey: string): Promise<void> {
@@ -492,6 +508,7 @@ export async function setOwnerGeminiKey(apiKey: string): Promise<void> {
   }
   const { db } = ensureFirebase();
   const ref = doc(db, 'settings', 'secrets');
+  geminiKeyCache = { value: clean.slice(0, 512), checkedAt: Date.now() };
   if (!clean) {
     await deleteDoc(ref).catch(() => {});
     return;
@@ -890,6 +907,10 @@ function mapGlossaryDoc(r: Record<string, unknown>): GlossaryEntry {
   };
 }
 
+const glossaryEntriesCache = new Map<string, { entries: GlossaryEntry[]; checkedAt: number }>();
+const glossaryEntriesInFlight = new Map<string, Promise<GlossaryEntry[]>>();
+const GLOSSARY_CACHE_TTL_MS = 3 * 60 * 1000;
+
 export async function loadGlossaryEntriesOnce(titleId?: string): Promise<GlossaryEntry[]> {
   if (isLocalE2EMode()) {
     const store = getE2EStore();
@@ -912,42 +933,74 @@ export async function loadGlossaryEntriesOnce(titleId?: string): Promise<Glossar
     }
     return Array.from(bySurface.values());
   }
-  try {
-    const { db } = ensureFirebase();
-    const bySurface = new Map<string, GlossaryEntry>();
-    if (titleId) {
-      const snap = await getDocs(collection(db, 'titles', titleId, 'glossary'));
-      for (const d of snap.docs) {
-        const entry = mapGlossaryDoc(d.data());
-        if (entry.surface) bySurface.set(entry.surface, entry);
-      }
-    }
-    if (titleId !== 't_default') {
-      const defSnap = await getDocs(collection(db, 'titles', 't_default', 'glossary'));
-      for (const d of defSnap.docs) {
-        const entry = mapGlossaryDoc(d.data());
-        if (entry.surface && entry.confirmed && !bySurface.has(entry.surface)) {
-          bySurface.set(entry.surface, entry);
+
+  const cacheKey = titleId || '__default__';
+  const hit = glossaryEntriesCache.get(cacheKey);
+  if (hit && Date.now() - hit.checkedAt < GLOSSARY_CACHE_TTL_MS) {
+    return hit.entries;
+  }
+  const inflight = glossaryEntriesInFlight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const task = (async (): Promise<GlossaryEntry[]> => {
+    try {
+      const { db } = ensureFirebase();
+      const bySurface = new Map<string, GlossaryEntry>();
+
+      // Parallelize title glossary + default glossary in a single round-trip
+      const [primarySnap, defSnap] = await Promise.all([
+        titleId ? getDocs(collection(db, 'titles', titleId, 'glossary')) : Promise.resolve(null),
+        titleId !== 't_default'
+          ? getDocs(collection(db, 'titles', 't_default', 'glossary'))
+          : Promise.resolve(null),
+      ]);
+
+      if (primarySnap) {
+        for (const d of primarySnap.docs) {
+          const entry = mapGlossaryDoc(d.data());
+          if (entry.surface) bySurface.set(entry.surface, entry);
         }
       }
-    }
-    if (bySurface.size === 0) {
-      const titlesSnap = await getDocs(collection(db, 'titles'));
-      for (const tDoc of titlesSnap.docs.slice(0, 5)) {
-        if (tDoc.id === titleId || tDoc.id === 't_default') continue;
-        const gSnap = await getDocs(collection(db, 'titles', tDoc.id, 'glossary'));
-        for (const d of gSnap.docs) {
+      if (defSnap) {
+        for (const d of defSnap.docs) {
           const entry = mapGlossaryDoc(d.data());
           if (entry.surface && entry.confirmed && !bySurface.has(entry.surface)) {
             bySurface.set(entry.surface, entry);
           }
         }
       }
+      if (bySurface.size === 0) {
+        const titlesSnap = await getDocs(collection(db, 'titles'));
+        const extraIds = titlesSnap.docs
+          .slice(0, 5)
+          .map((tDoc) => tDoc.id)
+          .filter((id) => id !== titleId && id !== 't_default');
+        if (extraIds.length > 0) {
+          const extraSnaps = await Promise.all(
+            extraIds.map((id) => getDocs(collection(db, 'titles', id, 'glossary')))
+          );
+          for (const gSnap of extraSnaps) {
+            for (const d of gSnap.docs) {
+              const entry = mapGlossaryDoc(d.data());
+              if (entry.surface && entry.confirmed && !bySurface.has(entry.surface)) {
+                bySurface.set(entry.surface, entry);
+              }
+            }
+          }
+        }
+      }
+      const list = Array.from(bySurface.values());
+      glossaryEntriesCache.set(cacheKey, { entries: list, checkedAt: Date.now() });
+      return list;
+    } catch {
+      return hit?.entries || [];
+    } finally {
+      glossaryEntriesInFlight.delete(cacheKey);
     }
-    return Array.from(bySurface.values());
-  } catch {
-    return [];
-  }
+  })();
+
+  glossaryEntriesInFlight.set(cacheKey, task);
+  return task;
 }
 
 export function subscribeGlossary(
@@ -1054,6 +1107,7 @@ export async function upsertUserGlossaryEntry(
     ...fullEntry,
     updatedAt: serverTimestamp(),
   });
+  glossaryEntriesCache.clear();
 }
 
 export async function removeGlossaryEntry(titleId: string, key: string): Promise<void> {
@@ -1065,6 +1119,7 @@ export async function removeGlossaryEntry(titleId: string, key: string): Promise
   }
   const { db } = ensureFirebase();
   await deleteDoc(doc(db, 'titles', titleId, 'glossary', key));
+  glossaryEntriesCache.clear();
 }
 
 export function subscribeJobs(onData: (jobs: JobDoc[]) => void): () => void {
@@ -1330,6 +1385,7 @@ export async function mergeTitleGlossariesDirect(
       updatedAt: serverTimestamp(),
     });
   }
+  glossaryEntriesCache.clear();
   return { merged, conflicts };
 }
 
