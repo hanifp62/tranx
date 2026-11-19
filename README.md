@@ -1,67 +1,131 @@
 # tranX
 
-Aplikasi web progresif (PWA) lintas perangkat milik pribadi untuk menerjemahkan teks, gambar, dokumen, dan halaman web dua arah antara bahasa **Indonesia**, **Inggris**, dan **Jepang** (dilengkapi mode **Deteksi bahasa** otomatis dan tombol **Tukar bahasa**) sambil menjaga konsistensi ejaan nama tokoh dari kalimat ke kalimat.
+Cross-device Progressive Web App (PWA) for translating text, images, documents, and web novel / ebook pages across **Indonesian**, **English**, and **Japanese** with automatic language detection, bidirectional character name consistency, and full offline-ready standalone installation.
 
-## Arsitektur Inti
+Live application: [tranx-hanif-id.web.app](https://tranx-hanif-id.web.app)
 
-- **Matriks 9 Pasangan Bahasa Dua Arah & Deteksi Otomatis**: Mendukung penuh `auto-id`, `auto-en`, `auto-ja`, `ja-id`, `ja-en`, `id-ja`, `id-en`, `en-id`, dan `en-ja`, lengkap dengan pelindung glosarium dua arah (`Chihaya` <-> `千早`), indikator bahasa terdeteksi waktu nyata, dan dikte suara adaptif (`id-ID`, `en-US`, `ja-JP`).
-- **Mesin Terjemahan (`translator.py` / `jptrans 1.1.0` + `multilingual.py`)**: Berkas tunggal `translator.py` di akar repositori dijaga utuh tanpa modifikasi dan diekstrak secara deterministik ke `functions/vendor/jptrans/` melalui `tools/vendor_jptrans.py` lengkap dengan verifikasi SHA-256 (`MANIFEST.sha256`).
-- **Arsitektur Dua Tingkat Tahan Gangguan (Cloud Functions Gen-2 + Browser Direct Engine)**:
-  - Saat Cloud Functions Gen-2 (`python312`, region `asia-southeast2` Jakarta) aktif, klien memakai rute `/v1/*` penuh (`/v1/chat`, `/v1/translate`, `/v1/image:translate`, `/v1/speech:transcribe`, `/v1/links:preview`, `/v1/web`, dan `on_document_uploaded`).
-  - Saat proyek Firebase berjalan pada paket gratis **Spark** (tanpa Cloud Functions), pemutus arus `/v1/healthz` secara otomatis mengalihkan eksekusi ke mesin langsung di peramban (`web/src/lib/directEngine.ts`) untuk teks, dokumen (`.txt`, `.md`, `.srt`, `.vtt`, `.ass`, `.html`, `.docx`, `.epub`), gambar, dan pembaca tautan web bebas galat CORS (`r.jina.ai` + `googleapis.com`), tetap tersinkron penuh ke Cloud Firestore.
-- **Antarmuka Ruang Baca (`web/`)**: Dibangun dengan React 19, Vite 6, TypeScript, dan Workbox PWA mengikuti sistem desain `tranX v3` (*Ruang Baca Tinta Sumi & Kaca Optik*, tema `Terang` dan `Gelap`, bahasa antarmuka `Indonesia` dan `English`).
-- **Keamanan Pemilik Tunggal**: Seluruh aturan `firestore.rules`, `storage.rules`, dan verifikasi token HTTP mengunci akses ke akun pemilik tunggal atau perangkat kedua yang dipasangkan lewat kode 6 angka sekali pakai (`/v1/auth:pairCode`), serta menyimpan kunci API Gemini secara terisolasi di dokumen Firestore `/settings/secrets` milik pemilik tanpa `localStorage`.
+## Highlights
 
-## Struktur Direktori
+- **9 Bidirectional Language Pairs + Auto-Detect**: Full support for `auto-id`, `auto-en`, `auto-ja`, `ja-id`, `ja-en`, `id-ja`, `id-en`, `en-id`, and `en-ja`, including real-time detected language indicator, instant swap, bidirectional character name glossary (`Chihaya` <-> `千早`), and adaptive voice dictation (`id-ID`, `en-US`, `ja-JP`).
+- **4 Isolated Workspaces**: Dedicated workflows for **Text**, **Image** (zero-key client WASM OCR + overlay canvas), **Document** (`.txt`, `.md`, `.srt`, `.vtt`, `.ass`, `.html`, `.docx`, `.epub`, `.pdf` with CJK font support), and **Link / Ebook Reader**.
+- **Universal Multi-Site Ebook & Translated Site Reader**:
+  - In-app **Ebook Reader** (1-column focused reading + 2-column side-by-side desktop bilingual view) and **Translated Site** view with automatic chapter detection and navigation across Kakuyomu (full `/episode_sidebar` expansion up to 1,500 chapters), Syosetu, RoyalRoad, Aozora Bunko (Shift_JIS), NovelBin, AO3, Wikipedia, and WordPress sites.
+  - Self-healing IndexedDB v2 cache (`tranx_perf_cache_v1`) that automatically purges poisoned HTTP 403/WAF blocks, retries with `X-No-Cache`, rescues CloudFront 403 pages, and runs untranslated mop-up retry waves.
+- **High-Throughput Resilient Architecture**:
+  - Dual-tier execution: Firebase Cloud Functions Gen-2 (`python312`, `asia-southeast2`) when running on Blaze, with automatic `/v1/healthz` circuit-breaker fallback to the browser Direct Engine (`web/src/lib/directEngine.ts`) on Firebase Spark.
+  - Hardware-adaptive token bucket, endpoint circuit breaker, bounded LRU caches, sliding-window rate limiting (`120/min` general, `15/min` heavy web/document routes), and 3x parallel translation pool for smooth 5-10 concurrent user operation.
+- **Installable Cross-Device PWA**:
+  - Zero-warning W3C Web App Manifest, Workbox service worker precaching, synchronous `<head>` `beforeinstallprompt` capture (`/pwa-capture.js`), 1-click native installation on Desktop and Android Chrome, automatic hide when installed, and responsive mobile/tablet/desktop layouts verified against WCAG 2.2 Level AA.
+
+## Architecture & Repository Layout
 
 ```text
-.
-├── translator.py              # Mesin sumber jptrans 1.1.0 (dikunci utuh)
+tranx/
+├── translator.py                  # Core jptrans 1.1.0 engine source (locked intact, MD5 verified)
 ├── tools/
-│   ├── vendor_jptrans.py      # Ekstraktor modul vendor + MANIFEST.sha256
-│   └── verify_integrity.py    # Pemeriksa MD5, 32 selftest, batas impor AST, dan kebersihan kode
+│   ├── vendor_jptrans.py          # Deterministic vendor extractor + MANIFEST.sha256 generator
+│   └── verify_integrity.py        # MD5, 32 selftests, AST boundary, secret & hygiene gate
 ├── functions/
-│   ├── main.py                # Titik masuk Cloud Functions Gen-2 (asia-southeast2)
-│   ├── tranx_core/            # Adaptor mesin, matriks 9 bahasa, glosarium 14 kolom, OCR, dokumen, web, suara
-│   ├── app/                   # Repositori Firestore/InMemory dan rute Flask /v1/*
-│   └── tests/                 # Uji unit dan kontrak rute HTTP (pytest)
+│   ├── main.py                    # Firebase Cloud Functions Gen-2 entrypoint (asia-southeast2)
+│   ├── requirements.txt           # Python 3.12 backend dependencies
+│   ├── app/                       # Flask /v1/* routes, rate limiter, Firestore/InMemory store
+│   ├── tranx_core/                # Translation adapter, 9-pair matrix, glossary, OCR, docs, web
+│   ├── vendor/                    # Deterministically extracted jptrans modules + MANIFEST.sha256
+│   └── tests/                     # Unit and HTTP route contract test suite (pytest)
 ├── web/
-│   ├── src/                   # Aplikasi PWA React 19 + directEngine Spark + sistem token tranX v3
-│   └── e2e/                   # Uji klik menyeluruh, matriks bahasa, dan audit WCAG 2.2 AA (Playwright + axe-core)
-├── firestore.rules            # Aturan keamanan Cloud Firestore pemilik tunggal (9 mode bahasa)
-├── firestore.indexes.json     # Indeks komposit riwayat disematkan & TTL
-├── storage.rules              # Aturan keamanan Cloud Storage (batas unggah 50 MB)
-└── firebase.json              # Konfigurasi Hosting (+ CSP Direct Engine), Firestore, Storage, Auth, dan Functions
+│   ├── index.html                 # App shell with synchronous /pwa-capture.js head hook
+│   ├── public/                    # PWA capture script, SVG favicon, 192/512 icons, screenshots
+│   ├── src/
+│   │   ├── App.tsx                # Main application shell (Text, Image, Document, Link workspaces)
+│   │   ├── components/            # SubViews (desktop/mobile reader), Modals, ImageOverlayCanvas
+│   │   ├── lib/                   # directEngine, api, resilience, perfCache (IDB v2), pwaInstall
+│   │   ├── i18n/                  # Indonesian & English UI string tables
+│   │   └── styles/                # tranX v3 design tokens & responsive Light/Dark stylesheets
+│   ├── e2e/                       # Playwright E2E, mobile/desktop QA & axe-core WCAG 2.2 AA suite
+│   ├── vite.config.ts             # Vite 6 + vite-plugin-pwa manifest & Workbox configuration
+│   └── .env.example               # Template environment variables (safe placeholder values)
+├── .github/
+│   ├── workflows/ci.yml           # Automated integrity, pytest, web build & secret hygiene CI
+│   └── PULL_REQUEST_TEMPLATE.md   # Pull request verification checklist
+├── firebase.json                  # Hosting headers (CSP/HSTS/COOP/CORP), rewrites, Firestore, Auth
+├── firestore.rules                # Single-owner Cloud Firestore security rules
+├── firestore.indexes.json         # Composite indexes for pinned history and TTL cleanup
+├── storage.rules                  # Single-owner Cloud Storage rules (50 MB upload cap)
+├── SECURITY.md                    # Security architecture and vulnerability reporting policy
+├── CHANGELOG.md                   # Structured release history
+└── LICENSE                        # MIT License
 ```
 
-## Perintah Pengembangan & Verifikasi
+## Quick Start
 
-1. **Verifikasi kemurnian mesin dan integritas kode:**
-   ```bash
-   npm run verify:integrity
-   ```
-2. **Jalankan uji unit dan rute backend (`functions/tests`):**
-   ```bash
-   npm run test:backend
-   ```
-3. **Bangun bundel produksi PWA (`web/dist`):**
-   ```bash
-   npm run build:web
-   ```
-4. **Jalankan uji E2E lintas ukuran layar dan aksesibilitas:**
-   ```bash
-   npm run test:e2e
-   ```
+### Prerequisites
 
-## Konfigurasi Kunci Model & Deploy
+- **Node.js 22+** and **npm**
+- **Python 3.12+**
+- Optional: **Firebase CLI** (`firebase-tools`) for hosting/rules deployment
 
-1. Masuk ke aplikasi menggunakan akun Google pemilik (`https://tranx-hanif-id.web.app`).
-2. Buka **Setelan -> Lanjutan**, masukkan kunci API Gemini Anda bila ingin memakai kualitas model penuh (disimpan aman ke Firestore `/settings/secrets`), lalu tekan **Cek mesin sekarang**. Tanpa kunci API sekalipun, terjemahan teks, dokumen, dan tautan web langsung berjalan instan.
-3. Untuk memperbarui aturan Firestore dan bundel Hosting pada paket Spark maupun Blaze:
-   ```bash
-   firebase deploy --only firestore,hosting --project tranx-hanif-id
-   ```
-4. Opsional (paket **Blaze**): aktifkan Cloud Functions Gen-2 dan Cloud Storage penuh dengan menjalankan:
-   ```bash
-   firebase deploy --only functions,storage --project tranx-hanif-id
-   ```
+### 1. Clone & Configure Environment
+
+```bash
+git clone https://github.com/hanifp62/tranx.git
+cd tranx
+cp web/.env.example web/.env.local
+```
+
+Populate `web/.env.local` with your Firebase Web SDK project values. Never commit `.env.local` or `.env.production` files.
+
+### 2. Install Dependencies
+
+```bash
+# Frontend PWA
+npm ci --prefix web
+
+# Backend Cloud Functions & tests (virtualenv recommended)
+python3.12 -m venv functions/venv
+functions/venv/bin/pip install -r functions/requirements.txt pytest
+```
+
+### 3. Run Locally
+
+```bash
+npm run dev:web
+```
+
+## Verification & Quality Gates
+
+Every change should pass all four checks before merging or deploying:
+
+```bash
+# 1. Verify translator.py MD5 purity, 52 vendor SHA-256 files, 32/32 selftests, AST & secret hygiene
+npm run verify:integrity
+
+# 2. Run backend unit and HTTP contract tests (29 tests)
+npm run test:backend
+
+# 3. Typecheck and build production PWA bundle
+npm run build:web
+
+# 4. Run Playwright cross-viewport E2E & WCAG 2.2 AA accessibility suite (7 suites)
+npm run test:e2e
+```
+
+## Deployment
+
+### Firebase Spark Plan (Hosting + Firestore Rules + Direct Engine)
+
+```bash
+npm run build:web
+firebase deploy --only firestore,hosting --project <your-firebase-project-id>
+```
+
+### Firebase Blaze Plan (Full Cloud Functions Gen-2 + Cloud Storage)
+
+```bash
+firebase deploy --only functions,storage --project <your-firebase-project-id>
+```
+
+Optional Gemini API keys can be configured inside the app under **Settings -> Advanced** and are stored exclusively in the owner's Firestore `/settings/secrets` document rather than browser `localStorage`.
+
+## License
+
+Released under the [MIT License](LICENSE).
