@@ -1003,16 +1003,27 @@ export function TranslatedWebViewer({
             <div className="result-card">
               <span className="status-badge error">{strings.cannotTranslateWeb}</span>
               <div>{errorMsg}</div>
-              {autoTranslatedSiteUrl && safeExternalUrl && (
-                <div>
+              {safeExternalUrl && (
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  {autoTranslatedSiteUrl && (
+                    <a
+                      href={autoTranslatedSiteUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="btn-primary pressable"
+                    >
+                      <IconGlobe size={16} />
+                      {strings.openAutoTranslatedTab}
+                    </a>
+                  )}
                   <a
-                    href={autoTranslatedSiteUrl}
+                    href={safeExternalUrl}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="btn-primary pressable"
+                    className="btn-secondary pressable"
                   >
-                    <IconGlobe size={16} />
-                    {strings.openAutoTranslatedTab}
+                    <IconLink size={16} />
+                    {strings.openOriginalSite}
                   </a>
                 </div>
               )}

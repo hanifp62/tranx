@@ -1187,14 +1187,104 @@ function sanitizeNovelNav(nav: NovelNavigation): NovelNavigation {
 }
 
 const NOVEL_HOST_RE =
-  /(kakuyomu\.jp|syosetu\.com|syosetu\.org|alphapolis\.co\.jp|aozora\.gr\.jp|royalroad\.com|scribblehub\.com|webnovel\.com|wuxiaworld\.|novelbin\.|novelfull\.|wattpad\.com|lightnovel|webnovel|novelupdates\.|wordpress\.com)/i;
+  /(kakuyomu\.jp|syosetu\.com|syosetu\.org|alphapolis\.co\.jp|aozora\.gr\.jp|royalroad\.com|scribblehub\.com|archiveofourown\.org|fanfiction\.net|webnovel\.com|wuxiaworld\.|novelbin\.|novelfull\.|novelfire\.|freewebnovel\.|lightnovelworld\.|lightnovelpub\.|readnovelfull\.|boxnovel\.|wattpad\.com|tapas\.io|lightnovel|webnovel|novelupdates\.|wordpress\.com)/i;
+
+const NON_NOVEL_HOST_RE =
+  /(wikipedia\.org|wikimedia\.org|wiktionary\.org|bbc\.com|bbc\.co\.uk|cnn\.com|nytimes\.com|reuters\.com|theguardian\.com|nhk\.or\.jp|yahoo\.co\.jp|github\.com|stackoverflow\.com|reddit\.com|x\.com|twitter\.com|youtube\.com|kompas\.com|detik\.com|tempo\.co|cnnindonesia\.com)/i;
+
+const NON_CHAPTER_PATH_RE =
+  /\/(login|signin|sign-in|signup|sign-up|register|logout|account|profile|settings|search|cart|checkout|pricing|contact|about|privacy|privacypolicy|terms|tos|dmca|cookie|cookiepolicy|help|helpcenter|support|notifications|report|impression|novelreview|novelreport|ihantsuhou|favnovelmain|rank|ranking|tags?|categor(?:y|ies)|author|authors|mypage|advertising|ads)\b/i;
 
 const NEXT_LINK_RE =
-  /(次のエピソード|次の話|次のページ|次へ|次話|次の章|next\s*(chapter|episode|ep|page|part|post)?|newer\s*post|bab\s*(berikutnya|selanjutnya)|halaman\s*(berikutnya|selanjutnya)|artikel\s*(berikutnya|selanjutnya)|cerita\s*(berikutnya|selanjutnya)|selanjutnya|berikutnya|lanjutan|^next$|^»$|^→$)/i;
+  /(次のエピソード|次の話|次のページ|次へ|次話|次の章|next\s*(chapter|episode|ep|page|part|post)|newer\s*post|bab\s*(berikutnya|selanjutnya)|halaman\s*(berikutnya|selanjutnya)|artikel\s*(berikutnya|selanjutnya)|cerita\s*(berikutnya|selanjutnya)|^next$|^selanjutnya$|^berikutnya$|^lanjutan$|^»$|^>>$|^→$)/i;
 const PREV_LINK_RE =
-  /(前のエピソード|前の話|前のページ|前へ|前話|前の章|prev(ious)?\s*(chapter|episode|ep|page|part|post)?|older\s*post|bab\s*sebelumnya|halaman\s*sebelumnya|artikel\s*sebelumnya|cerita\s*sebelumnya|sebelumnya|^prev$|^«$|^←$)/i;
+  /(前のエピソード|前の話|前のページ|前へ|前話|前の章|prev(ious)?\s*(chapter|episode|ep|page|part|post)|older\s*post|bab\s*sebelumnya|halaman\s*sebelumnya|artikel\s*sebelumnya|cerita\s*sebelumnya|^prev$|^previous$|^sebelumnya$|^«$|^<<$|^←$)/i;
 const TOC_LINK_RE =
   /(目次|エピソード一覧|作品トップ|table\s*of\s*contents|chapter\s*list|all\s*chapters|daftar\s*(isi|bab)|^toc$)/i;
+
+function decodeHtmlEntities(input: string): string {
+  if (!input || !input.includes('&')) return input;
+  const named: Record<string, string> = {
+    amp: '&',
+    lt: '<',
+    gt: '>',
+    quot: '"',
+    apos: "'",
+    nbsp: ' ',
+    ndash: '-',
+    mdash: '-',
+    hellip: '...',
+    lsquo: "'",
+    rsquo: "'",
+    ldquo: '"',
+    rdquo: '"',
+    laquo: '<<',
+    raquo: '>>',
+  };
+  return input
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const code = Number(dec);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : _;
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const code = parseInt(hex, 16);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : _;
+    })
+    .replace(/&([a-z]+);/gi, (m, name) => named[name.toLowerCase()] ?? m);
+}
+
+function getRegistrableDomain(hostname: string): string {
+  const clean = hostname.toLowerCase().replace(/^www\./, '');
+  const parts = clean.split('.').filter(Boolean);
+  if (parts.length <= 2) return clean;
+  const tail2 = parts.slice(-2).join('.');
+  if (/^(co|ne|or|gr|ac|go|ed|lg)\.(jp|uk|id|kr|au|nz)$/i.test(tail2) && parts.length >= 3) {
+    return parts.slice(-3).join('.');
+  }
+  return tail2;
+}
+
+function isSameRegistrableHost(urlA: string, urlB: string): boolean {
+  try {
+    return getRegistrableDomain(new URL(urlA).hostname) === getRegistrableDomain(new URL(urlB).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isCandidateChapterUrl(candidateUrl: string, baseUrl: string): boolean {
+  if (!isSameRegistrableHost(candidateUrl, baseUrl)) return false;
+  try {
+    const u = new URL(candidateUrl);
+    if (NON_CHAPTER_PATH_RE.test(u.pathname)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasMojibake(text: string): boolean {
+  if (!text) return false;
+  const matches = text.match(/\uFFFD/g);
+  return Boolean(matches && matches.length >= 3);
+}
+
+function isChallengeOrBlockedPayload(title: string, html: string, content: string): boolean {
+  const head = `${title}\n${content.slice(0, 800)}\n${html.slice(0, 2200)}`;
+  const hasChallengeMarker =
+    /just a moment\.\.\.|attention required!\s*\|\s*cloudflare|checking your browser|enable javascript and cookies to continue|cf-browser-verification|cf-challenge|challenge-platform|verify you are human|please complete the security check|ddos-guard|access denied\s*\|\s*cloudflare/i.test(
+      head
+    );
+  if (!hasChallengeMarker) return false;
+  // Only flag if body text is small (real articles discussing Cloudflare are long!)
+  if (content.length > 2500) return false;
+  if (html.length > 25000 && !/just a moment\.\.\.|attention required/i.test(title)) return false;
+  return true;
+}
 
 function deriveKnownTocInfo(rawUrl: string): { tocUrl: string; isTocPage: boolean } | null {
   try {
@@ -1209,10 +1299,17 @@ function deriveKnownTocInfo(rawUrl: string): { tocUrl: string; isTocPage: boolea
       if (wk) return { tocUrl: `https://kakuyomu.jp/works/${wk[1]}`, isTocPage: true };
     }
     if (host.includes('syosetu.com')) {
-      const ep = path.match(/^\/(n[a-z0-9]+)\/\d+\/?$/i);
-      if (ep) return { tocUrl: `${u.origin}/${ep[1]}/`, isTocPage: false };
+      const ep = path.match(/^\/(n[a-z0-9]+)\/(\d+)\/?$/i);
+      if (ep) {
+        const epNum = Number(ep[2]);
+        const tocPage = epNum > 100 ? Math.floor((epNum - 1) / 100) + 1 : 1;
+        return {
+          tocUrl: tocPage > 1 ? `${u.origin}/${ep[1]}/?p=${tocPage}` : `${u.origin}/${ep[1]}/`,
+          isTocPage: false,
+        };
+      }
       const wk = path.match(/^\/(n[a-z0-9]{4,})\/?$/i);
-      if (wk) return { tocUrl: `${u.origin}/${wk[1]}/`, isTocPage: true };
+      if (wk) return { tocUrl: `${u.origin}/${wk[1]}/${u.search}`, isTocPage: true };
     }
     if (host.includes('syosetu.org')) {
       const ep = path.match(/^\/novel\/(\d+)\/\d+\.html$/i);
@@ -1231,6 +1328,31 @@ function deriveKnownTocInfo(rawUrl: string): { tocUrl: string; isTocPage: boolea
       if (ep) return { tocUrl: `${u.origin}/fiction/${ep[1]}/${ep[2]}`, isTocPage: false };
       const wk = path.match(/^\/fiction\/(\d+)\/([^/]+)\/?$/i);
       if (wk) return { tocUrl: `${u.origin}/fiction/${wk[1]}/${wk[2]}`, isTocPage: true };
+    }
+    if (host.includes('scribblehub.com')) {
+      const ep = path.match(/^\/read\/(\d+)-([^/]+)\/chapter\/\d+/i);
+      if (ep) return { tocUrl: `${u.origin}/series/${ep[1]}/${ep[2]}/`, isTocPage: false };
+      const wk = path.match(/^\/series\/(\d+)\/([^/]+)\/?$/i);
+      if (wk) return { tocUrl: `${u.origin}/series/${wk[1]}/${wk[2]}/`, isTocPage: true };
+    }
+    if (host.includes('archiveofourown.org')) {
+      const ep = path.match(/^\/works\/(\d+)\/chapters\/\d+/i);
+      if (ep) return { tocUrl: `${u.origin}/works/${ep[1]}/navigate`, isTocPage: false };
+      const wk = path.match(/^\/works\/(\d+)\/navigate\/?$/i);
+      if (wk) return { tocUrl: `${u.origin}/works/${wk[1]}/navigate`, isTocPage: true };
+    }
+    // Universal NovelBin / NovelFull / NovelFire / FreeWebNovel / LightNovelWorld / WuxiaWorld / Madara WP patterns
+    const genericNovelEp = path.match(
+      /^(\/(?:b|book|novel|series|story|fiction|read|manga|light-novel)\/[^/]+)\/(?:chapter|ch|ep|episode|bab|part)[-_/][^/]+/i
+    );
+    if (genericNovelEp) {
+      return { tocUrl: `${u.origin}${genericNovelEp[1]}`, isTocPage: false };
+    }
+    const genericNovelToc = path.match(
+      /^(\/(?:b|book|novel|series|story|light-novel)\/[^/]+)\/?$/i
+    );
+    if (genericNovelToc && NOVEL_HOST_RE.test(host)) {
+      return { tocUrl: `${u.origin}${genericNovelToc[1]}`, isTocPage: true };
     }
   } catch {
     // ignore
@@ -1266,6 +1388,23 @@ export function deriveSeriesTitleId(rawUrl: string): string {
     const royal = path.match(/^\/fiction\/(\d+)/);
     if (host.includes('royalroad.com') && royal) {
       return `t_novel_rr_${royal[1]}`;
+    }
+    const scribble = path.match(/^\/(?:read|series)\/(\d+)/);
+    if (host.includes('scribblehub.com') && scribble) {
+      return `t_novel_sh_${scribble[1]}`;
+    }
+    const ao3 = path.match(/^\/works\/(\d+)/);
+    if (host.includes('archiveofourown.org') && ao3) {
+      return `t_novel_ao3_${ao3[1]}`;
+    }
+    const ffnet = path.match(/^\/s\/(\d+)/);
+    if (host.includes('fanfiction.net') && ffnet) {
+      return `t_novel_ff_${ffnet[1]}`;
+    }
+    const genericNovel = path.match(/^\/(?:b|book|novel|series|story|light-novel)\/([^/]+)/i);
+    if (genericNovel) {
+      const slug = genericNovel[1].replace(/[^a-z0-9]/gi, '_').slice(0, 28);
+      return `t_novel_${host.replace(/^www\./, '').split('.')[0].slice(0, 12)}_${slug}`;
     }
     return `t_web_${host.replace(/[^a-z0-9]/gi, '_').slice(0, 24)}`;
   } catch {
@@ -1406,6 +1545,104 @@ function extractKakuyomuFromNextData(
   }
 }
 
+function extractRoyalRoadFromScriptData(rawHtml: string, cleanUrl: string): NovelNavigation | null {
+  if (!/royalroad\.com/i.test(cleanUrl)) return null;
+  const match = rawHtml.match(/window\.chapters\s*=\s*(\[\s*\{[\s\S]*?\}\s*\])\s*;/);
+  if (!match) return null;
+  try {
+    const items = JSON.parse(match[1]) as Array<{ title?: string; url?: string }>;
+    if (!Array.isArray(items) || items.length === 0) return null;
+    const curKey = canonicalUrlKey(cleanUrl);
+    const chapters: NovelChapterLink[] = [];
+    for (const item of items) {
+      if (!item?.url) continue;
+      const abs = resolveSafeSiblingUrl(item.url, cleanUrl);
+      if (!abs) continue;
+      chapters.push({
+        title: decodeHtmlEntities((item.title || `Bab ${chapters.length + 1}`).trim()),
+        url: abs,
+        ...(canonicalUrlKey(abs) === curKey ? { current: true } : {}),
+      });
+    }
+    if (chapters.length === 0) return null;
+    const curIdx = chapters.findIndex((c) => c.current);
+    const tocInfo = deriveKnownTocInfo(cleanUrl);
+    const isTocPage = Boolean(tocInfo?.isTocPage) && curIdx < 0;
+    return sanitizeNovelNav({
+      isNovel: true,
+      isTocPage,
+      totalChapters: chapters.length,
+      ...(curIdx >= 0 ? { currentIndex: curIdx } : {}),
+      chapterLabel: curIdx >= 0 ? `${curIdx + 1} / ${chapters.length}` : `${chapters.length} bab`,
+      firstUrl: chapters[0]?.url || null,
+      prevUrl: curIdx > 0 ? chapters[curIdx - 1].url : null,
+      nextUrl: isTocPage
+        ? chapters[0]?.url || null
+        : curIdx >= 0 && curIdx + 1 < chapters.length
+          ? chapters[curIdx + 1].url
+          : null,
+      tocUrl: tocInfo?.tocUrl || null,
+      chapters: chapters.slice(0, 500),
+    });
+  } catch {
+    return null;
+  }
+}
+
+function extractChaptersFromSelectDropdowns(doc: Document, cleanUrl: string): NovelChapterLink[] {
+  const curKey = canonicalUrlKey(cleanUrl);
+  const base = new URL(cleanUrl);
+  const ao3Work = base.hostname.includes('archiveofourown.org')
+    ? base.pathname.match(/^\/works\/(\d+)/)
+    : null;
+  const ffStory = base.hostname.includes('fanfiction.net')
+    ? base.pathname.match(/^\/s\/(\d+)\/\d+(\/[^/]*)?/)
+    : null;
+
+  const selects = Array.from(doc.querySelectorAll('select'));
+  for (const sel of selects) {
+    const opts = Array.from(sel.querySelectorAll('option'));
+    if (opts.length < 2) continue;
+    const meta = `${sel.id || ''} ${sel.name || ''} ${sel.className || ''}`.toLowerCase();
+    const isExplicitChapSelect =
+      /chap|episode|selected_id|single-chapter|chapter-jump|select-chapter/.test(meta);
+
+    const parsed: NovelChapterLink[] = [];
+    const seen = new Set<string>();
+    for (const opt of opts) {
+      const val = (opt.getAttribute('value') || '').trim();
+      const label = decodeHtmlEntities((opt.textContent || '').replace(/\s+/g, ' ').trim());
+      if (!val || val === '#' || val === '-1') continue;
+
+      let abs: string | null = null;
+      if (/^(https?:\/\/|\/)/i.test(val)) {
+        abs = resolveSafeSiblingUrl(val, cleanUrl);
+      } else if (ao3Work && /^\d+$/.test(val) && isExplicitChapSelect) {
+        abs = `${base.origin}/works/${ao3Work[1]}/chapters/${val}`;
+      } else if (ffStory && /^\d+$/.test(val) && isExplicitChapSelect) {
+        abs = `${base.origin}/s/${ffStory[1]}/${val}${ffStory[2] || ''}`;
+      } else if (isExplicitChapSelect && /^[a-z0-9/_-]+$/i.test(val)) {
+        abs = resolveSafeSiblingUrl(val, cleanUrl);
+      }
+
+      if (!abs || !isCandidateChapterUrl(abs, cleanUrl)) continue;
+      const key = canonicalUrlKey(abs);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      parsed.push({
+        title: label || `Bab ${parsed.length + 1}`,
+        url: abs,
+        ...(opt.hasAttribute('selected') || key === curKey ? { current: true } : {}),
+      });
+    }
+
+    if (parsed.length >= 2 && (isExplicitChapSelect || parsed.length >= 4)) {
+      return parsed.slice(0, 500);
+    }
+  }
+  return [];
+}
+
 function deriveNumericChapterFallback(cleanUrl: string): Partial<NovelNavigation> {
   try {
     const u = new URL(cleanUrl);
@@ -1416,12 +1653,13 @@ function deriveNumericChapterFallback(cleanUrl: string): Partial<NovelNavigation
     if (host.includes('syosetu.com') && syosetu) {
       const ncode = syosetu[1];
       const num = Number(syosetu[2]);
+      const tocPage = num > 100 ? Math.floor((num - 1) / 100) + 1 : 1;
       return {
         isNovel: true,
         chapterLabel: `Bab ${num}`,
         prevUrl: num > 1 ? `${u.origin}/${ncode}/${num - 1}/` : null,
         nextUrl: `${u.origin}/${ncode}/${num + 1}/`,
-        tocUrl: `${u.origin}/${ncode}/`,
+        tocUrl: tocPage > 1 ? `${u.origin}/${ncode}/?p=${tocPage}` : `${u.origin}/${ncode}/`,
       };
     }
 
@@ -1436,6 +1674,19 @@ function deriveNumericChapterFallback(cleanUrl: string): Partial<NovelNavigation
         prevUrl: num > 1 ? `${u.origin}/novel/${id}/${num - 1}.html` : null,
         nextUrl: `${u.origin}/novel/${id}/${num + 1}.html`,
         tocUrl: `${u.origin}/novel/${id}/`,
+      };
+    }
+
+    // FanFiction.net: https://www.fanfiction.net/s/<id>/<ch>/<slug>
+    const ffnet = u.pathname.match(/^\/s\/(\d+)\/(\d+)(\/[^/]*)?$/i);
+    if (host.includes('fanfiction.net') && ffnet) {
+      const num = Number(ffnet[2]);
+      const tail = ffnet[3] || '';
+      return {
+        isNovel: true,
+        chapterLabel: `Bab ${num}`,
+        prevUrl: num > 1 ? `${u.origin}/s/${ffnet[1]}/${num - 1}${tail}` : null,
+        nextUrl: `${u.origin}/s/${ffnet[1]}/${num + 1}${tail}`,
       };
     }
 
@@ -1459,7 +1710,7 @@ function deriveNumericChapterFallback(cleanUrl: string): Partial<NovelNavigation
 }
 
 const TOC_CTA_SKIP_RE =
-  /^(最初から読む|1話から読む|一話から読む|最新話|最新話を読む|続きを読む|start\s*reading|read\s*first|latest\s*chapter|continue\s*reading|baca\s*dari\s*awal)$/i;
+  /^(最初から読む|1話から読む|一話から読む|1話目から読む|最新話|最新話を読む|続きを読む|start\s*reading|read\s*first|latest\s*chapter|continue\s*reading|baca\s*dari\s*awal)$/i;
 
 function buildChaptersFromSiblingLinks(
   links: Array<{ title: string; url: string }>,
@@ -1477,23 +1728,24 @@ function buildChaptersFromSiblingLinks(
   const curKey = canonicalUrlKey(cleanUrl);
   const basisUrl = tocContextUrl || cleanUrl;
   let siblingRe: RegExp | null = null;
+  let hostLower = '';
   try {
     const u = new URL(basisUrl);
-    const host = u.hostname.toLowerCase();
+    hostLower = u.hostname.toLowerCase();
     const kaku = u.pathname.match(/^\/works\/(\d+)/);
-    if (host.includes('kakuyomu.jp') && kaku) {
+    if (hostLower.includes('kakuyomu.jp') && kaku) {
       siblingRe = new RegExp(`^https?://[^/]*kakuyomu\\.jp/works/${kaku[1]}/episodes/\\d+`, 'i');
-    } else if (host.includes('syosetu.com')) {
+    } else if (hostLower.includes('syosetu.com')) {
       const syo = u.pathname.match(/^\/(n[a-z0-9]+)/i);
       if (syo) {
         siblingRe = new RegExp(`^https?://[^/]*syosetu\\.com/${syo[1]}/\\d+/?$`, 'i');
       }
-    } else if (host.includes('syosetu.org')) {
+    } else if (hostLower.includes('syosetu.org')) {
       const ham = u.pathname.match(/^\/novel\/(\d+)/);
       if (ham) {
         siblingRe = new RegExp(`^https?://[^/]*syosetu\\.org/novel/${ham[1]}/\\d+\\.html$`, 'i');
       }
-    } else if (host.includes('alphapolis.co.jp')) {
+    } else if (hostLower.includes('alphapolis.co.jp')) {
       const alpha = u.pathname.match(/^\/novel\/(\d+\/\d+)/);
       if (alpha) {
         siblingRe = new RegExp(
@@ -1501,45 +1753,100 @@ function buildChaptersFromSiblingLinks(
           'i'
         );
       }
-    } else if (host.includes('royalroad.com')) {
+    } else if (hostLower.includes('royalroad.com')) {
       const rr = u.pathname.match(/^\/fiction\/(\d+)/);
       if (rr) {
         siblingRe = new RegExp(`^https?://[^/]*royalroad\\.com/fiction/${rr[1]}/[^/]+/chapter/\\d+`, 'i');
       }
+    } else if (hostLower.includes('scribblehub.com')) {
+      const sh = u.pathname.match(/^\/(?:read|series)\/(\d+)/);
+      if (sh) {
+        siblingRe = new RegExp(`^https?://[^/]*scribblehub\\.com/read/${sh[1]}-[^/]+/chapter/\\d+`, 'i');
+      }
+    } else if (hostLower.includes('archiveofourown.org')) {
+      const ao3 = u.pathname.match(/^\/works\/(\d+)/);
+      if (ao3) {
+        siblingRe = new RegExp(`^https?://[^/]*archiveofourown\\.org/works/${ao3[1]}/chapters/\\d+`, 'i');
+      }
     } else {
-      const generic = u.pathname.match(
-        /^(.*\/(?:chapter|bab|episode|episodes|ep|ch|part|bagian|cards)[-_/?]?)\d+/i
-      );
-      if (generic) {
-        const escapedOrigin = `${u.origin}${generic[1]}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        siblingRe = new RegExp(`^${escapedOrigin}\\d+`, 'i');
+      const novelRoot = u.pathname.match(/^(\/(?:b|book|novel|series|story|light-novel)\/[^/]+)/i);
+      if (novelRoot) {
+        const escaped = `${u.origin}${novelRoot[1]}/`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        siblingRe = new RegExp(`^${escaped}[^/?#]+`, 'i');
+      } else {
+        const generic = u.pathname.match(
+          /^(.*\/(?:chapter|bab|episode|episodes|ep|ch|part|bagian|cards)[-_/?]?)\d+/i
+        );
+        if (generic) {
+          const escapedOrigin = `${u.origin}${generic[1]}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          siblingRe = new RegExp(`^${escapedOrigin}\\d+`, 'i');
+        }
       }
     }
   } catch {
     siblingRe = null;
   }
 
-  if (!siblingRe) {
-    return { chapters: [], prevUrl: null, nextUrl: null, firstUrl: null };
-  }
-
   const seen = new Set<string>();
   const chapters: NovelChapterLink[] = [];
-  for (const item of links) {
-    if (!siblingRe.test(item.url)) continue;
-    const rawLabel = item.title
-      .replace(/\s*\d{4}年\d{1,2}月\d{1,2}日.*$/, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    if (TOC_CTA_SKIP_RE.test(rawLabel)) continue;
-    const key = canonicalUrlKey(item.url);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    chapters.push({
-      title: rawLabel || `Bab ${chapters.length + 1}`,
-      url: item.url,
-      ...(key === curKey ? { current: true } : {}),
-    });
+  if (siblingRe) {
+    for (const item of links) {
+      if (!siblingRe.test(item.url)) continue;
+      if (!isCandidateChapterUrl(item.url, basisUrl)) continue;
+      const rawLabel = decodeHtmlEntities(
+        item.title
+          .replace(/\s*\d{4}年\d{1,2}月\d{1,2}日.*$/, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+      );
+      if (TOC_CTA_SKIP_RE.test(rawLabel)) continue;
+      const key = canonicalUrlKey(item.url);
+      if (key === canonicalUrlKey(basisUrl) && deriveKnownTocInfo(basisUrl)?.isTocPage) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      chapters.push({
+        title: rawLabel || `Bab ${chapters.length + 1}`,
+        url: item.url,
+        ...(key === curKey ? { current: true } : {}),
+      });
+    }
+  } else if (!NON_NOVEL_HOST_RE.test(hostLower)) {
+    // Universal fallback for indie novel sites & blogs: cluster >= 3 links sharing an explicit chapter/episode/bab slug prefix
+    const buckets = new Map<string, Array<{ title: string; url: string }>>();
+    for (const item of links) {
+      if (!isCandidateChapterUrl(item.url, basisUrl)) continue;
+      try {
+        const lu = new URL(item.url);
+        const m = lu.pathname.match(
+          /^(\/[^?#]*\/(?:chapter|chap|ch|episode|ep|bab|part|bagian|story|volume|vol)[-_/]?)([^/]+)\/?$/i
+        );
+        if (!m) continue;
+        const prefix = `${lu.origin}${m[1].toLowerCase()}`;
+        const list = buckets.get(prefix) || [];
+        list.push(item);
+        buckets.set(prefix, list);
+      } catch {
+        // ignore
+      }
+    }
+    let bestBucket: Array<{ title: string; url: string }> = [];
+    for (const list of buckets.values()) {
+      if (list.length > bestBucket.length) bestBucket = list;
+    }
+    if (bestBucket.length >= 3) {
+      for (const item of bestBucket) {
+        const key = canonicalUrlKey(item.url);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const rawLabel = decodeHtmlEntities(item.title.replace(/\s+/g, ' ').trim());
+        if (TOC_CTA_SKIP_RE.test(rawLabel)) continue;
+        chapters.push({
+          title: rawLabel || `Bab ${chapters.length + 1}`,
+          url: item.url,
+          ...(key === curKey ? { current: true } : {}),
+        });
+      }
+    }
   }
 
   const capped = chapters.slice(0, 500);
@@ -1573,6 +1880,14 @@ function extractNovelNavigationFromHtml(
   extraLinks: Array<{ title: string; url: string }> = []
 ): NovelNavigation {
   const curKey = canonicalUrlKey(cleanUrl);
+  const hostLower = (() => {
+    try {
+      return new URL(cleanUrl).hostname.toLowerCase();
+    } catch {
+      return '';
+    }
+  })();
+  const isNonNovelHost = NON_NOVEL_HOST_RE.test(hostLower);
   const tocInfo = deriveKnownTocInfo(cleanUrl);
   const kakuEpMatch = cleanUrl.match(/kakuyomu\.jp\/works\/(\d+)\/episodes\/(\d+)/i);
   const kakuWorkMatch = !kakuEpMatch ? cleanUrl.match(/kakuyomu\.jp\/works\/(\d+)\/?$/i) : null;
@@ -1580,7 +1895,7 @@ function extractNovelNavigationFromHtml(
     ? extractKakuyomuFromNextData(rawHtml, kakuEpMatch[1], kakuEpMatch[2])
     : kakuWorkMatch
       ? extractKakuyomuFromNextData(rawHtml, kakuWorkMatch[1], '')
-      : null;
+      : extractRoyalRoadFromScriptData(rawHtml, cleanUrl);
 
   let prevUrl: string | null = nextDataNav?.prevUrl || null;
   let nextUrl: string | null = nextDataNav?.nextUrl || null;
@@ -1589,53 +1904,88 @@ function extractNovelNavigationFromHtml(
   // W3C standard <link rel="prev|next">
   if (!prevUrl) {
     const linkPrev = doc.querySelector('link[rel="prev"], a[rel="prev"]')?.getAttribute('href');
-    if (linkPrev) prevUrl = resolveSafeSiblingUrl(linkPrev, cleanUrl);
+    const resolved = linkPrev ? resolveSafeSiblingUrl(linkPrev, cleanUrl) : null;
+    if (resolved && isCandidateChapterUrl(resolved, cleanUrl)) prevUrl = resolved;
   }
   if (!nextUrl) {
     const linkNext = doc.querySelector('link[rel="next"], a[rel="next"]')?.getAttribute('href');
-    if (linkNext) nextUrl = resolveSafeSiblingUrl(linkNext, cleanUrl);
+    const resolved = linkNext ? resolveSafeSiblingUrl(linkNext, cleanUrl) : null;
+    if (resolved && isCandidateChapterUrl(resolved, cleanUrl)) nextUrl = resolved;
   }
 
   // Site-specific & WordPress/novel pagination selectors
-  if (!prevUrl) {
-    const el = doc.querySelector(
-      '#contentMain-readPreviousEpisode, a[data-test="previous-episode-link"], .c-pager__item--before, a.prev-episode, .nav-previous a, .post-navigation .nav-previous a, a.prev.page-numbers'
-    );
-    if (el?.getAttribute('href')) prevUrl = resolveSafeSiblingUrl(el.getAttribute('href')!, cleanUrl);
+  if (!isNonNovelHost) {
+    if (!prevUrl) {
+      const el = doc.querySelector(
+        '#contentMain-readPreviousEpisode, a[data-test="previous-episode-link"], .c-pager__item--before, .p-novel__pager-prev, #prev_chap, a.prev_page, a.prev-episode, .chapter-nav .prev a, .nav-previous a, .post-navigation .nav-previous a, a.prev.page-numbers'
+      );
+      const resolved = el?.getAttribute('href')
+        ? resolveSafeSiblingUrl(el.getAttribute('href')!, cleanUrl)
+        : null;
+      if (resolved && isCandidateChapterUrl(resolved, cleanUrl)) prevUrl = resolved;
+    }
+    if (!nextUrl) {
+      const el = doc.querySelector(
+        '#contentMain-readNextEpisode, a[data-test="next-episode-link"], .c-pager__item--next, .p-novel__pager-next, #next_chap, a.next_page, a.next-episode, .chapter-nav .next a, .nav-next a, .post-navigation .nav-next a, a.next.page-numbers'
+      );
+      const resolved = el?.getAttribute('href')
+        ? resolveSafeSiblingUrl(el.getAttribute('href')!, cleanUrl)
+        : null;
+      if (resolved && isCandidateChapterUrl(resolved, cleanUrl)) nextUrl = resolved;
+    }
   }
-  if (!nextUrl) {
-    const el = doc.querySelector(
-      '#contentMain-readNextEpisode, a[data-test="next-episode-link"], .c-pager__item--next, a.next-episode, .nav-next a, .post-navigation .nav-next a, a.next.page-numbers'
-    );
-    if (el?.getAttribute('href')) nextUrl = resolveSafeSiblingUrl(el.getAttribute('href')!, cleanUrl);
+
+  // Explicit TOC containers across novel platforms (Syosetu .p-eplist, Madara .wp-manga-chapter, NovelBin .list-chapter, etc.)
+  const tocContainerLinks: Array<{ title: string; url: string }> = [];
+  if (!isNonNovelHost) {
+    for (const a of Array.from(
+      doc.querySelectorAll(
+        '.p-eplist a[href], .index_box a[href], .list-chapter a[href], .chapter-list a[href], #chapterlist a[href], .wp-manga-chapter a[href], .episode-list a[href], table#chapters a[href], ol.chapters a[href]'
+      )
+    )) {
+      const abs = resolveSafeSiblingUrl(a.getAttribute('href') || '', cleanUrl);
+      if (!abs || !isCandidateChapterUrl(abs, cleanUrl)) continue;
+      const label = decodeHtmlEntities((a.textContent || '').replace(/\s+/g, ' ').trim());
+      if (label && !TOC_CTA_SKIP_RE.test(label)) {
+        tocContainerLinks.push({ title: label, url: abs });
+      }
+    }
   }
 
   const allAnchors: Array<{ title: string; url: string }> = [];
   for (const a of Array.from(doc.querySelectorAll('a[href]'))) {
     const abs = resolveSafeSiblingUrl(a.getAttribute('href') || '', cleanUrl);
     if (!abs) continue;
-    const label = (
-      a.textContent ||
-      a.getAttribute('aria-label') ||
-      a.getAttribute('title') ||
-      ''
-    )
-      .replace(/\s+/g, ' ')
-      .trim();
+    const label = decodeHtmlEntities(
+      (
+        a.textContent ||
+        a.getAttribute('aria-label') ||
+        a.getAttribute('title') ||
+        ''
+      )
+        .replace(/\s+/g, ' ')
+        .trim()
+    );
     const clsAndId = `${a.className || ''} ${a.id || ''}`;
     allAnchors.push({ title: label, url: abs });
 
-    if (!nextUrl && canonicalUrlKey(abs) !== curKey) {
+    if (isNonNovelHost || canonicalUrlKey(abs) === curKey || !isCandidateChapterUrl(abs, cleanUrl)) {
+      continue;
+    }
+    if (!nextUrl && label.length <= 48) {
       if (NEXT_LINK_RE.test(label) || /next[-_]?(ep|chap|page|post)|readNext/i.test(clsAndId)) {
         nextUrl = abs;
       }
     }
-    if (!prevUrl && canonicalUrlKey(abs) !== curKey) {
-      if (PREV_LINK_RE.test(label) || /prev(ious)?[-_]?(ep|chap|page|post)|readPrevious/i.test(clsAndId)) {
+    if (!prevUrl && label.length <= 48) {
+      if (
+        PREV_LINK_RE.test(label) ||
+        /prev(ious)?[-_]?(ep|chap|page|post)|readPrevious/i.test(clsAndId)
+      ) {
         prevUrl = abs;
       }
     }
-    if (!tocUrl && TOC_LINK_RE.test(label)) {
+    if (!tocUrl && label.length <= 48 && TOC_LINK_RE.test(label)) {
       tocUrl = abs;
     }
   }
@@ -1644,48 +1994,96 @@ function extractNovelNavigationFromHtml(
   for (const item of extraLinks) {
     const abs = resolveSafeSiblingUrl(item.url, cleanUrl);
     if (!abs) continue;
-    const label = item.title.replace(/\s+/g, ' ').trim();
+    const label = decodeHtmlEntities(item.title.replace(/\s+/g, ' ').trim());
     allAnchors.push({ title: label, url: abs });
-    if (canonicalUrlKey(abs) === curKey) continue;
-    if (!nextUrl && NEXT_LINK_RE.test(label)) nextUrl = abs;
-    if (!prevUrl && PREV_LINK_RE.test(label)) prevUrl = abs;
-    if (!tocUrl && TOC_LINK_RE.test(label)) tocUrl = abs;
+    if (isNonNovelHost || canonicalUrlKey(abs) === curKey || !isCandidateChapterUrl(abs, cleanUrl)) {
+      continue;
+    }
+    if (!nextUrl && label.length <= 48 && NEXT_LINK_RE.test(label)) nextUrl = abs;
+    if (!prevUrl && label.length <= 48 && PREV_LINK_RE.test(label)) prevUrl = abs;
+    if (!tocUrl && label.length <= 48 && TOC_LINK_RE.test(label)) tocUrl = abs;
   }
 
+  const selectChapters = isNonNovelHost ? [] : extractChaptersFromSelectDropdowns(doc, cleanUrl);
   const siblingNav = buildChaptersFromSiblingLinks(allAnchors, cleanUrl);
-  const chapters =
-    nextDataNav?.chapters && nextDataNav.chapters.length > 0
-      ? nextDataNav.chapters
-      : siblingNav.chapters;
+
+  let chapters: NovelChapterLink[] = [];
+  if (nextDataNav?.chapters && nextDataNav.chapters.length > 0) {
+    chapters = nextDataNav.chapters;
+  } else if (selectChapters.length >= Math.max(2, siblingNav.chapters.length)) {
+    chapters = selectChapters;
+  } else if (siblingNav.chapters.length >= 2) {
+    chapters = siblingNav.chapters;
+  } else if (tocContainerLinks.length >= 2) {
+    const seenToc = new Set<string>();
+    chapters = tocContainerLinks
+      .filter((it) => {
+        const k = canonicalUrlKey(it.url);
+        if (seenToc.has(k)) return false;
+        seenToc.add(k);
+        return true;
+      })
+      .slice(0, 500)
+      .map((it) => ({
+        title: it.title,
+        url: it.url,
+        ...(canonicalUrlKey(it.url) === curKey ? { current: true } : {}),
+      }));
+  }
+
+  const derivedCurIdx = chapters.findIndex((c) => c.current);
+  if (!prevUrl && derivedCurIdx > 0) prevUrl = chapters[derivedCurIdx - 1].url;
+  if (!nextUrl && derivedCurIdx >= 0 && derivedCurIdx + 1 < chapters.length) {
+    nextUrl = chapters[derivedCurIdx + 1].url;
+  }
   if (!prevUrl && siblingNav.prevUrl) prevUrl = siblingNav.prevUrl;
   if (!nextUrl && siblingNav.nextUrl) nextUrl = siblingNav.nextUrl;
 
-  const fallback = deriveNumericChapterFallback(cleanUrl);
+  const fallback = isNonNovelHost ? {} : deriveNumericChapterFallback(cleanUrl);
   if (!prevUrl && fallback.prevUrl) prevUrl = fallback.prevUrl;
   if (!nextUrl && fallback.nextUrl) nextUrl = fallback.nextUrl;
   if (!tocUrl && fallback.tocUrl) tocUrl = fallback.tocUrl;
 
   const isNovel =
-    Boolean(nextDataNav?.isNovel) ||
-    Boolean(tocInfo) ||
-    isKnownNovelUrl(cleanUrl) ||
-    Boolean(fallback.isNovel) ||
-    chapters.length >= 2 ||
-    Boolean(prevUrl || nextUrl);
+    !isNonNovelHost &&
+    (Boolean(nextDataNav?.isNovel) ||
+      Boolean(tocInfo) ||
+      isKnownNovelUrl(cleanUrl) ||
+      Boolean(fallback.isNovel) ||
+      chapters.length >= 2 ||
+      Boolean(prevUrl || nextUrl));
 
   const curIdx =
     nextDataNav?.currentIndex !== undefined
       ? nextDataNav.currentIndex
-      : siblingNav.currentIndex;
+      : derivedCurIdx >= 0
+        ? derivedCurIdx
+        : siblingNav.currentIndex;
+  const isTocPage =
+    isNovel &&
+    Boolean(
+      nextDataNav?.isTocPage ||
+        (tocInfo?.isTocPage && chapters.length >= 1) ||
+        (chapters.length >= 5 && curIdx === undefined && !prevUrl)
+    );
+  if (isTocPage && !nextUrl && chapters[0]?.url) {
+    nextUrl = chapters[0].url;
+  }
 
   return sanitizeNovelNav({
     isNovel,
-    isTocPage: Boolean(nextDataNav?.isTocPage || (tocInfo?.isTocPage && chapters.length >= 1)),
+    isTocPage,
     seriesTitle: nextDataNav?.seriesTitle,
-    chapterLabel: nextDataNav?.chapterLabel || siblingNav.chapterLabel || fallback.chapterLabel,
-    totalChapters: nextDataNav?.totalChapters || siblingNav.totalChapters,
+    chapterLabel:
+      nextDataNav?.chapterLabel ||
+      (curIdx !== undefined && chapters.length > 0
+        ? `${curIdx + 1} / ${chapters.length}`
+        : chapters.length > 0
+          ? `${chapters.length} bab`
+          : siblingNav.chapterLabel || fallback.chapterLabel),
+    totalChapters: nextDataNav?.totalChapters || chapters.length || siblingNav.totalChapters,
     currentIndex: curIdx,
-    firstUrl: nextDataNav?.firstUrl || siblingNav.firstUrl || chapters[0]?.url || null,
+    firstUrl: nextDataNav?.firstUrl || chapters[0]?.url || siblingNav.firstUrl || null,
     prevUrl,
     nextUrl,
     tocUrl,
@@ -1699,6 +2097,14 @@ function extractNovelNavigationFromMarkdown(
   extraLinks: Array<{ title: string; url: string }> = []
 ): NovelNavigation {
   const curKey = canonicalUrlKey(cleanUrl);
+  const hostLower = (() => {
+    try {
+      return new URL(cleanUrl).hostname.toLowerCase();
+    } catch {
+      return '';
+    }
+  })();
+  const isNonNovelHost = NON_NOVEL_HOST_RE.test(hostLower);
   const tocInfo = deriveKnownTocInfo(cleanUrl);
   const mdLinks: Array<{ title: string; url: string }> = [];
   const linkRe = /\[([^\]]{1,180})\]\((https?:\/\/[^)\s]+)\)/g;
@@ -1706,40 +2112,47 @@ function extractNovelNavigationFromMarkdown(
   while ((m = linkRe.exec(md)) !== null) {
     const safe = resolveSafeSiblingUrl(m[2], cleanUrl);
     if (!safe) continue;
-    mdLinks.push({ title: m[1].replace(/\s+/g, ' ').trim(), url: safe });
+    mdLinks.push({ title: decodeHtmlEntities(m[1].replace(/\s+/g, ' ').trim()), url: safe });
   }
   for (const item of extraLinks) {
     const safe = resolveSafeSiblingUrl(item.url, cleanUrl);
     if (!safe) continue;
-    mdLinks.push({ title: item.title.replace(/\s+/g, ' ').trim(), url: safe });
+    mdLinks.push({ title: decodeHtmlEntities(item.title.replace(/\s+/g, ' ').trim()), url: safe });
   }
 
   let prevUrl: string | null = null;
   let nextUrl: string | null = null;
   let tocUrl: string | null = tocInfo?.tocUrl || null;
 
-  for (const item of mdLinks) {
-    if (canonicalUrlKey(item.url) === curKey) continue;
-    if (!nextUrl && NEXT_LINK_RE.test(item.title)) nextUrl = item.url;
-    if (!prevUrl && PREV_LINK_RE.test(item.title)) prevUrl = item.url;
-    if (!tocUrl && TOC_LINK_RE.test(item.title)) tocUrl = item.url;
+  if (!isNonNovelHost) {
+    for (const item of mdLinks) {
+      if (canonicalUrlKey(item.url) === curKey || !isCandidateChapterUrl(item.url, cleanUrl)) {
+        continue;
+      }
+      if (!nextUrl && item.title.length <= 48 && NEXT_LINK_RE.test(item.title)) nextUrl = item.url;
+      if (!prevUrl && item.title.length <= 48 && PREV_LINK_RE.test(item.title)) prevUrl = item.url;
+      if (!tocUrl && item.title.length <= 48 && TOC_LINK_RE.test(item.title)) tocUrl = item.url;
+    }
   }
 
-  const siblingNav = buildChaptersFromSiblingLinks(mdLinks, cleanUrl);
+  const siblingNav = isNonNovelHost
+    ? { chapters: [], prevUrl: null, nextUrl: null, firstUrl: null }
+    : buildChaptersFromSiblingLinks(mdLinks, cleanUrl);
   if (!prevUrl && siblingNav.prevUrl) prevUrl = siblingNav.prevUrl;
   if (!nextUrl && siblingNav.nextUrl) nextUrl = siblingNav.nextUrl;
 
-  const fallback = deriveNumericChapterFallback(cleanUrl);
+  const fallback = isNonNovelHost ? {} : deriveNumericChapterFallback(cleanUrl);
   if (!prevUrl && fallback.prevUrl) prevUrl = fallback.prevUrl;
   if (!nextUrl && fallback.nextUrl) nextUrl = fallback.nextUrl;
   if (!tocUrl && fallback.tocUrl) tocUrl = fallback.tocUrl;
 
   const isNovel =
-    Boolean(tocInfo) ||
-    isKnownNovelUrl(cleanUrl) ||
-    Boolean(fallback.isNovel) ||
-    siblingNav.chapters.length >= 2 ||
-    Boolean(prevUrl || nextUrl);
+    !isNonNovelHost &&
+    (Boolean(tocInfo) ||
+      isKnownNovelUrl(cleanUrl) ||
+      Boolean(fallback.isNovel) ||
+      siblingNav.chapters.length >= 2 ||
+      Boolean(prevUrl || nextUrl));
 
   return sanitizeNovelNav({
     isNovel,
@@ -1824,70 +2237,86 @@ function isSuspiciousTrackerPayload(
   return false;
 }
 
+async function fetchViaJinaInternal(
+  cleanUrl: string,
+  options: { format: 'html' | 'markdown'; noCache?: boolean; signal?: AbortSignal }
+): Promise<JinaFetchResult | null> {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'X-With-Links-Summary': 'true',
+  };
+  if (options.format === 'html') {
+    headers['X-Return-Format'] = 'html';
+  }
+  if (options.noCache) {
+    headers['X-No-Cache'] = 'true';
+  }
+  const resp = await fetch(`https://r.jina.ai/${cleanUrl}`, {
+    method: 'GET',
+    headers,
+    signal: options.signal,
+  });
+  if (!resp.ok) return null;
+  const ctype = resp.headers.get('content-type') || '';
+  if (ctype.includes('application/json')) {
+    const json = await resp.json();
+    const d = json?.data || {};
+    const title = decodeHtmlEntities(String(d.title || '').trim());
+    const finalUrl =
+      typeof d.finalUrl === 'string' && d.finalUrl.startsWith('http')
+        ? d.finalUrl
+        : typeof d.url === 'string' && d.url.startsWith('http')
+          ? d.url
+          : cleanUrl;
+    const html = typeof d.html === 'string' ? d.html : '';
+    // Never substitute 1-line meta description as full article body when real HTML is returned
+    const content =
+      typeof d.content === 'string' && d.content.trim()
+        ? d.content.trim()
+        : !html && typeof d.description === 'string'
+          ? d.description.trim()
+          : '';
+    const linksObj =
+      d.links && typeof d.links === 'object' ? (d.links as Record<string, unknown>) : {};
+    const links: Array<{ title: string; url: string }> = [];
+    for (const [k, v] of Object.entries(linksObj)) {
+      if (typeof v === 'string' && v.startsWith('http')) {
+        links.push({ title: decodeHtmlEntities(k), url: v });
+      }
+    }
+    return { title, finalUrl, html, content, links };
+  }
+  const rawTxt = await resp.text();
+  const titleMatch = rawTxt.match(/^Title:\s*(.+)$/m);
+  return {
+    title: decodeHtmlEntities(titleMatch ? titleMatch[1].trim() : ''),
+    finalUrl: cleanUrl,
+    html: options.format === 'html' && /<(html|body|article|div|p)\b/i.test(rawTxt) ? rawTxt : '',
+    content: rawTxt,
+    links: [],
+  };
+}
+
 async function fetchViaJinaHtmlAndLinks(
   cleanUrl: string,
   options?: { noCache?: boolean; signal?: AbortSignal }
 ): Promise<JinaFetchResult | null> {
-  const attempt = async (noCache: boolean): Promise<JinaFetchResult | null> => {
-    const headers: Record<string, string> = {
-      Accept: 'application/json',
-      'X-Return-Format': 'html',
-      'X-With-Links-Summary': 'true',
-    };
-    if (noCache) headers['X-No-Cache'] = 'true';
-    const resp = await fetch(`https://r.jina.ai/${cleanUrl}`, {
-      method: 'GET',
-      headers,
+  try {
+    const first = await fetchViaJinaInternal(cleanUrl, {
+      format: 'html',
+      noCache: Boolean(options?.noCache),
       signal: options?.signal,
     });
-    if (!resp.ok) return null;
-    const ctype = resp.headers.get('content-type') || '';
-    if (ctype.includes('application/json')) {
-      const json = await resp.json();
-      const d = json?.data || {};
-      const title = String(d.title || '').trim();
-      const finalUrl =
-        typeof d.finalUrl === 'string' && d.finalUrl.startsWith('http')
-          ? d.finalUrl
-          : typeof d.url === 'string' && d.url.startsWith('http')
-            ? d.url
-            : cleanUrl;
-      const html = typeof d.html === 'string' ? d.html : '';
-      // Never substitute 1-line meta description as full article body when real HTML is returned
-      const content =
-        typeof d.content === 'string' && d.content.trim()
-          ? d.content.trim()
-          : !html && typeof d.description === 'string'
-            ? d.description.trim()
-            : '';
-      const linksObj = d.links && typeof d.links === 'object' ? (d.links as Record<string, unknown>) : {};
-      const links: Array<{ title: string; url: string }> = [];
-      for (const [k, v] of Object.entries(linksObj)) {
-        if (typeof v === 'string' && v.startsWith('http')) {
-          links.push({ title: k, url: v });
-        }
-      }
-      return { title, finalUrl, html, content, links };
-    }
-    const rawTxt = await resp.text();
-    const titleMatch = rawTxt.match(/^Title:\s*(.+)$/m);
-    return {
-      title: titleMatch ? titleMatch[1].trim() : '',
-      finalUrl: cleanUrl,
-      html: /<(html|body|article|div|p)\b/i.test(rawTxt) ? rawTxt : '',
-      content: rawTxt,
-      links: [],
-    };
-  };
-
-  try {
-    const first = await attempt(Boolean(options?.noCache));
     if (
       first &&
       !options?.noCache &&
       isSuspiciousTrackerPayload(cleanUrl, first.title, first.finalUrl, first.html, first.content)
     ) {
-      const fresh = await attempt(true);
+      const fresh = await fetchViaJinaInternal(cleanUrl, {
+        format: 'html',
+        noCache: true,
+        signal: options?.signal,
+      });
       if (fresh) return fresh;
     }
     return first;
@@ -1897,35 +2326,117 @@ async function fetchViaJinaHtmlAndLinks(
   }
 }
 
+async function fetchViaJinaRenderedMarkdown(
+  cleanUrl: string,
+  options?: { noCache?: boolean; signal?: AbortSignal }
+): Promise<JinaFetchResult | null> {
+  try {
+    return await fetchViaJinaInternal(cleanUrl, {
+      format: 'markdown',
+      noCache: Boolean(options?.noCache),
+      signal: options?.signal,
+    });
+  } catch (err) {
+    if ((err as { name?: string })?.name === 'AbortError') throw err;
+    return null;
+  }
+}
+
+const MAIN_CONTENT_SELECTORS =
+  '.widget-episodeBody, #novel_honbun, .p-novel__body, .js-novel-text, #honbun, #novelBoby, .novel-body, .episode-body, .main_text, .chapter-inner.chapter-content, .chapter-content, #chp_raw, .chp_raw, #chapters .userstuff, .userstuff.module, #storytext, #chr-content, #chapter-content, .reading-content, .chapter-c, .chapter__content, .cha-words, #chapter-container, #mw-content-text .mw-parser-output, .note-common-styles__textnote-body, .it-MdContent, .znc, .available-content, .body.markup, .markdown-body, [itemprop="articleBody"], .entry-content, .post-content, .post-body, .article-body, .article__body, article, main';
+
+function scoreBestReadabilityRoot(doc: Document): Element | null {
+  const candidates = Array.from(doc.querySelectorAll('article, main, section, div'));
+  let bestEl: Element | null = null;
+  let bestScore = 0;
+
+  for (const el of candidates) {
+    const clsAndId = `${el.className || ''} ${el.id || ''}`;
+    if (/(sidebar|menu|navbar|footer|header|comment|related|recommend|widget|cookie|modal|popup|banner|breadcrumb)/i.test(clsAndId)) {
+      continue;
+    }
+    const textLen = (el.textContent || '').replace(/\s+/g, ' ').trim().length;
+    if (textLen < 160) continue;
+    const pCount = el.querySelectorAll('p').length;
+    const linkTextLen = Array.from(el.querySelectorAll('a')).reduce(
+      (acc, a) => acc + ((a.textContent || '').trim().length || 0),
+      0
+    );
+    const linkDensity = linkTextLen / Math.max(1, textLen);
+    if (linkDensity > 0.55) continue;
+    // Prefer denser, more specific containers over outer wrappers
+    const depthBonus = el.tagName === 'ARTICLE' ? 1.25 : el.tagName === 'MAIN' ? 1.15 : 1;
+    const score = (textLen * (1 - linkDensity) + pCount * 55) * depthBonus;
+    if (score > bestScore) {
+      bestScore = score;
+      bestEl = el;
+    }
+  }
+  return bestEl;
+}
+
+function extractNodeLinesPreservingBreaks(el: Element): string[] {
+  const copy = el.cloneNode(true) as Element;
+  copy.querySelectorAll('br').forEach((br) => {
+    br.replaceWith(copy.ownerDocument.createTextNode('\n'));
+  });
+  return (copy.textContent || '')
+    .split(/\r?\n+/)
+    .map((line) => line.replace(/[\t\u00a0 ]+/g, ' ').trim())
+    .filter((line) => line.length >= 1);
+}
+
 function extractCleanParagraphsFromHtml(doc: Document, titleHint = ''): string[] {
   const clone = doc.cloneNode(true) as Document;
-  // Remove scripts, styles, chrome, ads, and ruby readings (<rt>/<rp>) so kanji text stays clean
+  // Remove scripts, styles, chrome, ads, wiki clutter, and ruby readings (<rt>/<rp>) so prose stays clean
   clone
     .querySelectorAll(
-      'script, style, noscript, svg, nav, footer, header, aside, form, rt, rp, [aria-hidden="true"], .widget-episodeNavigation, #contentMain-episodeNavigation, .c-pager'
+      'script, style, noscript, svg, nav, footer, header, aside, form, rt, rp, [aria-hidden="true"], .widget-episodeNavigation, #contentMain-episodeNavigation, .c-pager, .p-novel__pager, .infobox, .navbox, .vertical-navbox, .sistersitebox, .hatnote, .mw-editsection, .reflist, .references, sup.reference, .toc, #toc, .noprint, .mw-jump-link, .sharedaddy, .jp-relatedposts, .comments-area, #comments, .cookie-banner, .advertisement, .ad-container'
     )
     .forEach((el) => el.remove());
 
-  const root =
-    clone.querySelector(
-      '.widget-episodeBody, #novel_honbun, .p-novel__body, #honbun, .main_text, .novel-body, .episode-body, .chapter-content, .entry-content, .post-content, article, main'
-    ) || clone.body;
-
+  let root: Element | null = clone.querySelector(MAIN_CONTENT_SELECTORS);
+  if (root && (root.textContent || '').replace(/\s+/g, ' ').trim().length < 80) {
+    root = scoreBestReadabilityRoot(clone) || root;
+  }
+  if (!root) {
+    root = scoreBestReadabilityRoot(clone) || clone.body;
+  }
   if (!root) return [];
-  const normTitle = titleHint.replace(/\s+/g, ' ').trim().toLowerCase();
-  const nodes = Array.from(root.querySelectorAll('h1, h2, h3, p, blockquote'));
-  const paras = nodes
-    .map((n) => (n.textContent || '').replace(/\s+/g, ' ').trim())
-    .filter((s, idx) => s.length >= 1 && !(idx === 0 && normTitle && s.toLowerCase() === normTitle))
-    .slice(0, 220);
+
+  const normTitle = decodeHtmlEntities(titleHint).replace(/\s+/g, ' ').trim().toLowerCase();
+  const nodes = Array.from(root.querySelectorAll('h1, h2, h3, p, blockquote, li'));
+  const paras: string[] = [];
+  for (const n of nodes) {
+    // Skip list items that are mostly navigation links
+    if (n.tagName === 'LI') {
+      const tLen = (n.textContent || '').trim().length;
+      const aLen = Array.from(n.querySelectorAll('a')).reduce(
+        (acc, a) => acc + ((a.textContent || '').trim().length || 0),
+        0
+      );
+      if (tLen < 24 || aLen / Math.max(1, tLen) > 0.65) continue;
+    }
+    const hasBr = n.querySelector('br') !== null;
+    const lines = hasBr
+      ? extractNodeLinesPreservingBreaks(n)
+      : [(n.textContent || '').replace(/\s+/g, ' ').trim()];
+    for (const s of lines) {
+      if (!s) continue;
+      if (paras.length === 0 && normTitle && s.toLowerCase() === normTitle) continue;
+      paras.push(s);
+      if (paras.length >= 220) break;
+    }
+    if (paras.length >= 220) break;
+  }
+
   if (paras.length >= 2) return paras;
 
-  const fallbackText = (root.textContent || '')
-    .split(/\n{2,}/)
-    .map((s) => s.replace(/\s+/g, ' ').trim())
+  // Fallback for <br>-separated prose inside a single container (e.g. Aozora Bunko .main_text, Hameln #honbun, Blogger)
+  const brLines = extractNodeLinesPreservingBreaks(root)
     .filter((s, idx) => s.length >= 1 && !(idx === 0 && normTitle && s.toLowerCase() === normTitle))
     .slice(0, 220);
-  return fallbackText.length >= paras.length ? fallbackText : paras;
+  return brLines.length >= paras.length ? brLines : paras;
 }
 
 async function fetchSeriesTocDirect(
@@ -1964,15 +2475,19 @@ async function fetchSeriesTocDirect(
     let bestNav: NovelNavigation | null = null;
     let fallbackTitle = '';
 
-    // Primary: Jina Reader HTML + Links Summary with X-No-Cache (fast CORS, includes Kakuyomu __NEXT_DATA__ 84+ chapters!)
+    // Primary: Jina Reader HTML + Links Summary with X-No-Cache (fast CORS, includes Kakuyomu __NEXT_DATA__, Syosetu TOC, RoyalRoad window.chapters!)
     const jinaRes = await fetchViaJinaHtmlAndLinks(safeToc, {
       noCache: true,
       signal: ctrl.signal,
     }).catch(() => null);
 
-    if (jinaRes) {
+    if (
+      jinaRes &&
+      !isChallengeOrBlockedPayload(jinaRes.title, jinaRes.html, jinaRes.content) &&
+      !hasMojibake(jinaRes.title + jinaRes.html.slice(0, 1200))
+    ) {
       fallbackTitle = jinaRes.title
-        .replace(/\s*[-–|]\s*(カクヨム|小説家になろう|ハーメルン|Kakuyomu).*$/i, '')
+        .replace(/\s*[-–|]\s*(カクヨム|小説家になろう|ハーメルン|Kakuyomu|Royal Road|Scribble Hub).*$/i, '')
         .trim();
       if (jinaRes.html) {
         const doc = new DOMParser().parseFromString(jinaRes.html, 'text/html');
@@ -1986,10 +2501,28 @@ async function fetchSeriesTocDirect(
       }
     }
 
-    // Secondary fallback: CORS HTML proxies if Jina didn't find >= 2 chapters
+    // Secondary: Jina Rendered Markdown + Links Summary when HTML TOC was empty/challenged/mojibake
+    if (!bestNav || (bestNav.chapters?.length || 0) < 2) {
+      const mdRes = await fetchViaJinaRenderedMarkdown(safeToc, {
+        signal: ctrl.signal,
+      }).catch(() => null);
+      if (mdRes && !isChallengeOrBlockedPayload(mdRes.title, mdRes.html, mdRes.content)) {
+        if (!fallbackTitle && mdRes.title) {
+          fallbackTitle = mdRes.title
+            .replace(/\s*[-–|]\s*(カクヨム|小説家になろう|ハーメルン|Kakuyomu|Royal Road|Scribble Hub).*$/i, '')
+            .trim();
+        }
+        const mdNav = extractNovelNavigationFromMarkdown(mdRes.content, safeToc, mdRes.links);
+        if ((mdNav.chapters?.length || 0) > (bestNav?.chapters?.length || 0)) {
+          bestNav = mdNav;
+        }
+      }
+    }
+
+    // Tertiary fallback: CORS HTML proxies if Jina didn't find >= 2 chapters
     if (!bestNav || (bestNav.chapters?.length || 0) < 2) {
       const raw = await fetchRawHtmlViaCorsProxy(safeToc, ctrl.signal).catch(() => null);
-      if (raw) {
+      if (raw && !isChallengeOrBlockedPayload('', raw, '')) {
         const doc = new DOMParser().parseFromString(raw, 'text/html');
         const proxyNav = extractNovelNavigationFromHtml(doc, raw, safeToc);
         if ((proxyNav.chapters?.length || 0) > (bestNav?.chapters?.length || 0)) {
@@ -2082,6 +2615,27 @@ function mergeNovelNav(primary: NovelNavigation, secondary?: NovelNavigation | n
   });
 }
 
+async function decodeHtmlResponseWithCharset(resp: Response): Promise<string> {
+  const buf = await resp.arrayBuffer();
+  if (buf.byteLength > 5 * 1024 * 1024) return '';
+  const bytes = new Uint8Array(buf);
+  const ctype = resp.headers.get('content-type') || '';
+  const headAscii = new TextDecoder('latin1').decode(bytes.subarray(0, Math.min(bytes.length, 2048)));
+  const charsetMatch = `${ctype} ${headAscii}`.match(/charset\s*=\s*["']?([a-zA-Z0-9_-]+)/i);
+  const rawCharset = (charsetMatch?.[1] || 'utf-8').toLowerCase();
+  const normalizedCharset =
+    rawCharset === 'sjis' || rawCharset === 'x-sjis' || rawCharset === 'shift_jis' || rawCharset === 'shift-jis'
+      ? 'shift_jis'
+      : rawCharset === 'eucjp' || rawCharset === 'euc-jp' || rawCharset === 'euc_jp'
+        ? 'euc-jp'
+        : 'utf-8';
+  try {
+    return new TextDecoder(normalizedCharset, { fatal: false }).decode(bytes);
+  } catch {
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  }
+}
+
 async function fetchRawHtmlViaCorsProxy(
   cleanUrl: string,
   signal?: AbortSignal
@@ -2090,31 +2644,61 @@ async function fetchRawHtmlViaCorsProxy(
     `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`,
     `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`,
   ];
-  for (const endpoint of proxies) {
-    try {
-      const resp = await fetch(endpoint, { method: 'GET', signal });
-      if (!resp.ok) continue;
-      const html = await resp.text();
-      if (html && html.length <= 5 * 1024 * 1024 && /<(html|body|article|div|p)\b/i.test(html)) {
-        return html;
-      }
-    } catch (err) {
-      if ((err as { name?: string })?.name === 'AbortError') throw err;
+  // Race proxies in parallel so one dead proxy never blocks another
+  const attempts = proxies.map(async (endpoint) => {
+    const resp = await fetch(endpoint, { method: 'GET', signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const html = await decodeHtmlResponseWithCharset(resp);
+    if (!html || !/<(html|body|article|div|p)\b/i.test(html)) {
+      throw new Error('Non-HTML payload');
     }
+    if (isChallengeOrBlockedPayload('', html, '')) {
+      throw new Error('Blocked challenge payload');
+    }
+    return html;
+  });
+
+  try {
+    return await Promise.any(attempts);
+  } catch (err) {
+    if (signal?.aborted) {
+      throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+    }
+    void err;
+    return null;
   }
-  return null;
 }
 
-function cleanReaderMarkdownToParagraphs(md: string): string[] {
+const MD_BOILERPLATE_LINE_RE =
+  /^(skip to (main )?content|jump to content|toggle navigation|menu|log ?in|sign ?in|sign ?up|register|cookie policy|privacy policy|terms of service|all rights reserved|back to top|↑ページトップへ|閉じる|ログイン|ブックマークへ移動|ヘルプセンター)$/i;
+
+function stripInlineMarkdownFormatting(text: string): string {
+  return decodeHtmlEntities(text)
+    .replace(/\*{4,}/g, ' ')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/__([^_\n]+)__/g, '$1')
+    .replace(/(^|[\s([{"'“‘])\*([^*\n]+)\*(?=[\s)\]}.,!?;:"'”’]|$)/g, '$1$2')
+    .replace(/(^|[\s([{"'“‘])_([^_\n]+)_(?=[\s)\]}.,!?;:"'”’]|$)/g, '$1$2')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/^>\s?/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cleanReaderMarkdownToParagraphs(md: string, titleHint = ''): string[] {
   const lines = md.split(/\r?\n/);
   const paras: string[] = [];
   let buf: string[] = [];
+  const normTitle = decodeHtmlEntities(titleHint).replace(/\s+/g, ' ').trim().toLowerCase();
 
   const flush = () => {
     if (!buf.length) return;
-    const joined = buf.join(' ').replace(/\s+/g, ' ').trim();
+    const joined = stripInlineMarkdownFormatting(buf.join(' '));
     buf = [];
-    if (joined.length >= 2) paras.push(joined);
+    if (joined.length < 2) return;
+    if (MD_BOILERPLATE_LINE_RE.test(joined)) return;
+    if (paras.length === 0 && normTitle && joined.toLowerCase() === normTitle) return;
+    paras.push(joined);
   };
 
   for (const rawLine of lines) {
@@ -2124,23 +2708,40 @@ function cleanReaderMarkdownToParagraphs(md: string): string[] {
       continue;
     }
     if (/^(Title|URL Source|Published Time|Markdown Content):/i.test(line)) continue;
+    if (/^[-*_]{3,}$/.test(line) || /^\|[\s:|-]+\|$/.test(line)) {
+      flush();
+      continue;
+    }
     if (/^!\[[^\]]*\]\([^)]+\)$/.test(line)) continue;
 
-    const cleaned = line
+    // Strip linked images and markdown links while keeping readable anchor text
+    const unlinked = line
+      .replace(/\[!\[[^\]]*\]\([^)]+\)\]\([^)]+\)/g, '')
       .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
       .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
       .trim();
-    if (!cleaned) continue;
+    if (!unlinked) continue;
 
-    if (/^#{1,6}\s+/.test(cleaned)) {
+    if (/^#{1,6}\s+/.test(unlinked)) {
       flush();
-      paras.push(cleaned);
+      const heading = stripInlineMarkdownFormatting(unlinked.replace(/^#{1,6}\s+/, ''));
+      if (heading && !MD_BOILERPLATE_LINE_RE.test(heading)) {
+        if (!(paras.length === 0 && normTitle && heading.toLowerCase() === normTitle)) {
+          paras.push(heading);
+        }
+      }
+    } else if (/^[-*+]\s+/.test(unlinked)) {
+      flush();
+      const bulletText = stripInlineMarkdownFormatting(unlinked.replace(/^[-*+]\s+/, ''));
+      if (bulletText.length >= 2 && !MD_BOILERPLATE_LINE_RE.test(bulletText)) {
+        paras.push(bulletText);
+      }
     } else {
-      buf.push(cleaned);
+      buf.push(unlinked);
     }
   }
   flush();
-  return paras.slice(0, 140);
+  return paras.slice(0, 200);
 }
 
 async function fetchWebArticleDirect(
@@ -2184,10 +2785,11 @@ async function fetchWebArticleDirectInner(
     let jinaLinks: Array<{ title: string; url: string }> = [];
     let navFromMd: NovelNavigation | null = null;
     let navFromHtml: NovelNavigation | null = null;
+    let hitAntiBotChallenge = false;
 
     const knownToc = deriveKnownTocInfo(cleanUrl);
 
-    // Primary fetch: Jina Reader HTML + Links Summary (returns FULL real HTML + links with CORS!)
+    // Primary fetch: Jina Reader HTML + Links Summary (preserves full DOM, __NEXT_DATA__, <select> chapters, & Situs Terjemahan layout!)
     const jinaPromise =
       srcParas.length > 0 && rawHtml
         ? Promise.resolve()
@@ -2197,6 +2799,16 @@ async function fetchWebArticleDirectInner(
               signal: ctrl.signal,
             });
             if (!res) return;
+            const challengeDetected = isChallengeOrBlockedPayload(res.title, res.html, res.content);
+            const mojibakeDetected = hasMojibake(`${res.title}\n${res.html.slice(0, 2000)}`);
+            if (challengeDetected) {
+              hitAntiBotChallenge = true;
+              return;
+            }
+            if (mojibakeDetected) {
+              // Shift_JIS / EUC-JP mojibake in HTML mode -> let Jina Rendered Markdown decode UTF-8 cleanly
+              return;
+            }
             if (res.title) titleSrc = res.title;
             if (
               res.finalUrl &&
@@ -2211,7 +2823,7 @@ async function fetchWebArticleDirectInner(
               navFromMd = extractNovelNavigationFromMarkdown(res.content, finalUrl, res.links);
             }
             if (res.content && srcParas.length === 0) {
-              srcParas = cleanReaderMarkdownToParagraphs(res.content);
+              srcParas = cleanReaderMarkdownToParagraphs(res.content, titleSrc);
             }
           })();
 
@@ -2222,26 +2834,12 @@ async function fetchWebArticleDirectInner(
 
     const [, earlyTocNav] = await Promise.all([jinaPromise, earlyTocPromise]);
 
-    // Fallback: only hit external CORS proxies if Jina returned no HTML (or we still need HTML for view=site)
-    if (!rawHtml && (srcParas.length === 0 || options?.needRawHtml)) {
-      const htmlCtrl = new AbortController();
-      const htmlTimer = window.setTimeout(() => htmlCtrl.abort(), 7000);
-      try {
-        const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, htmlCtrl.signal);
-        if (fetched) rawHtml = fetched;
-      } catch {
-        // Ignore slow proxy fallback
-      } finally {
-        window.clearTimeout(htmlTimer);
-      }
-    }
-
     if (rawHtml) {
       const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
       navFromHtml = extractNovelNavigationFromHtml(doc, rawHtml, finalUrl, jinaLinks);
       if (!titleSrc || titleSrc === host) {
-        const docTitle = (doc.title || '').trim();
-        if (docTitle) titleSrc = docTitle;
+        const docTitle = decodeHtmlEntities((doc.title || '').trim());
+        if (docTitle && !hasMojibake(docTitle)) titleSrc = docTitle;
       }
       const htmlParas = extractCleanParagraphsFromHtml(doc, titleSrc);
       if (htmlParas.length > srcParas.length || srcParas.length < 2) {
@@ -2249,7 +2847,81 @@ async function fetchWebArticleDirectInner(
       }
     }
 
+    // Automatic Smart Fallback: Jina Rendered Markdown mode!
+    // Rescues Syosetu episodes (HTML=0), RoyalRoad (Cloudflare HTML), Aozora Bunko (Shift_JIS mojibake), and JS-rendered SPAs!
+    const htmlYieldedPoorProse =
+      srcParas.length < 2 && !(navFromHtml?.isTocPage && (navFromHtml.chapters?.length || 0) >= 2);
+    if (htmlYieldedPoorProse) {
+      const mdRes = await fetchViaJinaRenderedMarkdown(cleanUrl, { signal: ctrl.signal });
+      if (mdRes) {
+        if (isChallengeOrBlockedPayload(mdRes.title, mdRes.html, mdRes.content)) {
+          hitAntiBotChallenge = true;
+        } else {
+          hitAntiBotChallenge = false;
+          if (mdRes.title && !hasMojibake(mdRes.title)) titleSrc = mdRes.title;
+          if (
+            mdRes.finalUrl &&
+            !isSuspiciousTrackerPayload(cleanUrl, mdRes.title, mdRes.finalUrl, mdRes.html, mdRes.content)
+          ) {
+            finalUrl = mdRes.finalUrl;
+          }
+          if (mdRes.content) rawMarkdown = mdRes.content;
+          if (mdRes.links.length > 0) {
+            jinaLinks = [...jinaLinks, ...mdRes.links];
+          }
+          const mdParas = cleanReaderMarkdownToParagraphs(mdRes.content, titleSrc);
+          if (mdParas.length > srcParas.length) {
+            srcParas = mdParas;
+            // Clear empty/shell rawHtml if HTML extraction failed so Situs Terjemahan renders clean semantic content
+            if (rawHtml) {
+              const checkDoc = new DOMParser().parseFromString(rawHtml, 'text/html');
+              if (extractCleanParagraphsFromHtml(checkDoc, titleSrc).length < 2) {
+                rawHtml = '';
+              }
+            }
+          }
+          if (mdRes.content || mdRes.links.length > 0) {
+            const parsedMdNav = extractNovelNavigationFromMarkdown(
+              mdRes.content,
+              finalUrl,
+              jinaLinks
+            );
+            navFromMd = navFromMd ? mergeNovelNav(parsedMdNav, navFromMd) : parsedMdNav;
+          }
+        }
+      }
+    }
+
+    // Secondary Fallback: Parallel charset-aware CORS HTML proxies when still empty or raw HTML needed for view=site
+    if (!rawHtml && (srcParas.length === 0 || (options?.needRawHtml && srcParas.length < 2))) {
+      const htmlCtrl = new AbortController();
+      const htmlTimer = window.setTimeout(() => htmlCtrl.abort(), 7000);
+      try {
+        const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, htmlCtrl.signal);
+        if (fetched && !hasMojibake(fetched.slice(0, 2000))) {
+          rawHtml = fetched;
+          const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+          navFromHtml = extractNovelNavigationFromHtml(doc, rawHtml, finalUrl, jinaLinks);
+          if (!titleSrc || titleSrc === host) {
+            const docTitle = decodeHtmlEntities((doc.title || '').trim());
+            if (docTitle) titleSrc = docTitle;
+          }
+          const htmlParas = extractCleanParagraphsFromHtml(doc, titleSrc);
+          if (htmlParas.length > srcParas.length) srcParas = htmlParas;
+        }
+      } catch {
+        // Ignore slow proxy fallback
+      } finally {
+        window.clearTimeout(htmlTimer);
+      }
+    }
+
     if (srcParas.length === 0) {
+      if (hitAntiBotChallenge) {
+        throw new Error(
+          `Situs ${host} memasang verifikasi keamanan / anti-bot (Cloudflare) sehingga konten tidak dapat diambil otomatis. Buka situs asli atau salin teks halaman langsung ke tab Teks.`
+        );
+      }
       throw new Error(
         `Tidak ditemukan paragraf teks yang dapat dibaca pada ${host}. Halaman mungkin memerlukan login atau tantangan anti-bot.`
       );
@@ -2596,7 +3268,15 @@ async function buildTranslatedSiteHtmlDirect(params: {
         el.tagName === 'VIDEO' ||
         el.tagName === 'AUDIO'
       ) {
-        const rawSrc = el.getAttribute('src') || el.getAttribute('data-src') || '';
+        const currentSrc = (el.getAttribute('src') || '').trim();
+        const lazySrc = (
+          el.getAttribute('data-src') ||
+          el.getAttribute('data-lazy-src') ||
+          el.getAttribute('data-original') ||
+          ''
+        ).trim();
+        const isPlaceholderDataUri = /^data:image\/(gif|svg\+xml);/i.test(currentSrc);
+        const rawSrc = (!currentSrc || isPlaceholderDataUri) && lazySrc ? lazySrc : currentSrc || lazySrc;
         if (rawSrc && !rawSrc.startsWith('data:')) {
           const safeAbs = resolveSafeSiblingUrl(rawSrc, article.url);
           if (safeAbs) el.setAttribute('src', safeAbs);
@@ -2606,7 +3286,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
           const safePoster = resolveSafeSiblingUrl(rawPoster, article.url);
           if (safePoster) el.setAttribute('poster', safePoster);
         }
-        const rawSrcset = el.getAttribute('srcset') || '';
+        const rawSrcset = el.getAttribute('srcset') || el.getAttribute('data-srcset') || '';
         if (rawSrcset) {
           const resolvedSrcset = rawSrcset
             .split(',')
@@ -2640,7 +3320,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
       'html,body{overflow-x:hidden !important;max-width:100vw !important;} img,video{max-width:100% !important;height:auto !important;}';
     head.appendChild(safeStyle);
 
-    // Collect visible text nodes for in-place DOM translation (preserving site layout)
+    // Collect visible text nodes prioritizing main article content FIRST (up to 750 nodes) so long Wikipedia/news/novel pages never stop halfway
     const skipParentTags = new Set([
       'SCRIPT',
       'STYLE',
@@ -2653,47 +3333,63 @@ async function buildTranslatedSiteHtmlDirect(params: {
       'RT',
       'RP',
     ]);
+    const MAX_SITE_NODES = 750;
     const textNodes: Text[] = [];
-    const walker = doc.createTreeWalker(doc.body || doc.documentElement, NodeFilter.SHOW_TEXT);
-    let node = walker.nextNode();
-    while (node && textNodes.length < 480) {
-      const parent = node.parentElement;
-      const val = (node.nodeValue || '').trim();
-      if (
-        val.length >= 2 &&
-        hasTranslatableLetters(val) &&
-        (!parent || !skipParentTags.has(parent.tagName))
-      ) {
-        textNodes.push(node as Text);
-      }
-      node = walker.nextNode();
-    }
-
-    if (textNodes.length > 0) {
-      const { outputs } = await translateParagraphsDirect({
-        paragraphs: textNodes.map((n) => (n.nodeValue || '').trim()),
-        mode,
-        titleId: params.titleId || article.titleId,
-      });
-      textNodes.forEach((tn, idx) => {
-        if (outputs[idx]) {
-          tn.nodeValue = outputs[idx];
+    const seenTextNodes = new Set<Text>();
+    const collectFromSubtree = (rootEl: Node | null) => {
+      if (!rootEl || textNodes.length >= MAX_SITE_NODES) return;
+      const walker = doc.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT);
+      let node = walker.nextNode();
+      while (node && textNodes.length < MAX_SITE_NODES) {
+        const tn = node as Text;
+        if (!seenTextNodes.has(tn)) {
+          const parent = tn.parentElement;
+          const val = (tn.nodeValue || '').trim();
+          if (
+            val.length >= 2 &&
+            hasTranslatableLetters(val) &&
+            (!parent || !skipParentTags.has(parent.tagName))
+          ) {
+            seenTextNodes.add(tn);
+            textNodes.push(tn);
+          }
         }
-      });
-    }
+        node = walker.nextNode();
+      }
+    };
 
-    if (doc.title) {
-      doc.title = translatedHeading;
-    }
-    if (navButtonsHtml && doc.body) {
-      const navWrap = doc.createElement('div');
-      navWrap.innerHTML = navButtonsHtml;
-      doc.body.appendChild(navWrap);
-    }
+    const mainRegion = doc.querySelector(MAIN_CONTENT_SELECTORS);
+    if (mainRegion) collectFromSubtree(mainRegion);
+    collectFromSubtree(doc.body || doc.documentElement);
 
-    const serialized = `<!doctype html>\n${doc.documentElement.outerHTML}`;
-    translatedSiteHtmlCache.set(cacheKey, serialized);
-    return serialized;
+    // Guard against blank JS-only SPA shells (<div id="root"></div>): fall back to clean semantic translated view!
+    if (textNodes.length >= 2 || translatedParas.length < 2) {
+      if (textNodes.length > 0) {
+        const { outputs } = await translateParagraphsDirect({
+          paragraphs: textNodes.map((n) => (n.nodeValue || '').trim()),
+          mode,
+          titleId: params.titleId || article.titleId,
+        });
+        textNodes.forEach((tn, idx) => {
+          if (outputs[idx]) {
+            tn.nodeValue = outputs[idx];
+          }
+        });
+      }
+
+      if (doc.title) {
+        doc.title = translatedHeading;
+      }
+      if (navButtonsHtml && doc.body) {
+        const navWrap = doc.createElement('div');
+        navWrap.innerHTML = navButtonsHtml;
+        doc.body.appendChild(navWrap);
+      }
+
+      const serialized = `<!doctype html>\n${doc.documentElement.outerHTML}`;
+      translatedSiteHtmlCache.set(cacheKey, serialized);
+      return serialized;
+    }
   }
 
   // Clean semantic fallback when CORS HTML proxy was blocked: still rewrites chapter links into /web!

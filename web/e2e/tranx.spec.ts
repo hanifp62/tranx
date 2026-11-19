@@ -1067,4 +1067,367 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
 
     expect(consoleErrors).toEqual([]);
   });
+
+  test('Universal Multi-Site Link Engine (Syosetu, RoyalRoad, Aozora Shift_JIS, NovelBin <select>+<br>, Wikipedia/WordPress, & Cloudflare honest fallback)', async ({
+    page,
+  }) => {
+    await page.route('**/v1/healthz', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
+    await page.route('https://api.allorigins.win/raw**', async (route) => {
+      await route.fulfill({ status: 504, body: 'Gateway Timeout' });
+    });
+    await page.route('https://api.codetabs.com/**', async (route) => {
+      await route.fulfill({ status: 504, body: 'Gateway Timeout' });
+    });
+
+    // Simulate real-world behavior discovered during live probing across 6 non-Kakuyomu ecosystems
+    await page.route('https://r.jina.ai/**', async (route) => {
+      const reqUrl = route.request().url();
+      const hdrs = route.request().headers();
+      const isHtmlMode = hdrs['x-return-format'] === 'html';
+
+      // 1. Syosetu / Narou Episode 1 & 2: Jina HTML returns EMPTY html="", Rendered Markdown returns full Japanese prose!
+      if (reqUrl.includes('ncode.syosetu.com/n9669bk/1')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify(
+            isHtmlMode
+              ? { code: 200, data: { title: '', html: '', url: 'https://ncode.syosetu.com/n9669bk/1/' } }
+              : {
+                  code: 200,
+                  data: {
+                    title: 'Mushoku Tensei - Prologue',
+                    url: 'https://ncode.syosetu.com/n9669bk/1/',
+                    content:
+                      'I am a 34-year-old jobless recluse.\n\nA bright flash appeared right before the truck hit.',
+                    links: {
+                      '次へ': 'https://ncode.syosetu.com/n9669bk/2/',
+                      '目次': 'https://ncode.syosetu.com/n9669bk/',
+                    },
+                  },
+                }
+          ),
+        });
+        return;
+      }
+      if (reqUrl.includes('ncode.syosetu.com/n9669bk/2')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify(
+            isHtmlMode
+              ? { code: 200, data: { title: '', html: '', url: 'https://ncode.syosetu.com/n9669bk/2/' } }
+              : {
+                  code: 200,
+                  data: {
+                    title: 'Mushoku Tensei - Chapter 2: A New World',
+                    url: 'https://ncode.syosetu.com/n9669bk/2/',
+                    content: 'When I opened my eyes, I was staring at a wooden ceiling.',
+                    links: { '前へ': 'https://ncode.syosetu.com/n9669bk/1/' },
+                  },
+                }
+          ),
+        });
+        return;
+      }
+      if (reqUrl.includes('ncode.syosetu.com/n9669bk')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: 'Mushoku Tensei',
+              url: 'https://ncode.syosetu.com/n9669bk/',
+              html: `<!doctype html><html><head><title>Mushoku Tensei</title></head><body><div class="p-eplist"><a href="/n9669bk/1/">Prologue</a><a href="/n9669bk/2/">Chapter 2: A New World</a></div></body></html>`,
+              links: {
+                Prologue: 'https://ncode.syosetu.com/n9669bk/1/',
+                'Chapter 2: A New World': 'https://ncode.syosetu.com/n9669bk/2/',
+              },
+            },
+          }),
+        });
+        return;
+      }
+
+      // 2. RoyalRoad Chapter: Jina HTML returns Cloudflare "Just a moment...", Rendered Markdown returns full chapter!
+      if (reqUrl.includes('royalroad.com/fiction/21220/mother-of-learning/chapter/301778')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify(
+            isHtmlMode
+              ? {
+                  code: 200,
+                  data: {
+                    title: 'Just a moment...',
+                    html: '<html><head><title>Just a moment...</title></head><body>Enable JavaScript and cookies to continue</body></html>',
+                  },
+                }
+              : {
+                  code: 200,
+                  data: {
+                    title: '1. Good Morning Brother - Mother of Learning',
+                    url: 'https://www.royalroad.com/fiction/21220/mother-of-learning/chapter/301778/1-good-morning-brother',
+                    content:
+                      '**Chapter 001****Good Morning Brother**\n\nZorian opened his eyes and heard _MORNING_ shouted loudly.',
+                    links: {
+                      'Next Chapter':
+                        'https://www.royalroad.com/fiction/21220/mother-of-learning/chapter/301780/2-life-and-times',
+                    },
+                  },
+                }
+          ),
+        });
+        return;
+      }
+      if (reqUrl.includes('royalroad.com/fiction/21220/mother-of-learning')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: 'Just a moment...',
+              html: '<html><head><title>Just a moment...</title></head><body>Enable JavaScript and cookies to continue</body></html>',
+            },
+          }),
+        });
+        return;
+      }
+
+      // 3. Aozora Bunko: Jina HTML returns Shift_JIS mojibake (\uFFFD), Rendered Markdown returns clean UTF-8!
+      if (reqUrl.includes('aozora.gr.jp/cards/000879/files/127_15260.html')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify(
+            isHtmlMode
+              ? {
+                  code: 200,
+                  data: {
+                    title: '\uFFFDH\uFFFDV\uFFFD',
+                    html: '<html><body><div class="main_text">\uFFFD\uFFFD\uFFFD\uFFFD</div></body></html>',
+                  },
+                }
+              : {
+                  code: 200,
+                  data: {
+                    title: 'Rashomon',
+                    url: 'https://www.aozora.gr.jp/cards/000879/files/127_15260.html',
+                    content: 'One evening a servant waited for the rain to stop under the Rashomon gate.',
+                  },
+                }
+          ),
+        });
+        return;
+      }
+
+      // 4. NovelBin / Generic Novel site using <select> chapter dropdown + <br> line breaks inside #chr-content!
+      if (reqUrl.includes('novelbin.com/b/kyoto-chronicles/chapter-1')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: 'Kyoto Chronicles &#8220;Chapter 1&#8221; &#124; NovelBin',
+              url: 'https://novelbin.com/b/kyoto-chronicles/chapter-1',
+              html: `<!doctype html><html><head><title>Kyoto Chronicles &#8220;Chapter 1&#8221; &#124; NovelBin</title></head><body>
+                <select id="chapter-select">
+                  <option value="/b/kyoto-chronicles/chapter-1" selected>Chapter 1: Departure</option>
+                  <option value="/b/kyoto-chronicles/chapter-2">Chapter 2: Crossing the Bridge</option>
+                  <option value="/b/kyoto-chronicles/chapter-3">Chapter 3: Lantern Night</option>
+                </select>
+                <div id="chr-content">First snow fell softly on the temple roof.<br><br>Second line whispered across the courtyard.<br>Third line closed the chapter.</div>
+              </body></html>`,
+            },
+          }),
+        });
+        return;
+      }
+
+      // 5. Wikipedia non-novel article: infobox + sup.reference clutter + sidebar "Next" link must NOT trigger Ebook badge!
+      if (reqUrl.includes('en.wikipedia.org/wiki/Rashomon_(short_story)')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: 'Rashomon (short story) &#124; Wikipedia',
+              url: 'https://en.wikipedia.org/wiki/Rashomon_(short_story)',
+              html: `<!doctype html><html><head><title>Rashomon (short story) - Wikipedia</title></head><body>
+                <aside><a href="/wiki/Next_article">Next</a></aside>
+                <div id="mw-content-text"><div class="mw-parser-output">
+                  <table class="infobox"><tr><td>INFOBOX_NOISE_1915</td></tr></table>
+                  <p>Rashomon is a famous short story by Ryunosuke Akutagawa.<sup class="reference">[1]</sup></p>
+                  <p>It depicts an encounter beneath the ruined southern gate of Kyoto.</p>
+                  <a href="/wiki/Kyoto">Kyoto</a>
+                </div></div>
+              </body></html>`,
+            },
+          }),
+        });
+        return;
+      }
+
+      // 6. Hard Cloudflare-blocked site (both HTML and MD return Cloudflare challenge)
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({
+          code: 200,
+          data: {
+            title: 'Just a moment...',
+            html: '<html><head><title>Just a moment...</title></head><body>Verify you are human</body></html>',
+            content: 'Just a moment... Enable JavaScript and cookies to continue',
+          },
+        }),
+      });
+    });
+
+    await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      const reqUrl = new URL(route.request().url());
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const q = postParams.get('q') || reqUrl.searchParams.get('q') || '';
+      const lines = q.split('\n').map((line) =>
+        line
+          .replace(/Mushoku Tensei - Prologue/gi, 'Mushoku Tensei - Prolog')
+          .replace(/Mushoku Tensei - Chapter 2: A New World/gi, 'Mushoku Tensei - Bab 2: Dunia Baru')
+          .replace(/I am a 34-year-old jobless recluse\./gi, 'Aku adalah penyendiri pengangguran berusia 34 tahun.')
+          .replace(
+            /A bright flash appeared right before the truck hit\./gi,
+            'Kilatan cahaya terang muncul tepat sebelum truk menabrak.'
+          )
+          .replace(
+            /When I opened my eyes, I was staring at a wooden ceiling\./gi,
+            'Saat aku membuka mata, aku menatap langit-langit kayu.'
+          )
+          .replace(/1\. Good Morning Brother - Mother of Learning/gi, '1. Selamat Pagi Kakak - Mother of Learning')
+          .replace(/Chapter 001 Good Morning Brother/gi, 'Bab 001 Selamat Pagi Kakak')
+          .replace(
+            /Zorian opened his eyes and heard MORNING shouted loudly\./gi,
+            'Zorian membuka matanya dan mendengar PAGI diteriakkan keras.'
+          )
+          .replace(
+            /One evening a servant waited for the rain to stop under the Rashomon gate\./gi,
+            'Suatu sore seorang pelayan menunggu hujan reda di bawah gerbang Rashomon.'
+          )
+          .replace(/Kyoto Chronicles ["\u201C]Chapter 1["\u201D] \| NovelBin/gi, 'Kronik Kyoto "Bab 1" | NovelBin')
+          .replace(/First snow fell softly on the temple roof\./gi, 'Salju pertama turun lembut di atap kuil.')
+          .replace(
+            /Second line whispered across the courtyard\./gi,
+            'Baris kedua berbisik melintasi halaman.'
+          )
+          .replace(/Third line closed the chapter\./gi, 'Baris ketiga menutup bab ini.')
+          .replace(
+            /Rashomon is a famous short story by Ryunosuke Akutagawa\./gi,
+            'Rashomon adalah cerita pendek terkenal karya Ryunosuke Akutagawa.'
+          )
+          .replace(
+            /It depicts an encounter beneath the ruined southern gate of Kyoto\./gi,
+            'Kisah ini menggambarkan pertemuan di bawah gerbang selatan Kyoto yang runtuh.'
+          )
+      );
+      const segments = lines.map((t, idx) => [idx < lines.length - 1 ? `${t}\n` : t, t]);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([segments, null, 'en']),
+      });
+    });
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // A. Syosetu episode (empty HTML -> auto-rescued by Jina Rendered Markdown + TOC 1/2 + Next chapter!)
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fncode.syosetu.com%2Fn9669bk%2F1%2F&mode=auto-id&view=reader'
+    );
+    await expect(page.getByRole('heading', { name: 'Mushoku Tensei - Prolog' })).toBeVisible();
+    await expect(page.getByText(/Ebook terdeteksi · 1 \/ 2/)).toBeVisible();
+    await expect(page.locator('.novel-reader-body')).toContainText(
+      'Aku adalah penyendiri pengangguran berusia 34 tahun.'
+    );
+    await page.locator('.novel-chapter-dock').getByRole('button', { name: /Bab berikutnya/ }).click();
+    await expect(page.getByRole('heading', { name: 'Mushoku Tensei - Bab 2: Dunia Baru' })).toBeVisible();
+    await expect(page.locator('.novel-reader-body')).toContainText(
+      'Saat aku membuka mata, aku menatap langit-langit kayu.'
+    );
+
+    // B. RoyalRoad chapter (Cloudflare HTML -> auto-rescued by Jina Rendered Markdown + clean inline markdown stripping + Situs Terjemahan safe fallback!)
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fwww.royalroad.com%2Ffiction%2F21220%2Fmother-of-learning%2Fchapter%2F301778%2F1-good-morning-brother&mode=auto-id&view=reader'
+    );
+    await expect(
+      page.getByRole('heading', { name: '1. Selamat Pagi Kakak - Mother of Learning' })
+    ).toBeVisible();
+    await expect(page.locator('.novel-reader-body')).toContainText('Bab 001 Selamat Pagi Kakak');
+    await expect(page.locator('.novel-reader-body')).not.toContainText('**');
+    await expect(page.locator('.novel-reader-body')).not.toContainText('_MORNING_');
+    await expect(page.getByText(/Ebook terdeteksi/)).toBeVisible();
+    await page.getByRole('button', { name: 'Situs Terjemahan' }).click();
+    const rrFrame = page.frameLocator('iframe[title="Pembaca Halaman Terjemahan"]');
+    await expect(rrFrame.locator('body')).toContainText('Zorian membuka matanya');
+    await expect(rrFrame.locator('body')).not.toContainText('Just a moment');
+
+    // C. Aozora Bunko (Shift_JIS mojibake HTML -> auto-rescued by clean UTF-8 Rendered Markdown!)
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fwww.aozora.gr.jp%2Fcards%2F000879%2Ffiles%2F127_15260.html&mode=auto-id&view=reader'
+    );
+    await expect(page.locator('.novel-reader-body')).toContainText(
+      'Suatu sore seorang pelayan menunggu hujan reda di bawah gerbang Rashomon.'
+    );
+    await expect(page.locator('.novel-reader-body')).not.toContainText('\uFFFD');
+
+    // D. NovelBin (<select> chapter dropdown -> 1/3 chapters + HTML entity decoded title + <br> lines split into 3 separate paragraphs!)
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fnovelbin.com%2Fb%2Fkyoto-chronicles%2Fchapter-1&mode=auto-id&view=reader'
+    );
+    await expect(page.getByRole('heading', { name: 'Kronik Kyoto "Bab 1" | NovelBin' })).toBeVisible();
+    await expect(page.getByText(/Ebook terdeteksi · 1 \/ 3/)).toBeVisible();
+    await expect(page.locator('.novel-reader-para')).toHaveCount(3);
+    await expect(page.locator('.novel-reader-para').nth(0)).toContainText('Salju pertama');
+    await expect(page.locator('.novel-reader-para').nth(1)).toContainText('Baris kedua');
+    await expect(page.locator('.novel-reader-para').nth(2)).toContainText('Baris ketiga');
+
+    // E. Wikipedia non-novel article (strips infobox & [1] ref, decodes HTML entity, NO false Ebook badge, rewrites internal links in Situs Terjemahan!)
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FRashomon_(short_story)&mode=auto-id&view=reader'
+    );
+    await expect(page.locator('.novel-reader-body')).toContainText(
+      'Rashomon adalah cerita pendek terkenal karya Ryunosuke Akutagawa.'
+    );
+    await expect(page.locator('.novel-reader-body')).not.toContainText('INFOBOX_NOISE_1915');
+    await expect(page.locator('.novel-reader-body')).not.toContainText('[1]');
+    await expect(page.getByText(/Ebook terdeteksi/)).toHaveCount(0);
+    await page.getByRole('button', { name: 'Situs Terjemahan' }).click();
+    const wikiFrame = page.frameLocator('iframe[title="Pembaca Halaman Terjemahan"]');
+    await expect(wikiFrame.locator('body')).toContainText(
+      'Rashomon adalah cerita pendek terkenal karya Ryunosuke Akutagawa.'
+    );
+    const wikiLinkHref = await wikiFrame.locator('a[href*="Kyoto"]').first().getAttribute('href');
+    expect(wikiLinkHref || '').toContain('/web?url=');
+    expect(wikiLinkHref || '').toContain('view=site');
+
+    // F. Hard Cloudflare anti-bot site -> honest Indonesian error + Buka situs asli button (NEVER renders "Just a moment..." as article!)
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fblocked-novel.example%2Fch%2F1&mode=auto-id&view=reader'
+    );
+    await expect(page.getByText('Tidak dapat diterjemahkan langsung')).toBeVisible();
+    await expect(page.getByText(/verifikasi keamanan \/ anti-bot \(Cloudflare\)/i)).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Buka situs asli' })).toBeVisible();
+  });
 });
