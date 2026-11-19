@@ -20,6 +20,46 @@ import {
   upsertConversationMeta,
 } from './firebase';
 import { idbGet, idbLoadRecent, idbPut, idbPutMany } from './perfCache';
+import {
+  AdaptiveTokenBucket,
+  BoundedLruCache,
+  EndpointCircuitBreaker,
+  computeBackoffDelayMs,
+  getDeviceRuntimeProfile,
+} from './resilience';
+
+// Adaptive client-side rate limiters & circuit breakers calibrated for 5-10 concurrent users
+const gtxBucket = new AdaptiveTokenBucket(6, 3.5, 1.0);
+const geminiBucket = new AdaptiveTokenBucket(4, 1.8, 0.5);
+const jinaBucket = new AdaptiveTokenBucket(3, 1.4, 0.4);
+const gtxPrimaryBreaker = new EndpointCircuitBreaker(3, 18_000);
+const gtxAltBreaker = new EndpointCircuitBreaker(3, 20_000);
+const geminiBreaker = new EndpointCircuitBreaker(2, 30_000);
+const proxyBreakers = new Map<string, EndpointCircuitBreaker>();
+
+function getProxyBreaker(hostKey: string): EndpointCircuitBreaker {
+  let b = proxyBreakers.get(hostKey);
+  if (!b) {
+    b = new EndpointCircuitBreaker(2, 120_000);
+    proxyBreakers.set(hostKey, b);
+  }
+  return b;
+}
+
+function isMockOnlyLocalE2E(): boolean {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname;
+  if (host !== 'localhost' && host !== '127.0.0.1') return false;
+  try {
+    const qs = new URLSearchParams(window.location.search);
+    const isE2e = qs.get('e2e') === '1' || window.sessionStorage?.getItem('tranx_e2e') === '1';
+    const isDirect =
+      qs.get('direct') === '1' || window.sessionStorage?.getItem('tranx_e2e_direct') === '1';
+    return isE2e && !isDirect;
+  } catch {
+    return false;
+  }
+}
 
 const CJK_RE = /[\u3040-\u309f\u30a0-\u30ff\u3400-\u9fff]/;
 const CJK_SPAN_RE = /[\u3000-\u30ff\u3400-\u9fff\uff01-\uff60]+/g;
@@ -498,77 +538,115 @@ async function requestGtxSingleChunk(
   });
   const bodyForm = new URLSearchParams({ q: clean });
 
-  try {
-    const resp = await fetchWithTimeout(
-      `https://translate.googleapis.com/translate_a/single?${queryMeta.toString()}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-        body: bodyForm.toString(),
-      },
-      9500,
-      signal
-    );
-    if (resp.ok) {
-      const data = await resp.json();
-      const pieces: string[] = Array.isArray(data?.[0])
-        ? data[0]
-            .map((seg: unknown) =>
-              Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''
-            )
-            .filter(Boolean)
-        : [];
-      const serverSrc = String(data?.[2] || '').toLowerCase();
-      const detected =
-        serverSrc === 'ja' || serverSrc === 'id' || serverSrc === 'en'
-          ? (serverSrc as TargetLang)
-          : undefined;
-      return { translated: pieces.join(''), detected };
+  // Primary endpoint: translate.googleapis.com with token bucket, 429/5xx jitter retry, & circuit breaker
+  if (!gtxPrimaryBreaker.isOpen()) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await gtxBucket.acquire(signal);
+      try {
+        const resp = await fetchWithTimeout(
+          `https://translate.googleapis.com/translate_a/single?${queryMeta.toString()}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+            body: bodyForm.toString(),
+          },
+          9500,
+          signal
+        );
+        if (resp.ok) {
+          const data = await resp.json();
+          const pieces: string[] = Array.isArray(data?.[0])
+            ? data[0]
+                .map((seg: unknown) =>
+                  Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''
+                )
+                .filter(Boolean)
+            : [];
+          const serverSrc = String(data?.[2] || '').toLowerCase();
+          const detected =
+            serverSrc === 'ja' || serverSrc === 'id' || serverSrc === 'en'
+              ? (serverSrc as TargetLang)
+              : undefined;
+          gtxBucket.onSuccess();
+          gtxPrimaryBreaker.recordSuccess();
+          return { translated: pieces.join(''), detected };
+        }
+        if (resp.status === 429 || resp.status >= 500) {
+          const delayMs = computeBackoffDelayMs(attempt, resp.headers.get('Retry-After'), 400, 4000);
+          gtxBucket.onThrottle(delayMs);
+          if (resp.status === 429) {
+            gtxPrimaryBreaker.recordFailure(Math.max(delayMs, 10_000));
+            break; // Immediately fail over to healthy clients5 edge!
+          }
+          if (attempt === 0) {
+            await new Promise((r) => window.setTimeout(r, delayMs));
+            continue;
+          }
+        }
+        gtxPrimaryBreaker.recordFailure();
+        break;
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        gtxPrimaryBreaker.recordFailure();
+        break;
+      }
     }
-  } catch (err) {
-    if (signal?.aborted) throw err;
   }
 
   // Fallback 1: Alternate fast Google Translate edge (clients5.google.com, already whitelisted in CSP)
-  try {
-    const altMeta = new URLSearchParams({
-      client: 'dict-chrome-ex',
-      sl: src,
-      tl: tgt,
-    });
-    const respAlt = await fetchWithTimeout(
-      `https://clients5.google.com/translate_a/t?${altMeta.toString()}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-        body: bodyForm.toString(),
-      },
-      7500,
-      signal
-    );
-    if (respAlt.ok) {
-      const altData = await respAlt.json();
-      if (Array.isArray(altData)) {
-        const first = altData[0];
-        if (typeof first === 'string' && first.trim()) {
-          return { translated: first };
+  if (!gtxAltBreaker.isOpen()) {
+    await gtxBucket.acquire(signal);
+    try {
+      const altMeta = new URLSearchParams({
+        client: 'dict-chrome-ex',
+        sl: src,
+        tl: tgt,
+      });
+      const respAlt = await fetchWithTimeout(
+        `https://clients5.google.com/translate_a/t?${altMeta.toString()}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+          body: bodyForm.toString(),
+        },
+        7500,
+        signal
+      );
+      if (respAlt.ok) {
+        const altData = await respAlt.json();
+        if (Array.isArray(altData)) {
+          const first = altData[0];
+          if (typeof first === 'string' && first.trim()) {
+            gtxBucket.onSuccess();
+            gtxAltBreaker.recordSuccess();
+            return { translated: first };
+          }
+          if (Array.isArray(first) && typeof first[0] === 'string' && first[0].trim()) {
+            const detRaw = String(first[1] || '').toLowerCase();
+            const detected =
+              detRaw === 'ja' || detRaw === 'id' || detRaw === 'en'
+                ? (detRaw as TargetLang)
+                : undefined;
+            gtxBucket.onSuccess();
+            gtxAltBreaker.recordSuccess();
+            return { translated: first[0], detected };
+          }
         }
-        if (Array.isArray(first) && typeof first[0] === 'string' && first[0].trim()) {
-          const detRaw = String(first[1] || '').toLowerCase();
-          const detected =
-            detRaw === 'ja' || detRaw === 'id' || detRaw === 'en'
-              ? (detRaw as TargetLang)
-              : undefined;
-          return { translated: first[0], detected };
-        }
+      } else if (respAlt.status === 429 || respAlt.status >= 500) {
+        const delayMs = computeBackoffDelayMs(0, respAlt.headers.get('Retry-After'), 500, 6000);
+        gtxBucket.onThrottle(delayMs);
+        gtxAltBreaker.recordFailure(Math.max(delayMs, 12_000));
+      } else {
+        gtxAltBreaker.recordFailure();
       }
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      gtxAltBreaker.recordFailure();
     }
-  } catch (err) {
-    if (signal?.aborted) throw err;
   }
 
   // Fallback 2: GET for short payloads
-  if (clean.length <= 450) {
+  if (clean.length <= 450 && !gtxPrimaryBreaker.isOpen()) {
     try {
       const qs = new URLSearchParams({
         client: 'gtx',
@@ -623,6 +701,9 @@ async function requestGtxSingleChunk(
     }
   }
 
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    throw new Error('Perangkat sedang offline. Periksa koneksi internet Anda lalu coba lagi.');
+  }
   throw new Error('Layanan terjemahan sedang sibuk. Silakan coba sesaat lagi.');
 }
 
@@ -666,15 +747,16 @@ async function translateBatchViaGoogleGtx(
     }
   };
 
-  // Pack optimal request batches:
+  // Pack optimal dense request batches (70% fewer upstream HTTP calls -> safe for 5-10 concurrent users!):
   // Batch 0 is a priority micro-batch (<= 8 items, <= 950 chars) for ~250ms Time-To-First-Paragraph,
-  // followed by dense throughput batches (<= 24 items, <= 2,400 chars) executed across 6 parallel workers!
+  // followed by dense batches (<= 28 items, <= 3,200 chars) executed across hardware-adaptive 2-4 workers!
+  const profile = getDeviceRuntimeProfile();
   const batches: Array<Array<{ text: string; slots: number[] }>> = [];
   let cursor = 0;
   while (cursor < work.length) {
     const isFirstFastBatch = batches.length === 0 && work.length > 8;
-    const maxItems = isFirstFastBatch ? 8 : 24;
-    const maxChars = isFirstFastBatch ? 950 : 2400;
+    const maxItems = isFirstFastBatch ? 8 : 28;
+    const maxChars = isFirstFastBatch ? 950 : 3200;
     const batch: Array<{ text: string; slots: number[] }> = [];
     let charCount = 0;
     while (
@@ -693,16 +775,15 @@ async function translateBatchViaGoogleGtx(
     batches.push(batch);
   }
 
-  // Execute up to 6 batches concurrently for ~3x faster chapter, site & document translation!
-  await runConcurrentPool(batches, 6, async (batch) => {
+  await runConcurrentPool(batches, profile.gtxConcurrency, async (batch) => {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-    if (batch.length === 1 && batch[0].text.length > 2400) {
+    if (batch.length === 1 && batch[0].text.length > 3200) {
       const parts = batch[0].text.split(/(?<=[。！？.!?\n])/);
       const subChunks: string[] = [];
       let acc = '';
       for (const part of parts) {
-        if ((acc + part).length > 1500 && acc) {
+        if ((acc + part).length > 1800 && acc) {
           subChunks.push(acc);
           acc = part;
         } else {
@@ -711,7 +792,7 @@ async function translateBatchViaGoogleGtx(
       }
       if (acc) subChunks.push(acc);
       const translatedSubs = new Array<string>(subChunks.length).fill('');
-      await runConcurrentPool(subChunks, 4, async (sc, scIdx) => {
+      await runConcurrentPool(subChunks, Math.min(3, profile.gtxConcurrency), async (sc, scIdx) => {
         const r = await requestGtxSingleChunk(sc, src, tgt, signal);
         if (r.detected) detected = r.detected;
         translatedSubs[scIdx] = r.translated;
@@ -791,19 +872,25 @@ async function translateViaGeminiDirect(
     `Keep placeholders like [[E1]] verbatim in their natural grammatical position. Preserve line breaks. ` +
     `Return strict JSON: {"translations":[{"id":1,"text":"..."}]}`;
 
-  // Fast first chunk (14 items) for instant initial stream, followed by 40-item parallel chunks across 4 workers
+  if (geminiBreaker.isOpen()) {
+    throw new Error('Gemini cooldown active');
+  }
+
+  // Fast first chunk (16 items) for instant initial stream, followed by dense 55-item chunks (3x fewer RPM calls!)
+  const profile = getDeviceRuntimeProfile();
   const chunks: Array<{ start: number; slice: string[] }> = [];
   let pos = 0;
   while (pos < paragraphs.length) {
-    const size = chunks.length === 0 && paragraphs.length > 16 ? 14 : 40;
+    const size = chunks.length === 0 && paragraphs.length > 18 ? 16 : 55;
     chunks.push({ start: pos, slice: paragraphs.slice(pos, pos + size) });
     pos += size;
   }
 
   const allOut = new Array<string>(paragraphs.length);
-  await runConcurrentPool(chunks, 4, async ({ start, slice }) => {
+  await runConcurrentPool(chunks, profile.geminiConcurrency, async ({ start, slice }) => {
+    await geminiBucket.acquire(signal);
     const items = slice.map((text, idx) => ({ id: idx + 1, text }));
-    const resp = await fetch(
+    const resp = await fetchWithTimeout(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',
       {
         method: 'POST',
@@ -824,12 +911,22 @@ async function translateViaGeminiDirect(
             temperature: 0.2,
           },
         }),
-        signal,
-      }
+      },
+      18_000,
+      signal
     );
     if (!resp.ok) {
+      if (resp.status === 429 || resp.status >= 500) {
+        const retryMs = computeBackoffDelayMs(0, resp.headers.get('Retry-After'), 2000, 30_000);
+        geminiBucket.onThrottle(retryMs);
+        geminiBreaker.recordFailure(Math.max(retryMs, 25_000));
+      } else {
+        geminiBreaker.recordFailure();
+      }
       throw new Error(`Gemini HTTP ${resp.status}`);
     }
+    geminiBucket.onSuccess();
+    geminiBreaker.recordSuccess();
     const raw = await resp.json();
     const textPart = raw?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
     const parsed = JSON.parse(textPart);
@@ -1125,7 +1222,7 @@ export async function translateParagraphsDirect(params: {
   );
 
   if (mixedJaItems.length > 0) {
-    await runConcurrentPool(mixedJaItems, 6, async (item) => {
+    await runConcurrentPool(mixedJaItems, getDeviceRuntimeProfile().gtxConcurrency, async (item) => {
       const tr = await translateMixedCjkLineToTarget(item.masked, tgt, params.signal);
       const finalTxt = polishTranslatedProse(unmaskWithGlossary(tr, item.map), tgt);
       setCachedParaTranslation(item.cacheKey, finalTxt);
@@ -1153,18 +1250,37 @@ interface CachedWebEntry {
   novelNav: NovelNavigation;
   rawHtml?: string;
   rawMarkdown?: string;
+  htmlFetchAttempted?: boolean;
 }
 
-const webArticleCache = new Map<string, CachedWebEntry>();
+// Bounded O(1) LRU caches prevent unbounded RAM growth & mobile PWA OOM eviction during long reading sessions
+const initProfile = getDeviceRuntimeProfile();
+const webArticleCache = new BoundedLruCache<string, CachedWebEntry>(
+  Math.round(24 * initProfile.ramCacheScale)
+);
 const inFlightArticleFetches = new Map<string, Promise<CachedWebEntry>>();
-const translatedWebCache = new Map<string, { heading: string; paras: string[] }>();
+const translatedWebCache = new BoundedLruCache<string, { heading: string; paras: string[] }>(
+  Math.round(32 * initProfile.ramCacheScale)
+);
 const inFlightPreTranslations = new Set<string>();
-const translatedSiteHtmlCache = new Map<string, string>();
-const seriesTocCache = new Map<
+const translatedSiteHtmlCache = new BoundedLruCache<string, string>(
+  Math.round(16 * initProfile.ramCacheScale)
+);
+const seriesTocCache = new BoundedLruCache<
   string,
   { seriesTitle?: string; tocUrl: string; chapters: NovelChapterLink[] }
->();
-const translatedChapterTitlesCache = new Map<string, Record<string, string>>();
+>(24);
+const translatedChapterTitlesCache = new BoundedLruCache<string, Record<string, string>>(24);
+
+// Release excess RAM caches gracefully when mobile PWA or tab moves to background
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      translatedSiteHtmlCache.trimToRatio(0.4);
+      webArticleCache.trimToRatio(0.5);
+    }
+  });
+}
 
 const READING_PROGRESS_STORAGE_KEY = 'tranx_reading_progress_v1';
 const READING_PROGRESS_MAX = 60;
@@ -1371,15 +1487,22 @@ function hasMojibake(text: string): boolean {
 }
 
 function isChallengeOrBlockedPayload(title: string, html: string, content: string): boolean {
-  const head = `${title}\n${content.slice(0, 800)}\n${html.slice(0, 2200)}`;
+  const head = `${title}\n${content.slice(0, 1000)}\n${html.slice(0, 2800)}`;
   const hasChallengeMarker =
-    /just a moment\.\.\.|attention required!\s*\|\s*cloudflare|checking your browser|enable javascript and cookies to continue|cf-browser-verification|cf-challenge|challenge-platform|verify you are human|please complete the security check|ddos-guard|access denied\s*\|\s*cloudflare/i.test(
+    /just a moment\.\.\.|attention required!\s*\|\s*cloudflare|checking your browser|enable javascript and cookies to continue|cf-browser-verification|cf-challenge|challenge-platform|verify you are human|please complete the security check|ddos-guard|access denied\s*\|\s*cloudflare|generated by cloudfront|403\s+error\b|the request could not be satisfied|request blocked\.\s*we can['’]t connect to the server|cloudfront documentation|request unsuccessful\.\s*incapsula|access denied\b[\s\S]{0,220}reference\s*#|error\s+403\s+forbidden|<title>\s*(?:error:\s*the request could not be satisfied|403\s+(?:forbidden|error)|429\s+too many requests|503\s+service unavailable|access denied)\s*<\/title>/i.test(
       head
     );
   if (!hasChallengeMarker) return false;
-  // Only flag if body text is small (real articles discussing Cloudflare are long!)
-  if (content.length > 2500) return false;
-  if (html.length > 25000 && !/just a moment\.\.\.|attention required/i.test(title)) return false;
+  // Only flag if body text is small (real long articles discussing CloudFront/Cloudflare are > 3,500 chars!)
+  if (content.length > 3500) return false;
+  if (
+    html.length > 30000 &&
+    !/just a moment\.\.\.|attention required|the request could not be satisfied|403\s+(?:forbidden|error)|access denied/i.test(
+      title
+    )
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -2348,12 +2471,23 @@ async function fetchViaJinaInternal(
   if (options.noCache) {
     headers['X-No-Cache'] = 'true';
   }
-  const resp = await fetch(`https://r.jina.ai/${cleanUrl}`, {
-    method: 'GET',
-    headers,
-    signal: options.signal,
-  });
+  await jinaBucket.acquire(options.signal);
+  const resp = await fetchWithTimeout(
+    `https://r.jina.ai/${cleanUrl}`,
+    {
+      method: 'GET',
+      headers,
+    },
+    15_000,
+    options.signal
+  );
+  if (resp.status === 429 || resp.status >= 500) {
+    const retryMs = computeBackoffDelayMs(0, resp.headers.get('Retry-After'), 1000, 8000);
+    jinaBucket.onThrottle(retryMs);
+    return null;
+  }
   if (!resp.ok) return null;
+  jinaBucket.onSuccess();
   const ctype = resp.headers.get('content-type') || '';
   if (ctype.includes('application/json')) {
     const json = await resp.json();
@@ -2672,7 +2806,7 @@ export async function translateChapterTitlesDirect(params: {
   onProgress?: (partialMap: Record<string, string>, doneCount: number, totalCount: number) => void;
 }): Promise<Record<string, string>> {
   const { chapters, mode, titleId, tocKey, seriesTitle, signal, onProgress } = params;
-  if (!chapters.length) return {};
+  if (!chapters.length || isMockOnlyLocalE2E()) return {};
   const cacheKey = `${tocKey}::${mode}`;
   let initialMap = translatedChapterTitlesCache.get(cacheKey);
   if (!initialMap) {
@@ -2735,8 +2869,8 @@ export async function translateChapterTitlesDirect(params: {
     enqueueRange(0, uniqueChapters.length);
   }
 
-  // Process ALL pending chapters in fast 60-chapter parallel waves (2 concurrent waves x 6 GTX workers + L1/L2 cache!)
-  const WAVE_SIZE = 60;
+  // Process ALL pending chapters in dense 70-chapter waves (1 paced wave at a time across adaptive 2-4 GTX workers -> 92 chapters = only 4 HTTP requests, zero 429 risk for 5-10 users!)
+  const WAVE_SIZE = 70;
   const waveSpecs: Array<{ chapters: NovelChapterLink[]; includeSeries: boolean }> = [];
   const waveCount = Math.max(1, Math.ceil(priorityOrdered.length / WAVE_SIZE));
   for (let w = 0; w < waveCount; w += 1) {
@@ -2746,7 +2880,7 @@ export async function translateChapterTitlesDirect(params: {
     waveSpecs.push({ chapters: waveChapters, includeSeries });
   }
 
-  await runConcurrentPool(waveSpecs, 2, async ({ chapters: waveChapters, includeSeries }) => {
+  await runConcurrentPool(waveSpecs, 1, async ({ chapters: waveChapters, includeSeries }) => {
     if (signal?.aborted) return;
     const inputs = includeSeries
       ? [seriesTitle!.trim(), ...waveChapters.map((c) => c.title.trim())]
@@ -2833,22 +2967,35 @@ async function fetchRawHtmlViaCorsProxy(
   cleanUrl: string,
   signal?: AbortSignal
 ): Promise<string | null> {
-  const proxies = [
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`,
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`,
+  const proxies: Array<{ key: string; url: string }> = [
+    { key: 'allorigins', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}` },
+    { key: 'codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}` },
   ];
-  // Race proxies in parallel so one dead proxy never blocks another
-  const attempts = proxies.map(async (endpoint) => {
-    const resp = await fetch(endpoint, { method: 'GET', signal });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const html = await decodeHtmlResponseWithCharset(resp);
-    if (!html || !/<(html|body|article|div|p)\b/i.test(html)) {
-      throw new Error('Non-HTML payload');
+  const activeProxies = proxies.filter((p) => !getProxyBreaker(p.key).isOpen());
+  if (activeProxies.length === 0) return null;
+
+  // Race healthy proxies in parallel with per-proxy circuit breakers & CloudFront/WAF 403 rejection
+  const attempts = activeProxies.map(async ({ key, url: endpoint }) => {
+    const breaker = getProxyBreaker(key);
+    try {
+      const resp = await fetchWithTimeout(endpoint, { method: 'GET' }, 7000, signal);
+      if (!resp.ok) {
+        breaker.recordFailure();
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const html = await decodeHtmlResponseWithCharset(resp);
+      if (!html || !/<(html|body|article|div|p)\b/i.test(html)) {
+        throw new Error('Non-HTML payload');
+      }
+      if (isChallengeOrBlockedPayload('', html, '')) {
+        throw new Error('Blocked challenge/WAF payload');
+      }
+      breaker.recordSuccess();
+      return html;
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      throw err;
     }
-    if (isChallengeOrBlockedPayload('', html, '')) {
-      throw new Error('Blocked challenge payload');
-    }
-    return html;
   });
 
   try {
@@ -2939,11 +3086,15 @@ function cleanReaderMarkdownToParagraphs(md: string, titleHint = ''): string[] {
 
 async function fetchWebArticleDirect(
   rawUrl: string,
-  options?: { needRawHtml?: boolean }
+  options?: { needRawHtml?: boolean; signal?: AbortSignal }
 ): Promise<CachedWebEntry> {
   const cleanUrl = normalizeWebUrl(rawUrl);
   let cached = webArticleCache.get(cleanUrl);
-  if (cached && (!options?.needRawHtml || cached.rawHtml)) {
+  if (cached?.rawHtml && isChallengeOrBlockedPayload('', cached.rawHtml, '')) {
+    cached = { ...cached, rawHtml: undefined, htmlFetchAttempted: true };
+    webArticleCache.set(cleanUrl, cached);
+  }
+  if (cached && (!options?.needRawHtml || cached.rawHtml || cached.htmlFetchAttempted)) {
     return cached;
   }
 
@@ -2954,10 +3105,20 @@ async function fetchWebArticleDirect(
       6 * 60 * 60 * 1000
     );
     if (idbArticle && Array.isArray(idbArticle.srcParas) && idbArticle.srcParas.length > 0) {
-      webArticleCache.set(cleanUrl, idbArticle);
-      webArticleCache.set(idbArticle.url, idbArticle);
-      cached = idbArticle;
-      if (!options?.needRawHtml || cached.rawHtml) {
+      // Self-heal any poisoned CloudFront/WAF 403 rawHtml stored from earlier sessions
+      const cleanRawHtml =
+        idbArticle.rawHtml && !isChallengeOrBlockedPayload('', idbArticle.rawHtml, '')
+          ? idbArticle.rawHtml
+          : undefined;
+      const sanitizedEntry: CachedWebEntry = {
+        ...idbArticle,
+        rawHtml: cleanRawHtml,
+        htmlFetchAttempted: true,
+      };
+      webArticleCache.set(cleanUrl, sanitizedEntry);
+      webArticleCache.set(sanitizedEntry.url, sanitizedEntry);
+      cached = sanitizedEntry;
+      if (!options?.needRawHtml || cached.rawHtml || cached.htmlFetchAttempted) {
         return cached;
       }
     }
@@ -2979,10 +3140,15 @@ async function fetchWebArticleDirect(
 async function fetchWebArticleDirectInner(
   cleanUrl: string,
   cached: CachedWebEntry | undefined,
-  options?: { needRawHtml?: boolean }
+  options?: { needRawHtml?: boolean; signal?: AbortSignal }
 ): Promise<CachedWebEntry> {
   const host = new URL(cleanUrl).hostname;
   const ctrl = new AbortController();
+  const onOuterAbort = () => ctrl.abort();
+  if (options?.signal) {
+    if (options.signal.aborted) ctrl.abort();
+    else options.signal.addEventListener('abort', onOuterAbort, { once: true });
+  }
   const timer = window.setTimeout(() => ctrl.abort(), 24000);
 
   try {
@@ -3101,13 +3267,19 @@ async function fetchWebArticleDirectInner(
       }
     }
 
-    // Secondary Fallback: Parallel charset-aware CORS HTML proxies when still empty or raw HTML needed for view=site
-    if (!rawHtml && (srcParas.length === 0 || (options?.needRawHtml && srcParas.length < 2))) {
+    // Secondary Fallback: Parallel charset-aware CORS HTML proxies ONLY when prose is still empty (never overwrite working Ebook prose with a CloudFront 403 shell!)
+    if (!rawHtml && srcParas.length === 0) {
       const htmlCtrl = new AbortController();
+      const onInnerAbort = () => htmlCtrl.abort();
+      ctrl.signal.addEventListener('abort', onInnerAbort, { once: true });
       const htmlTimer = window.setTimeout(() => htmlCtrl.abort(), 7000);
       try {
         const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, htmlCtrl.signal);
-        if (fetched && !hasMojibake(fetched.slice(0, 2000))) {
+        if (
+          fetched &&
+          !hasMojibake(fetched.slice(0, 2000)) &&
+          !isChallengeOrBlockedPayload('', fetched, '')
+        ) {
           rawHtml = fetched;
           const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
           navFromHtml = extractNovelNavigationFromHtml(doc, rawHtml, finalUrl, jinaLinks);
@@ -3122,13 +3294,19 @@ async function fetchWebArticleDirectInner(
         // Ignore slow proxy fallback
       } finally {
         window.clearTimeout(htmlTimer);
+        ctrl.signal.removeEventListener('abort', onInnerAbort);
       }
+    }
+
+    // Never keep blocked CloudFront/Cloudflare/WAF HTML in rawHtml
+    if (rawHtml && isChallengeOrBlockedPayload('', rawHtml, '')) {
+      rawHtml = '';
     }
 
     if (srcParas.length === 0) {
       if (hitAntiBotChallenge) {
         throw new Error(
-          `Situs ${host} memasang verifikasi keamanan / anti-bot (Cloudflare) sehingga konten tidak dapat diambil otomatis. Buka situs asli atau salin teks halaman langsung ke tab Teks.`
+          `Situs ${host} memasang verifikasi keamanan / anti-bot (Cloudflare / CloudFront WAF) sehingga konten tidak dapat diambil otomatis. Buka situs asli atau salin teks halaman langsung ke tab Teks.`
         );
       }
       throw new Error(
@@ -3178,6 +3356,7 @@ async function fetchWebArticleDirectInner(
       novelNav: mergedNav,
       rawHtml: rawHtml || undefined,
       rawMarkdown: rawMarkdown || undefined,
+      htmlFetchAttempted: true,
     };
     webArticleCache.set(cleanUrl, entry);
     webArticleCache.set(finalUrl, entry);
@@ -3193,17 +3372,23 @@ async function fetchWebArticleDirectInner(
     }
     return entry;
   } catch (err) {
+    if (options?.signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
     if ((err as { name?: string })?.name === 'AbortError') {
       throw new Error(`Waktu tunggu habis saat mengambil halaman ${host}. Coba lagi.`);
     }
     throw err;
   } finally {
     window.clearTimeout(timer);
+    if (options?.signal) {
+      options.signal.removeEventListener('abort', onOuterAbort);
+    }
   }
 }
 
 export function prefetchWebArticleDirect(rawUrl?: string | null): void {
-  if (!rawUrl) return;
+  if (!rawUrl || isMockOnlyLocalE2E()) return;
   const safe = toSafeHttpUrl(rawUrl);
   if (!safe || webArticleCache.has(safe)) return;
   fetchWebArticleDirect(safe).catch(() => {});
@@ -3220,7 +3405,7 @@ export function prefetchNextChapterTranslatedDirect(
   view: 'reader' | 'site' = 'reader',
   theme?: 'Terang' | 'Gelap'
 ): void {
-  if (!rawUrl) return;
+  if (!rawUrl || isMockOnlyLocalE2E() || !getDeviceRuntimeProfile().allowBackgroundPrefetch) return;
   const safe = toSafeHttpUrl(rawUrl);
   if (!safe) return;
   const cacheKey = `${safe}::${mode}::${view}`;
@@ -3297,6 +3482,7 @@ function prewarmCurrentSiteHtmlDirect(params: {
   translatedParas: string[];
   theme?: 'Terang' | 'Gelap';
 }): void {
+  if (!getDeviceRuntimeProfile().allowBackgroundPrefetch) return;
   const cacheKey = `${params.article.url}::${params.mode}::${params.theme || 'auto'}::site`;
   if (translatedSiteHtmlCache.has(cacheKey) || inFlightPreTranslations.has(cacheKey)) return;
   inFlightPreTranslations.add(cacheKey);
@@ -3453,8 +3639,9 @@ async function buildTranslatedSiteHtmlDirect(params: {
   translatedHeading: string;
   translatedParas: string[];
   theme?: 'Terang' | 'Gelap';
+  signal?: AbortSignal;
 }): Promise<string> {
-  const { article, mode, translatedHeading, translatedParas, theme } = params;
+  const { article, mode, translatedHeading, translatedParas, theme, signal } = params;
   const cacheKey = `${article.url}::${mode}::${theme || 'auto'}::site`;
   const cachedHtml = translatedSiteHtmlCache.get(cacheKey);
   if (cachedHtml) return cachedHtml;
@@ -3488,7 +3675,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
         </div>`
       : '';
 
-  if (article.rawHtml) {
+  if (article.rawHtml && !isChallengeOrBlockedPayload('', article.rawHtml, '')) {
     const doc = new DOMParser().parseFromString(article.rawHtml, 'text/html');
 
     // Remove all executable/embedded/redirect tags AND JS-only loading curtains that stay white without JS
@@ -3722,6 +3909,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
           paragraphs: pendingTexts,
           mode,
           titleId: params.titleId || article.titleId,
+          signal,
         });
         pendingNodes.forEach((tn, idx) => {
           if (outputs[idx]) {
@@ -3834,10 +4022,12 @@ export async function directFetchWebReaderBundle(params: {
   titleId?: string;
   view: 'reader' | 'site' | 'original';
   theme?: 'Terang' | 'Gelap';
+  signal?: AbortSignal;
   onProgress?: (partialBundle: WebReaderBundle, doneCount: number, totalCount: number) => void;
 }): Promise<WebReaderBundle> {
   const article = await fetchWebArticleDirect(params.url, {
     needRawHtml: params.view === 'site',
+    signal: params.signal,
   });
   const tid = params.titleId || article.titleId;
   const cappedSrc = article.srcParas.slice(0, 180);
@@ -3848,7 +4038,27 @@ export async function directFetchWebReaderBundle(params: {
   if (params.view !== 'original') {
     const cacheKey1 = `${article.url}::${params.mode}`;
     const cacheKey2 = `${normalizeWebUrl(params.url)}::${params.mode}`;
-    const preTranslated = translatedWebCache.get(cacheKey1) || translatedWebCache.get(cacheKey2);
+    let preTranslated = translatedWebCache.get(cacheKey1) || translatedWebCache.get(cacheKey2);
+    if (!preTranslated) {
+      const idbTr =
+        (await idbGet<{ heading: string; paras: string[] }>(
+          'articles',
+          `tr::${cacheKey1}`,
+          12 * 60 * 60 * 1000
+        )) ||
+        (cacheKey2 !== cacheKey1
+          ? await idbGet<{ heading: string; paras: string[] }>(
+              'articles',
+              `tr::${cacheKey2}`,
+              12 * 60 * 60 * 1000
+            )
+          : undefined);
+      if (idbTr && Array.isArray(idbTr.paras) && idbTr.paras.length >= cappedSrc.length) {
+        preTranslated = idbTr;
+        translatedWebCache.set(cacheKey1, idbTr);
+        translatedWebCache.set(cacheKey2, idbTr);
+      }
+    }
     if (preTranslated) {
       titleDst = preTranslated.heading;
       translatedParas = preTranslated.paras;
@@ -3859,6 +4069,7 @@ export async function directFetchWebReaderBundle(params: {
         paragraphs: batch,
         mode: params.mode,
         titleId: tid,
+        signal: params.signal,
         onProgress:
           params.onProgress && params.view === 'reader'
             ? (partialOutputs, doneCount, totalCount) => {
@@ -3903,8 +4114,10 @@ export async function directFetchWebReaderBundle(params: {
       });
       titleDst = outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
       translatedParas = outputs.slice(1).map((s) => s.replace(/^#{1,6}\s+/, ''));
-      translatedWebCache.set(cacheKey1, { heading: titleDst, paras: translatedParas });
-      translatedWebCache.set(cacheKey2, { heading: titleDst, paras: translatedParas });
+      const savedTr = { heading: titleDst, paras: translatedParas };
+      translatedWebCache.set(cacheKey1, savedTr);
+      translatedWebCache.set(cacheKey2, savedTr);
+      void idbPut('articles', `tr::${cacheKey1}`, savedTr);
     }
   }
 
@@ -3923,6 +4136,7 @@ export async function directFetchWebReaderBundle(params: {
       translatedHeading: titleDst,
       translatedParas,
       theme: params.theme,
+      signal: params.signal,
     });
   } else if (params.view === 'reader' && article.rawHtml) {
     // Silently pre-warm Site HTML in background idle time so tapping Ebook -> Site switches instantaneously!

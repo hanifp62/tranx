@@ -849,6 +849,7 @@ export async function fetchWebReaderBundle(params: {
   titleId?: string;
   view: 'reader' | 'site' | 'original';
   theme?: 'Terang' | 'Gelap';
+  signal?: AbortSignal;
   onProgress?: (partialBundle: WebReaderBundle, doneCount: number, totalCount: number) => void;
 }): Promise<WebReaderBundle> {
   const cleanUrl = normalizeWebUrl(params.url);
@@ -949,6 +950,7 @@ export async function fetchWebReaderBundle(params: {
     titleId: params.titleId,
     view: params.view,
     theme: params.theme,
+    signal: params.signal,
     onProgress: params.onProgress,
   });
 }

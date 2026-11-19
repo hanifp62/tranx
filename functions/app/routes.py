@@ -7,7 +7,9 @@ import json
 import os
 import secrets
 import tempfile
+import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -97,6 +99,37 @@ def _ndjson_line(event: dict[str, Any]) -> str:
     return json.dumps(event, ensure_ascii=False) + "\n"
 
 
+class _SlidingWindowRateLimiter:
+    """Thread-safe sliding-window rate limiter protecting 5-10+ concurrent users & auth endpoints."""
+
+    def __init__(self, *, default_rpm: int = 120, auth_rpm: int = 15, window_sec: float = 60.0) -> None:
+        self._default_rpm = max(1, default_rpm)
+        self._auth_rpm = max(1, auth_rpm)
+        self._window_sec = max(1.0, window_sec)
+        self._lock = threading.Lock()
+        self._hits: dict[str, deque[float]] = {}
+
+    def check(self, key: str, *, is_auth: bool = False) -> tuple[bool, int, int, int]:
+        limit = self._auth_rpm if is_auth else self._default_rpm
+        now = time.monotonic()
+        cutoff = now - self._window_sec
+        with self._lock:
+            bucket = self._hits.setdefault(key, deque())
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if len(bucket) >= limit:
+                retry_after = max(1, int(self._window_sec - (now - bucket[0])) + 1)
+                return False, 0, limit, retry_after
+            bucket.append(now)
+            remaining = max(0, limit - len(bucket))
+            # Bound tracked key map to avoid memory growth under IP churn
+            if len(self._hits) > 512:
+                stale_keys = [k for k, q in self._hits.items() if not q or q[-1] <= cutoff]
+                for sk in stale_keys:
+                    self._hits.pop(sk, None)
+            return True, remaining, limit, 0
+
+
 def create_flask_app(
     repo: Repository,
     *,
@@ -105,16 +138,49 @@ def create_flask_app(
     vision_extractor_factory: Callable[[str], VisionExtractor] | None = None,
     speech_transcriber_factory: Callable[[str], SpeechTranscriber] | None = None,
     web_fetcher: Any = fetch_url_safely,
+    rate_limit_rpm: int = 120,
+    auth_rate_limit_rpm: int = 15,
 ) -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_HTTP_PAYLOAD_BYTES
     shared_cache = LayeredTranslationCache(repo.cache_store)
     usage_adapter = _RepoUsageAdapter(repo)
+    rate_limiter = _SlidingWindowRateLimiter(
+        default_rpm=rate_limit_rpm,
+        auth_rpm=auth_rate_limit_rpm,
+    )
 
     @app.before_request
-    def _handle_options_preflight() -> tuple[str, int] | None:
+    def _handle_options_and_rate_limit() -> Any:
         if request.method == "OPTIONS":
             return "", 204
+        if request.path == "/v1/healthz":
+            return None
+        client_ip = (
+            (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            or request.remote_addr
+            or "unknown"
+        )
+        is_auth_ep = request.path.startswith("/v1/auth:pair")
+        bucket_key = f"{'auth' if is_auth_ep else 'api'}:{client_ip}"
+        allowed, remaining, limit, retry_after = rate_limiter.check(bucket_key, is_auth=is_auth_ep)
+        request.environ["tranx.rl_limit"] = str(limit)
+        request.environ["tranx.rl_remaining"] = str(remaining)
+        if not allowed:
+            resp = jsonify(
+                {
+                    "error": {
+                        "code": "RATE_LIMITED",
+                        "message": "Terlalu banyak permintaan dalam waktu singkat. Coba lagi sebentar.",
+                        "retryAfter": retry_after,
+                    }
+                }
+            )
+            resp.status_code = 429
+            resp.headers["Retry-After"] = str(retry_after)
+            resp.headers["X-RateLimit-Limit"] = str(limit)
+            resp.headers["X-RateLimit-Remaining"] = "0"
+            return resp
         return None
 
     @app.after_request
@@ -136,6 +202,9 @@ def create_flask_app(
         )
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
         resp.headers.setdefault("X-Frame-Options", "DENY")
+        if "tranx.rl_limit" in request.environ:
+            resp.headers.setdefault("X-RateLimit-Limit", request.environ["tranx.rl_limit"])
+            resp.headers.setdefault("X-RateLimit-Remaining", request.environ["tranx.rl_remaining"])
         return resp
 
     @app.errorhandler(AuthError)

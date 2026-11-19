@@ -737,6 +737,7 @@ export function TranslatedWebViewer({
 
   useEffect(() => {
     let active = true;
+    const ctrl = new AbortController();
     setLoading(true);
     setStreamProgress(null);
     setErrorMsg(null);
@@ -751,22 +752,23 @@ export function TranslatedWebViewer({
       titleId,
       view,
       theme: resolvedTheme,
+      signal: ctrl.signal,
       onProgress: (partial, doneCount, totalCount) => {
-        if (!active) return;
+        if (!active || ctrl.signal.aborted) return;
         setBundle(partial);
         setLoading(false);
         setStreamProgress(doneCount < totalCount ? { done: doneCount, total: totalCount } : null);
       },
     })
       .then((res) => {
-        if (active) {
+        if (active && !ctrl.signal.aborted) {
           setBundle(res);
           setLoading(false);
           setStreamProgress(null);
         }
       })
       .catch((err) => {
-        if (active) {
+        if (active && !ctrl.signal.aborted && (err as { name?: string })?.name !== 'AbortError') {
           setErrorMsg(
             err instanceof Error ? err.message : 'Halaman web tidak dapat dimuat.'
           );
@@ -776,6 +778,7 @@ export function TranslatedWebViewer({
       });
     return () => {
       active = false;
+      ctrl.abort();
     };
   }, [user, url, mode, titleId, view, resolvedTheme]);
 
@@ -817,7 +820,14 @@ export function TranslatedWebViewer({
 
   // Auto-translate 100% of ALL chapter titles + seriesTitle strictly matching the active target mode
   useEffect(() => {
-    if (!nav?.chapters || nav.chapters.length === 0 || view === 'original') {
+    const isMockOnlyE2E =
+      typeof window !== 'undefined' &&
+      (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') &&
+      (new URLSearchParams(window.location.search).get('e2e') === '1' ||
+        window.sessionStorage.getItem('tranx_e2e') === '1') &&
+      new URLSearchParams(window.location.search).get('direct') !== '1' &&
+      window.sessionStorage.getItem('tranx_e2e_direct') !== '1';
+    if (!nav?.chapters || nav.chapters.length === 0 || view === 'original' || isMockOnlyE2E) {
       setChapterTranslateProgress(null);
       return;
     }
