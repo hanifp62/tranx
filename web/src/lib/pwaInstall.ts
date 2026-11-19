@@ -7,9 +7,15 @@ export interface BeforeInstallPromptEvent extends Event {
 export interface PwaInstallState {
   canNativePrompt: boolean;
   isInstalled: boolean;
+  shouldShowInstallButton: boolean;
   isIosSafari: boolean;
   isMacSafari: boolean;
   isAndroid: boolean;
+}
+
+interface EarlyPwaStore {
+  deferredPrompt: BeforeInstallPromptEvent | null;
+  appInstalled: boolean;
 }
 
 const LEGACY_INSTALLED_KEY = 'tranx_pwa_installed_device_v1';
@@ -38,7 +44,6 @@ function detectStandaloneInstalled(): boolean {
 function readInstalledRecord(): { installedAt: number } | null {
   if (typeof window === 'undefined') return null;
   try {
-    // Purge legacy v1 key that could remain permanently stuck after Android PWA uninstall
     if (window.localStorage.getItem(LEGACY_INSTALLED_KEY) !== null) {
       window.localStorage.removeItem(LEGACY_INSTALLED_KEY);
     }
@@ -79,9 +84,14 @@ function writeInstalledDeviceFlag(installed: boolean): void {
   }
 }
 
-function detectPlatform(): { isIosSafari: boolean; isMacSafari: boolean; isAndroid: boolean } {
+function detectPlatform(): {
+  isIosSafari: boolean;
+  isMacSafari: boolean;
+  isAndroid: boolean;
+  isChromiumDesktop: boolean;
+} {
   if (typeof navigator === 'undefined') {
-    return { isIosSafari: false, isMacSafari: false, isAndroid: false };
+    return { isIosSafari: false, isMacSafari: false, isAndroid: false, isChromiumDesktop: false };
   }
   const ua = navigator.userAgent || '';
   const isAndroid = /Android/i.test(ua);
@@ -90,19 +100,33 @@ function detectPlatform(): { isIosSafari: boolean; isMacSafari: boolean; isAndro
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const isWebKitSafari = /Safari/i.test(ua) && !/Chrome|CriOS|FxiOS|Edg|OPR|Android/i.test(ua);
   const isMac = /Macintosh|Mac OS X/i.test(ua) && !isIos;
+  const isChromium = /Chrome|Chromium|Edg\/|OPR\//i.test(ua) && !/Firefox|FxiOS/i.test(ua);
+  const isChromiumDesktop = isChromium && !isAndroid && !isIos;
   return {
     isIosSafari: isIos && isWebKitSafari,
     isMacSafari: isMac && isWebKitSafari,
     isAndroid,
+    isChromiumDesktop,
   };
 }
 
 export function getPwaInstallState(): PwaInstallState {
-  const { isIosSafari, isMacSafari, isAndroid } = detectPlatform();
+  const { isIosSafari, isMacSafari, isAndroid, isChromiumDesktop } = detectPlatform();
   const isStandalone = detectStandaloneInstalled();
+  const canNativePrompt = deferredPrompt !== null;
+  const isInstalled = installedFlag || isStandalone || readInstalledDeviceFlag();
+
+  // On Desktop Chrome/Edge/Brave, Chrome fires beforeinstallprompt when uninstalled and suppresses it
+  // when already installed ("Open in app" in address bar). Showing Install only when canNativePrompt is true
+  // guarantees 1-click direct native installation and hides the button automatically when already installed!
+  // On Android & Safari/Firefox, show when !isInstalled (1-click when prompt ready, platform guide otherwise).
+  const shouldShowInstallButton =
+    !isInstalled && (canNativePrompt || !isChromiumDesktop);
+
   return {
-    canNativePrompt: deferredPrompt !== null,
-    isInstalled: installedFlag || isStandalone || readInstalledDeviceFlag(),
+    canNativePrompt,
+    isInstalled,
+    shouldShowInstallButton,
     isIosSafari,
     isMacSafari,
     isAndroid,
@@ -129,9 +153,14 @@ export function refreshInstalledRelatedApps(): void {
   };
   if (typeof navWithRelated.getInstalledRelatedApps !== 'function') return;
 
-  const isAuthoritativeOrigin =
-    RELATED_APP_ORIGINS.has(window.location.origin) ||
-    Boolean((window as unknown as { __tranxMockRelatedApps?: boolean }).__tranxMockRelatedApps);
+  const { isAndroid } = detectPlatform();
+  const isMockRelated = Boolean(
+    (window as unknown as { __tranxMockRelatedApps?: boolean }).__tranxMockRelatedApps
+  );
+  // getInstalledRelatedApps() for webapp platform is authoritative on Android Chrome WebAPKs
+  // (Desktop Chrome can return [] even while the desktop PWA is installed and showing "Open in app").
+  const canClearFromEmpty =
+    isMockRelated || (isAndroid && RELATED_APP_ORIGINS.has(window.location.origin));
 
   navWithRelated
     .getInstalledRelatedApps()
@@ -144,9 +173,7 @@ export function refreshInstalledRelatedApps(): void {
         emit();
         return;
       }
-      // OS confirmed the PWA is NOT installed (e.g. user uninstalled it on Android Chrome to reinstall!):
-      // Clear any stale local flag outside the brief post-install WebAPK minting grace window.
-      if (isAuthoritativeOrigin && !detectStandaloneInstalled()) {
+      if (canClearFromEmpty && !detectStandaloneInstalled()) {
         const rec = readInstalledRecord();
         const withinGrace = Boolean(rec && Date.now() - rec.installedAt < POST_INSTALL_GRACE_MS);
         if (!withinGrace && (installedFlag || rec !== null)) {
@@ -162,14 +189,26 @@ export function refreshInstalledRelatedApps(): void {
 export function initPwaInstallCapture(): void {
   if (initialized || typeof window === 'undefined') return;
   initialized = true;
-  installedFlag = detectStandaloneInstalled() || readInstalledDeviceFlag();
-  if (detectStandaloneInstalled()) {
+
+  // Adopt any beforeinstallprompt / appinstalled captured synchronously by /pwa-capture.js in <head>
+  const early = (window as unknown as { __tranxEarlyPwa?: EarlyPwaStore }).__tranxEarlyPwa;
+  if (early?.deferredPrompt) {
+    deferredPrompt = early.deferredPrompt;
+    early.deferredPrompt = null;
+    installedFlag = false;
+    writeInstalledDeviceFlag(false);
+  } else if (early?.appInstalled) {
+    installedFlag = true;
     writeInstalledDeviceFlag(true);
+  } else {
+    installedFlag = detectStandaloneInstalled() || readInstalledDeviceFlag();
+    if (detectStandaloneInstalled()) {
+      writeInstalledDeviceFlag(true);
+    }
   }
 
   refreshInstalledRelatedApps();
 
-  // Re-check OS install state when returning to the browser tab (detects uninstall right away!)
   window.addEventListener('focus', () => refreshInstalledRelatedApps());
   window.addEventListener('pageshow', () => refreshInstalledRelatedApps());
   if (typeof document !== 'undefined') {

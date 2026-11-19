@@ -1939,31 +1939,19 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect((await page.request.get('/screenshots/mobile-narrow.png')).status()).toBe(200);
     expect(manifest.shortcuts?.length).toBeGreaterThanOrEqual(3);
 
-    // 4. Verify persistent Install App button (no notification banner): visible when NOT installed, disappears when installed, reappears if uninstalled!
+    // 4. Verify persistent Install App button (no notification banner):
+    //    - On Desktop Chromium when Chrome suppresses beforeinstallprompt (e.g. already installed "Open in app"), button stays HIDDEN (no fake guide popup!)
+    //    - The moment beforeinstallprompt fires (uninstalled / reinstallable), button appears & 1-click triggers native prompt() directly!
+    //    - Once accepted, button disappears immediately & stays hidden after reload; if uninstalled later & beforeinstallprompt fires again, it reappears!
     await page.goto('/?e2e=1');
     await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toBeVisible();
     await expect(page.locator('.pwa-install-banner')).toHaveCount(0);
 
     const headerInstallBtn = page.locator('.stage-header').getByRole('button', { name: 'Pasang aplikasi' });
-    await expect(headerInstallBtn).toBeVisible();
+    // Before beforeinstallprompt on Desktop Chromium -> hidden (matches Chrome "Open in app" state)
+    await expect(headerInstallBtn).toHaveCount(0);
 
-    // Without beforeinstallprompt, clicking Install App button opens platform install guide dialog
-    await headerInstallBtn.click();
-    await expect(page.getByRole('heading', { name: 'Cara memasang aplikasi tranX' })).toBeVisible();
-    await page.keyboard.press('Escape');
-
-    // Account menu also shows "Pasang aplikasi" while not installed
-    await page.locator('.account-row-btn').click();
-    await expect(page.getByRole('menuitem', { name: 'Pasang aplikasi' })).toBeVisible();
-    await page.keyboard.press('Escape');
-
-    // Axe WCAG 2.2 AA check with Install App button visible in header
-    const axeInstall = await new AxeBuilder({ page })
-      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
-      .analyze();
-    expect(axeInstall.violations).toEqual([]);
-
-    // Simulate browser firing native beforeinstallprompt -> clicking header button invokes native prompt() and hides button once installed!
+    // Browser fires native beforeinstallprompt -> header & account Install buttons appear immediately!
     await page.evaluate(() => {
       const ev = new Event('beforeinstallprompt', { cancelable: true }) as Event & {
         prompt?: () => Promise<void>;
@@ -1977,11 +1965,24 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       window.dispatchEvent(ev);
     });
 
+    await expect(headerInstallBtn).toBeVisible();
+    await page.locator('.account-row-btn').click();
+    await expect(page.getByRole('menuitem', { name: 'Pasang aplikasi' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    // Axe WCAG 2.2 AA check with Install App button visible in header
+    const axeInstall = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeInstall.violations).toEqual([]);
+
+    // 1-click direct native install (NO guide modal shown!) -> invokes prompt() & hides button once accepted!
     await headerInstallBtn.click();
     const promptInvoked = await page.evaluate(
       () => (window as unknown as { __pwaPromptCalled?: boolean }).__pwaPromptCalled
     );
     expect(promptInvoked).toBe(true);
+    await expect(page.getByRole('heading', { name: 'Cara memasang aplikasi tranX' })).toHaveCount(0);
     await expect(headerInstallBtn).toHaveCount(0);
     await expect(page.getByText('tranX berhasil dipasang sebagai aplikasi!')).toBeVisible();
 
@@ -2005,8 +2006,15 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     });
     await expect(headerInstallBtn).toBeVisible();
 
-    // 5. Verify mobile 390px reinstall recovery: stale legacy v1 installed flag is auto-cleared, and OS getInstalledRelatedApps()=[] restores BOTH mobile header & hamburger drawer install buttons!
+    // 5. Verify Android mobile 390px reinstall recovery: stale legacy v1 installed flag is auto-cleared, and OS getInstalledRelatedApps()=[] restores BOTH mobile header & hamburger drawer install buttons!
     await page.setViewportSize({ width: 390, height: 844 });
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'userAgent', {
+        configurable: true,
+        value:
+          'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
+      });
+    });
     await page.evaluate(() => {
       window.localStorage.setItem('tranx_pwa_installed_device_v1', '1');
       window.localStorage.setItem(

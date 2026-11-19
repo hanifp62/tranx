@@ -2015,7 +2015,7 @@ export function App() {
             <span>{strings.sidebarMore}</span>
           </button>
 
-          {isMobile && !pwaState.isInstalled && (
+          {isMobile && pwaState.shouldShowInstallButton && (
             <button
               type="button"
               className="sidebar-nav-btn pressable"
@@ -2230,7 +2230,7 @@ export function App() {
           </div>
 
           <div className="header-right">
-            {!pwaState.isInstalled &&
+            {pwaState.shouldShowInstallButton &&
               (isMobile ? (
                 <button
                   type="button"
@@ -3087,7 +3087,7 @@ export function App() {
                 </span>
               </button>
 
-              {!pwaState.isInstalled && (
+              {pwaState.shouldShowInstallButton && (
                 <button
                   type="button"
                   role="menuitem"
@@ -3426,7 +3426,7 @@ export function App() {
                 {settings.uiLang === 'id' ? 'ID \u2192 EN' : 'EN \u2192 ID'}
               </span>
             </button>
-            {!pwaState.isInstalled && (
+            {pwaState.shouldShowInstallButton && (
               <button
                 type="button"
                 className="sheet-row-btn"
