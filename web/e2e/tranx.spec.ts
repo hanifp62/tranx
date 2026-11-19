@@ -42,12 +42,21 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     // 1. Verify greeting & empty stage
     await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toBeVisible();
 
-    // 2. Verify Desktop geometry: K/Bilah mode sits BELOW K/Composer
+    // 2. Verify Desktop geometry: K/Bilah mode sits BELOW K/Composer & 56px optical top rail aligns sidebar + header
     const composerBox = await page.locator('.composer-slot').boundingBox();
     const modeBarBox = await page.locator('.mode-bar-slot').boundingBox();
     expect(composerBox).not.toBeNull();
     expect(modeBarBox).not.toBeNull();
     expect(modeBarBox!.y).toBeGreaterThan(composerBox!.y);
+    const sidebarTopBox = await page.locator('.sidebar-top-row').boundingBox();
+    const stageHeaderBox = await page.locator('.stage-header').boundingBox();
+    expect(sidebarTopBox).not.toBeNull();
+    expect(stageHeaderBox).not.toBeNull();
+    expect(Math.abs(sidebarTopBox!.height - stageHeaderBox!.height)).toBeLessThanOrEqual(2);
+    const desktopOverflow1280 = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(desktopOverflow1280).toBe(false);
 
     // 3. Verify WCAG AA Axe-Core on Terang
     const axeLight = await new AxeBuilder({ page })
@@ -248,9 +257,28 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.getByRole('heading', { name: 'Chapter 1: Rain at Rashomon' })).toBeVisible();
     await page.getByLabel('Pasangan bahasa').selectOption('auto-id');
     await expect(page.getByRole('heading', { name: 'Bab 1: Hujan di Rashomon' })).toBeVisible();
-    // Toggle Berdampingan (bilingual)
+    // Verify Desktop /web 3-zone topbar stays single-row (<= 64px) and zero horizontal overflow!
+    const desktopWebTopbar = await page.locator('.web-viewer-topbar').boundingBox();
+    expect(desktopWebTopbar).not.toBeNull();
+    expect(desktopWebTopbar!.height).toBeLessThanOrEqual(66);
+    const webOverflow1280 = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(webOverflow1280).toBe(false);
+    await page.screenshot({
+      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_desktop_web_reader_1280.png',
+    });
+    // Toggle Berdampingan (bilingual) -> verify TRUE 2-column side-by-side layout on Desktop (>= 1024px)!
     await page.getByRole('button', { name: 'Berdampingan' }).click();
     await expect(page.getByText('千早は小さく笑った。')).toBeVisible();
+    const biSrcBox = await page.locator('.bilingual-pair-card .bilingual-pair-src').first().boundingBox();
+    const biDstBox = await page.locator('.bilingual-pair-card .novel-reader-para').first().boundingBox();
+    expect(biSrcBox).not.toBeNull();
+    expect(biDstBox).not.toBeNull();
+    expect(biDstBox!.x).toBeGreaterThan(biSrcBox!.x + 200);
+    await page.screenshot({
+      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_desktop_web_bilingual_1280.png',
+    });
     // Click Bab berikutnya -> navigates directly to Chapter 2 without re-entering any URL
     await page.locator('.novel-chapter-dock').getByRole('button', { name: /Bab berikutnya/ }).click();
     await expect(page.getByRole('heading', { name: 'Bab 2: Lentera di Kyoto' })).toBeVisible();

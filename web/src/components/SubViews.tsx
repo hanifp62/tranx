@@ -1011,57 +1011,64 @@ export function TranslatedWebViewer({
             </button>
           </div>
         ) : (
-          <>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+          <div className="reader-desktop-bar">
+            <div className="reader-desktop-left">
               <button
                 type="button"
-                className="btn-secondary pressable"
+                className="btn-secondary pressable reader-back-btn"
                 onClick={() => onNavigate(backPath)}
               >
-                {strings.backBtn}
+                <span aria-hidden="true">{'\u2190'}</span>
+                <span>{strings.backBtn}</span>
               </button>
-              <div style={{ display: 'inline-flex', gap: '4px', flexWrap: 'wrap' }}>
+
+              <span className="reader-toolbar-divider" aria-hidden="true" />
+
+              <div className="reader-desktop-seg" role="group" aria-label={strings.readerModeTab}>
                 <button
                   type="button"
-                  className={view === 'reader' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  aria-pressed={view === 'reader'}
+                  className={`reader-desktop-seg-btn pressable ${view === 'reader' ? 'active' : ''}`}
                   onClick={() => setView('reader')}
                 >
                   <IconBook size={15} />
-                  {strings.readerModeTab}
+                  <span>{strings.readerModeTab}</span>
                 </button>
                 <button
                   type="button"
-                  className={view === 'site' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  aria-pressed={view === 'site'}
+                  className={`reader-desktop-seg-btn pressable ${view === 'site' ? 'active' : ''}`}
                   onClick={() => setView('site')}
                 >
                   <IconGlobe size={15} />
-                  {strings.translatedSiteTab}
+                  <span>{strings.translatedSiteTab}</span>
                 </button>
                 <button
                   type="button"
-                  className={view === 'original' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  aria-pressed={view === 'original'}
+                  className={`reader-desktop-seg-btn pressable ${view === 'original' ? 'active' : ''}`}
                   onClick={() => setView('original')}
                 >
-                  {strings.originalViewTab}
+                  <span>{strings.originalViewTab}</span>
                 </button>
               </div>
+
               {view === 'reader' && !nav?.isTocPage && (
                 <button
                   type="button"
-                  className={bilingual ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  className={`reader-bilingual-btn pressable ${bilingual ? 'active' : ''}`}
                   aria-pressed={bilingual}
                   onClick={() => setBilingual((v) => !v)}
                 >
                   <IconColumns size={15} />
-                  {strings.bilingualToggle}
+                  <span>{strings.bilingualToggle}</span>
                 </button>
               )}
             </div>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <div className="reader-desktop-right">
               <select
-                className="field-select"
-                style={{ minHeight: '36px', padding: '4px 10px', fontSize: '13px' }}
+                className="field-select reader-lang-select"
                 value={mode}
                 onChange={(e) => setMode(e.target.value as ModePair)}
                 aria-label={strings.langMenuTitle}
@@ -1079,7 +1086,7 @@ export function TranslatedWebViewer({
               {effectiveTitleId && (
                 <button
                   type="button"
-                  className="btn-secondary pressable"
+                  className="btn-secondary pressable reader-utility-btn"
                   onClick={() => onNavigate(`/kamus/${effectiveTitleId}`)}
                 >
                   {strings.glossary}
@@ -1088,15 +1095,15 @@ export function TranslatedWebViewer({
               {safeExternalUrl && (
                 <button
                   type="button"
-                  className={view === 'site' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  className="btn-secondary pressable reader-utility-btn"
                   onClick={() => openChapterUrl(safeExternalUrl, 'site')}
                 >
                   <IconLink size={15} />
-                  {strings.openAutoTranslatedTab}
+                  <span>{strings.openAutoTranslatedTab}</span>
                 </button>
               )}
             </div>
-          </>
+          </div>
         )}
         {view === 'reader' && !loading && !errorMsg && (
           <div className="ebook-reading-progress-track" aria-hidden="true">
@@ -1194,7 +1201,9 @@ export function TranslatedWebViewer({
             }}
           />
         ) : bundle ? (
-          <article className="novel-reader-wrap">
+          <article
+            className={`novel-reader-wrap ${bilingual && view === 'reader' && !nav?.isTocPage ? 'is-bilingual' : ''}`}
+          >
             <div className="novel-reader-header">
               <div
                 style={{
@@ -1626,7 +1635,7 @@ export function TranslatedWebViewer({
       {chaptersOpen && nav && (
         <div className="scrim-backdrop" onClick={() => setChaptersOpen(false)}>
           <div
-            className="modal-dialog"
+            className={`modal-dialog ${(nav.chapters?.length || 0) > 10 ? 'is-chapter-modal' : ''}`}
             role="dialog"
             aria-modal="true"
             aria-labelledby="chapter-list-title"
