@@ -3262,7 +3262,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
         : { prev: 'Bab sebelumnya', toc: 'Daftar bab', next: 'Bab berikutnya' };
   const navButtonsHtml =
     nav.prevUrl || nav.nextUrl || nav.tocUrl
-      ? `<div style="position:sticky;bottom:0;z-index:9999;background:#141917;color:#FAFBFA;padding:12px 16px;display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;border-top:1px solid #2B3230;font-family:Inter,-apple-system,sans-serif;font-size:14px;">
+      ? `<div class="tranx-site-nav-bar" style="position:sticky;bottom:0;z-index:9999;background:#141917;color:#FAFBFA;padding:12px 16px;display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;border-top:1px solid #2B3230;font-family:Inter,-apple-system,sans-serif;font-size:14px;">
           ${
             nav.prevUrl
               ? `<a href="${escapeHtml(buildTranxWebHref(nav.prevUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">&#8592; ${navLabels.prev}</a>`
@@ -3385,14 +3385,32 @@ async function buildTranslatedSiteHtmlDirect(params: {
     // Strip ruby readings (<rt>/<rp>) so translated text nodes don't mix furigana beside Latin prose
     doc.querySelectorAll('rt, rp').forEach((el) => el.remove());
 
-    // Inject lightweight responsive safety CSS so translated site fits cleanly on Desktop & Mobile
+    // Force responsive viewport + mobile reflow CSS so translated desktop websites fit phones cleanly without clipping right edges
     const head = doc.head || doc.createElement('head');
     if (!doc.head && doc.documentElement) {
       doc.documentElement.insertBefore(head, doc.body);
     }
+    doc.querySelectorAll('meta[name="viewport"]').forEach((el) => el.remove());
+    const vp = doc.createElement('meta');
+    vp.setAttribute('name', 'viewport');
+    vp.setAttribute('content', 'width=device-width, initial-scale=1.0');
+    head.insertBefore(vp, head.firstChild);
     const safeStyle = doc.createElement('style');
-    safeStyle.textContent =
-      'html,body{overflow-x:hidden !important;max-width:100vw !important;} img,video{max-width:100% !important;height:auto !important;}';
+    safeStyle.textContent = [
+      '*,*::before,*::after{box-sizing:border-box !important;}',
+      'html,body{max-width:100% !important;overflow-x:clip !important;}',
+      'img,video,svg{max-width:100% !important;height:auto !important;}',
+      '@media (max-width:767px){',
+      '  html,body{margin:0 !important;padding:0 !important;width:100% !important;}',
+      '  body{padding:0 12px 16px 12px !important;word-break:break-word !important;overflow-wrap:anywhere !important;}',
+      '  main,article,section,header,nav,footer,div,p,h1,h2,h3,h4,ul,ol,table,pre,blockquote{max-width:100% !important;min-width:0 !important;}',
+      '  [style*="width"]{max-width:100% !important;}',
+      '  header,nav,[class*="breadcrumb"],[class*="Header"],[class*="header"]{flex-wrap:wrap !important;white-space:normal !important;overflow-wrap:anywhere !important;height:auto !important;}',
+      '  h1,h2,h3,.widget-episodeTitle{font-size:clamp(18px,5.4vw,24px) !important;line-height:1.35 !important;white-space:normal !important;margin-left:0 !important;margin-right:0 !important;padding-left:0 !important;padding-right:0 !important;text-align:left !important;}',
+      '  #contentMain,#contentMain-inner,.widget-episode,.widget-episodeTitle,.widget-episodeBody,#novel_honbun,.p-novel__body,#honbun,article,main{width:100% !important;max-width:100% !important;margin-left:0 !important;margin-right:0 !important;padding-left:2px !important;padding-right:2px !important;left:auto !important;right:auto !important;transform:none !important;}',
+      '  aside,.sidebar,[class*="sidebar"],[class*="Sidebar"],#works-sidebar,.tranx-site-nav-bar{display:none !important;}',
+      '}',
+    ].join('\n');
     head.appendChild(safeStyle);
 
     // Collect visible text nodes prioritizing main article content FIRST (up to 750 nodes) so long Wikipedia/news/novel pages never stop halfway
@@ -3510,6 +3528,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
 <html lang="${tgt}">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${escapeHtml(translatedHeading)}</title>
 <style>
   :root { color-scheme: light dark; }
@@ -3520,6 +3539,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
   h1 { font-size: 26px; line-height: 1.3; margin: 0 0 8px 0; }
   p { margin: 0 0 16px 0; }
   .meta { font-family: Inter, -apple-system, sans-serif; font-size: 13px; color: #4F5855; }
+  @media (max-width: 767px) { .tranx-site-nav-bar { display: none !important; } }
 </style>
 </head>
 <body>
@@ -3699,6 +3719,7 @@ export async function directFetchTranslatedWebHtml(params: {
   h1 { font-size: 26px; line-height: 1.3; margin: 0 0 8px 0; }
   p { margin: 0 0 16px 0; }
   .meta { font-family: Inter, -apple-system, sans-serif; font-size: 13px; color: #4F5855; }
+  @media (max-width: 767px) { .tranx-site-nav-bar { display: none !important; } }
 </style>
 </head>
 <body>

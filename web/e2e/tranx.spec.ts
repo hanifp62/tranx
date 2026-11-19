@@ -857,28 +857,77 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect(sendBox!.width).toBeGreaterThanOrEqual(44);
     expect(sendBox!.height).toBeGreaterThanOrEqual(44);
 
-    // Verify Mobile Laci (320px leaving >= 56px scrim tap area) & Bottom Sheet (K/Lembar bawah)
+    // Verify Mobile Laci (320px leaving >= 56px scrim tap area) & Bottom Sheets (K/Lembar bawah)
     await page.screenshot({
       path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_390.png',
     });
-    await page.getByRole('button', { name: 'Menu', exact: true }).click();
+    const menuBtn = page.getByRole('button', { name: 'Menu', exact: true });
+    await menuBtn.click();
+    await expect(menuBtn).toHaveAttribute('aria-expanded', 'true');
+    await expect
+      .poll(async () => {
+        const box = await page.locator('aside.sidebar').boundingBox();
+        return box ? box.x : -999;
+      })
+      .toBeGreaterThanOrEqual(-1);
     const sidebarBox = await page.locator('aside.sidebar').boundingBox();
     expect(sidebarBox!.width).toBeLessThanOrEqual(334);
+    const bodyLocked = await page.evaluate(() => document.body.style.overflow === 'hidden');
+    expect(bodyLocked).toBe(true);
+    await page.screenshot({
+      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_drawer_390.png',
+    });
+
+    // Tapping "Lainnya" inside mobile hamburger drawer opens a native Mobile Bottom Sheet (NOT desktop popover)
+    await page.getByRole('button', { name: 'Lainnya' }).click();
+    const moreSheet = page.getByRole('dialog', { name: 'Lainnya' });
+    await expect(moreSheet).toBeVisible();
+    await expect(moreSheet.getByRole('button', { name: 'Berkas saya' })).toBeVisible();
+    await expect(moreSheet.getByRole('button', { name: 'Daftar nama' })).toBeVisible();
+    await expect(moreSheet.getByRole('button', { name: 'Pintasan keyboard' })).toBeVisible();
+    // Stacked Escape dismisses sheet first while keeping drawer open
+    await page.keyboard.press('Escape');
+    await expect(moreSheet).toHaveCount(0);
+    await expect(menuBtn).toHaveAttribute('aria-expanded', 'true');
+
+    // Tapping Account row inside mobile drawer opens Mobile Account Bottom Sheet & selecting Setelan closes drawer cleanly
+    await page.locator('.account-row-btn').click();
+    const accountSheet = page.locator('.bottom-sheet[role="dialog"]');
+    await expect(accountSheet).toBeVisible();
+    await accountSheet.getByRole('button', { name: /Setelan/ }).click();
+    await expect(menuBtn).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.getByRole('dialog')).toBeVisible();
+    await page.getByRole('button', { name: 'Gelap' }).click();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('html')).toHaveAttribute('data-tranx-v3', 'Gelap');
+
+    // History row bottom sheet + stacked Escape dismissal unlocks body scroll
+    await menuBtn.click();
     await page
       .getByRole('button', { name: /Menu riwayat Bab 1: Hujan di Gerbang Rashomon/i })
       .click();
     await expect(page.getByRole('button', { name: 'Lepas sematan' })).toBeVisible();
     await page.keyboard.press('Escape');
+    await expect(page.getByRole('button', { name: 'Lepas sematan' })).toHaveCount(0);
     await page.keyboard.press('Escape');
+    await expect(menuBtn).toHaveAttribute('aria-expanded', 'false');
+    const bodyUnlocked = await page.evaluate(() => document.body.style.overflow !== 'hidden');
+    expect(bodyUnlocked).toBe(true);
 
     // Mobile Source & Target Language Bottom Sheets (H13) + Swap button
     await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
     await expect(page.getByRole('dialog', { name: 'Bahasa sumber' })).toBeVisible();
-    await page.getByRole('dialog', { name: 'Bahasa sumber' }).getByRole('button', { name: 'Indonesia' }).click();
+    await page
+      .getByRole('dialog', { name: 'Bahasa sumber' })
+      .getByRole('button', { name: 'Indonesia' })
+      .click();
 
     await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
     await expect(page.getByRole('dialog', { name: 'Bahasa tujuan' })).toBeVisible();
-    await page.getByRole('dialog', { name: 'Bahasa tujuan' }).getByRole('button', { name: 'Jepang' }).click();
+    await page
+      .getByRole('dialog', { name: 'Bahasa tujuan' })
+      .getByRole('button', { name: 'Jepang' })
+      .click();
 
     await expect(page.getByRole('button', { name: 'Bahasa sumber: Indonesia' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Bahasa tujuan: Jepang' })).toBeVisible();
@@ -886,6 +935,140 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await page.getByRole('button', { name: 'Tukar bahasa' }).click();
     await expect(page.getByRole('button', { name: 'Bahasa sumber: Jepang' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Bahasa tujuan: Indonesia' })).toBeVisible();
+
+    // 3. Mobile 390x844 /web Reader Overhaul (in Dark Mode via real in-app navigation!): single-row topbar (<= 72px), single-row chapter dock (<= 76px), Hamburger Reader Bottom Sheet, WCAG AA & zero iframe clipping
+    await page.getByRole('tab', { name: 'Link' }).click();
+    await page.getByPlaceholder(/https:\/\//).fill('https://www.aozora.gr.jp/cards/1.html');
+    await page.getByRole('button', { name: 'Terjemahkan halaman' }).click();
+    await page.getByRole('button', { name: 'Buka halaman terjemahan penuh' }).click();
+    await expect(page.locator('html')).toHaveAttribute('data-tranx-v3', 'Gelap');
+    await expect(page.getByRole('heading', { name: 'Bab 1: Hujan di Rashomon' })).toBeVisible();
+
+    const webMobileOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(webMobileOverflow).toBe(false);
+
+    const readerTopbarBox = await page.locator('.web-viewer-topbar.is-mobile').boundingBox();
+    expect(readerTopbarBox).not.toBeNull();
+    expect(readerTopbarBox!.height).toBeLessThanOrEqual(72);
+
+    const chapterDockBox = await page.locator('.novel-chapter-dock').boundingBox();
+    expect(chapterDockBox).not.toBeNull();
+    expect(chapterDockBox!.height).toBeLessThanOrEqual(76);
+
+    // All 3 chapter dock buttons sit on a single horizontal row (never wrapping onto 2nd line)
+    const dockBtns = page.locator('.novel-chapter-dock-inner.is-mobile > button');
+    expect(await dockBtns.count()).toBe(3);
+    const [b0, b1, b2] = [
+      await dockBtns.nth(0).boundingBox(),
+      await dockBtns.nth(1).boundingBox(),
+      await dockBtns.nth(2).boundingBox(),
+    ];
+    expect(Math.abs(b0!.y - b1!.y)).toBeLessThanOrEqual(4);
+    expect(Math.abs(b1!.y - b2!.y)).toBeLessThanOrEqual(4);
+
+    // Axe WCAG 2.2 AA on Mobile /web Reader in Dark Mode
+    const axeWebDark = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeWebDark.violations).toEqual([]);
+
+    await page.screenshot({
+      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_web_reader_390.png',
+    });
+
+    // Open Mobile Reader Hamburger Bottom Sheet -> verify all controls + Axe AA in Dark Mode
+    const readerMenuBtn = page.getByRole('button', { name: 'Menu pembaca' });
+    await readerMenuBtn.click();
+    const readerSheet = page.getByRole('dialog', { name: 'Menu pembaca' });
+    await expect(readerSheet).toBeVisible();
+    await expect(readerSheet.getByLabel('Pasangan bahasa')).toBeVisible();
+    await expect(readerSheet.getByRole('button', { name: 'Berdampingan' })).toBeVisible();
+    await expect(readerSheet.getByRole('button', { name: 'Situs asli' })).toBeVisible();
+    await expect(readerSheet.getByRole('button', { name: /Daftar bab/ })).toBeVisible();
+    await expect(readerSheet.getByRole('button', { name: 'Daftar nama' })).toBeVisible();
+
+    const axeWebSheet = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeWebSheet.violations).toEqual([]);
+
+    await page.screenshot({
+      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_web_sheet_390.png',
+    });
+
+    // Switch to Situs Terjemahan from the bottom sheet -> verify translated iframe fits mobile viewport cleanly
+    await readerSheet.getByRole('button', { name: 'Situs Terjemahan' }).click();
+    await expect(readerSheet).toHaveCount(0);
+    await expect(page.locator('iframe[title="Pembaca Halaman Terjemahan"]')).toBeVisible();
+    const siteMobileOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(siteMobileOverflow).toBe(false);
+
+    // 4. Verify Kakuyomu-style 980px desktop HTML inside Direct Engine Situs Terjemahan reflows cleanly to 390px mobile without right-edge clipping
+    await page.route('**/v1/healthz', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
+    await page.route('https://api.allorigins.win/raw**', async (route) => {
+      await route.fulfill({ status: 504, body: 'Gateway Timeout' });
+    });
+    await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      const reqUrl = new URL(route.request().url());
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const q = postParams.get('q') || reqUrl.searchParams.get('q') || '';
+      const lines = q.split('\n');
+      const translatedLines = lines.map((line) =>
+        line.replace(/杉澤達也の知られざる努力/g, 'Upaya Tatsuya Sugisawa yang tidak diketahui')
+      );
+      const segments = translatedLines.map((t, idx) => [
+        idx < translatedLines.length - 1 ? `${t}\n` : t,
+        lines[idx] || '',
+      ]);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([segments, null, 'ja']),
+      });
+    });
+    await page.route('https://r.jina.ai/**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({
+          code: 200,
+          data: {
+            title: 'Cerita pendek: 杉澤達也の知られざる努力',
+            url: 'https://kakuyomu.jp/works/9990001/episodes/60',
+            finalUrl: 'https://kakuyomu.jp/works/9990001/episodes/60',
+            html: `<!doctype html><html><head><meta name="viewport" content="width=1024"><title>Cerita pendek: 杉澤達也の知られざる努力</title><style>#contentMain{width:980px;margin-left:180px;} .widget-episodeTitle{white-space:nowrap;font-size:32px;}</style></head><body><div id="contentMain"><h1 class="widget-episodeTitle">Cerita pendek: 杉澤達也の知られざる努力</h1><div class="widget-episodeBody"><p>Kamis siang saat istirahat berakhir.</p></div></div><a id="contentMain-readPreviousEpisode" href="/works/9990001/episodes/59">前のエピソード</a><a id="contentMain-readNextEpisode" href="/works/9990001/episodes/61">次のエピソード</a></body></html>`,
+            links: {
+              '前のエピソード': 'https://kakuyomu.jp/works/9990001/episodes/59',
+              '次のエピソード': 'https://kakuyomu.jp/works/9990001/episodes/61',
+            },
+          },
+        }),
+      });
+    });
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fkakuyomu.jp%2Fworks%2F9990001%2Fepisodes%2F60&mode=auto-id&view=site'
+    );
+    const siteIframe = page.locator('iframe[title="Pembaca Halaman Terjemahan"]');
+    await expect(siteIframe).toBeVisible({ timeout: 15000 });
+    const srcDocHtml = await siteIframe.getAttribute('srcdoc');
+    expect(srcDocHtml || '').toContain('width=device-width, initial-scale=1.0');
+    expect(srcDocHtml || '').not.toContain('width=1024');
+    expect(srcDocHtml || '').toContain('Upaya Tatsuya Sugisawa yang tidak diketahui');
+    const iframeFrame = page.frameLocator('iframe[title="Pembaca Halaman Terjemahan"]');
+    const headingBox = await iframeFrame.locator('.widget-episodeTitle').boundingBox();
+    expect(headingBox).not.toBeNull();
+    expect(headingBox!.x + headingBox!.width).toBeLessThanOrEqual(390);
+    await page.screenshot({
+      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_web_site_390.png',
+    });
   });
 
   test('Claude-BugHunter Security & Complete Menu Readiness Gate: XSS/javascript: URI/SSRF defense + all remaining menus (Cari, Ganti nama, Hapus, Pintasan, Bantuan, Pelajari, Berkas export, Kamus merge, Cadangan JSON)', async ({

@@ -165,6 +165,11 @@ export interface UiStrings {
   installGuideMacSafariStep1: string;
   installGuideDesktopStep1: string;
   installGuideDesktopStep2: string;
+  readerMenuLabel: string;
+  shortEbookTab: string;
+  shortSiteTab: string;
+  shortPrevChapter: string;
+  shortNextChapter: string;
   closeLabel: string;
 }
 
@@ -334,6 +339,11 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     installGuideMacSafariStep1: 'Di Safari macOS, buka menu File lalu pilih "Tambahkan ke Dock" untuk memasang tranX sebagai aplikasi penuh.',
     installGuideDesktopStep1: 'Klik ikon "Pasang tranX" di sisi kanan bilah alamat browser (Chrome / Edge / Brave), atau buka menu titik tiga browser lalu pilih "Pasang aplikasi".',
     installGuideDesktopStep2: 'Konfirmasi "Pasang" agar tranX muncul sebagai aplikasi mandiri di desktop atau layar utama HP Anda.',
+    readerMenuLabel: 'Menu pembaca',
+    shortEbookTab: 'Ebook',
+    shortSiteTab: 'Situs',
+    shortPrevChapter: 'Sblm',
+    shortNextChapter: 'Lanjut',
     closeLabel: 'Tutup',
   },
   en: {
@@ -501,6 +511,11 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     installGuideMacSafariStep1: 'In macOS Safari, open the File menu and choose "Add to Dock" to install tranX as a standalone app.',
     installGuideDesktopStep1: 'Click the Install icon on the right side of the address bar (Chrome / Edge / Brave), or open the browser menu and select "Install app".',
     installGuideDesktopStep2: 'Confirm "Install" to add tranX as a full standalone app on your desktop or home screen.',
+    readerMenuLabel: 'Reader menu',
+    shortEbookTab: 'Ebook',
+    shortSiteTab: 'Site',
+    shortPrevChapter: 'Prev',
+    shortNextChapter: 'Next',
     closeLabel: 'Close',
   },
 };

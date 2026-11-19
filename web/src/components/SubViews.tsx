@@ -36,10 +36,12 @@ import {
 } from '../lib/firebase';
 import {
   IconBook,
+  IconCheck,
   IconColumns,
   IconDownload,
   IconGlobe,
   IconLink,
+  IconMenu,
   IconPlus,
   IconTrash,
   IconX,
@@ -678,6 +680,10 @@ export function TranslatedWebViewer({
   const [mode, setMode] = useState<ModePair>(initialMode);
   const [view, setView] = useState<'reader' | 'site' | 'original'>(initialView);
   const [bilingual, setBilingual] = useState(false);
+  const [isMobile, setIsMobile] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth < 768 : false
+  );
+  const [readerMenuOpen, setReaderMenuOpen] = useState(false);
   const [chaptersOpen, setChaptersOpen] = useState(false);
   const [chapterQuery, setChapterQuery] = useState('');
   const deferredChapterQuery = useDeferredValue(chapterQuery);
@@ -705,10 +711,34 @@ export function TranslatedWebViewer({
   }, [initialMode]);
 
   useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  useEffect(() => {
+    if (!readerMenuOpen && !chaptersOpen) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setReaderMenuOpen(false);
+        setChaptersOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onEsc);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener('keydown', onEsc);
+    };
+  }, [readerMenuOpen, chaptersOpen]);
+
+  useEffect(() => {
     let active = true;
     setLoading(true);
     setStreamProgress(null);
     setErrorMsg(null);
+    setReaderMenuOpen(false);
     setChaptersOpen(false);
     setChapterQuery('');
     window.scrollTo({ top: 0 });
@@ -838,6 +868,7 @@ export function TranslatedWebViewer({
     targetView: 'reader' | 'site' = view === 'site' ? 'site' : 'reader'
   ) => {
     setChaptersOpen(false);
+    setReaderMenuOpen(false);
     setView(targetView);
     const qs = new URLSearchParams({
       url: targetUrl,
@@ -904,91 +935,141 @@ export function TranslatedWebViewer({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100dvh' }}>
-      <header className="web-viewer-topbar">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-          <button
-            type="button"
-            className="btn-secondary pressable"
-            onClick={() => onNavigate(backPath)}
-          >
-            {strings.backBtn}
-          </button>
-          <div style={{ display: 'inline-flex', gap: '4px', flexWrap: 'wrap' }}>
+      <header className={`web-viewer-topbar ${isMobile ? 'is-mobile' : ''}`}>
+        {isMobile ? (
+          <div className="reader-mobile-bar">
             <button
               type="button"
-              className={view === 'reader' ? 'btn-primary pressable' : 'btn-secondary pressable'}
-              onClick={() => setView('reader')}
+              className="icon-square-btn pressable"
+              aria-label={strings.backBtn}
+              onClick={() => onNavigate(backPath)}
             >
-              <IconBook size={15} />
-              {strings.readerModeTab}
+              <span aria-hidden="true" style={{ fontSize: '18px', fontWeight: 600 }}>
+                {'\u2190'}
+              </span>
             </button>
+
+            <div className="reader-mobile-seg" role="tablist" aria-label={strings.readerModeTab}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === 'reader'}
+                className={`reader-mobile-seg-btn pressable ${view === 'reader' ? 'active' : ''}`}
+                onClick={() => setView('reader')}
+              >
+                <IconBook size={15} />
+                <span>{strings.shortEbookTab}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === 'site'}
+                className={`reader-mobile-seg-btn pressable ${view === 'site' ? 'active' : ''}`}
+                onClick={() => setView('site')}
+              >
+                <IconGlobe size={15} />
+                <span>{strings.shortSiteTab}</span>
+              </button>
+            </div>
+
             <button
               type="button"
-              className={view === 'site' ? 'btn-primary pressable' : 'btn-secondary pressable'}
-              onClick={() => setView('site')}
+              className="icon-square-btn pressable"
+              aria-label={strings.readerMenuLabel}
+              aria-expanded={readerMenuOpen}
+              onClick={() => setReaderMenuOpen((v) => !v)}
             >
-              <IconGlobe size={15} />
-              {strings.translatedSiteTab}
-            </button>
-            <button
-              type="button"
-              className={view === 'original' ? 'btn-primary pressable' : 'btn-secondary pressable'}
-              onClick={() => setView('original')}
-            >
-              {strings.originalViewTab}
+              <IconMenu size={20} />
             </button>
           </div>
-          {view === 'reader' && !nav?.isTocPage && (
-            <button
-              type="button"
-              className={bilingual ? 'btn-primary pressable' : 'btn-secondary pressable'}
-              aria-pressed={bilingual}
-              onClick={() => setBilingual((v) => !v)}
-            >
-              <IconColumns size={15} />
-              {strings.bilingualToggle}
-            </button>
-          )}
-        </div>
+        ) : (
+          <>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="btn-secondary pressable"
+                onClick={() => onNavigate(backPath)}
+              >
+                {strings.backBtn}
+              </button>
+              <div style={{ display: 'inline-flex', gap: '4px', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className={view === 'reader' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  onClick={() => setView('reader')}
+                >
+                  <IconBook size={15} />
+                  {strings.readerModeTab}
+                </button>
+                <button
+                  type="button"
+                  className={view === 'site' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  onClick={() => setView('site')}
+                >
+                  <IconGlobe size={15} />
+                  {strings.translatedSiteTab}
+                </button>
+                <button
+                  type="button"
+                  className={view === 'original' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  onClick={() => setView('original')}
+                >
+                  {strings.originalViewTab}
+                </button>
+              </div>
+              {view === 'reader' && !nav?.isTocPage && (
+                <button
+                  type="button"
+                  className={bilingual ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  aria-pressed={bilingual}
+                  onClick={() => setBilingual((v) => !v)}
+                >
+                  <IconColumns size={15} />
+                  {strings.bilingualToggle}
+                </button>
+              )}
+            </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-          <select
-            className="field-select"
-            style={{ minHeight: '36px', padding: '4px 10px', fontSize: '13px' }}
-            value={mode}
-            onChange={(e) => setMode(e.target.value as ModePair)}
-            aria-label={strings.langMenuTitle}
-          >
-            <option value="auto-id">{strings.langAuto} {'\u2192'} {strings.langId}</option>
-            <option value="auto-en">{strings.langAuto} {'\u2192'} {strings.langEn}</option>
-            <option value="auto-ja">{strings.langAuto} {'\u2192'} {strings.langJa}</option>
-            <option value="ja-id">{strings.langJa} {'\u2192'} {strings.langId}</option>
-            <option value="ja-en">{strings.langJa} {'\u2192'} {strings.langEn}</option>
-            <option value="id-ja">{strings.langId} {'\u2192'} {strings.langJa}</option>
-            <option value="id-en">{strings.langId} {'\u2192'} {strings.langEn}</option>
-            <option value="en-id">{strings.langEn} {'\u2192'} {strings.langId}</option>
-            <option value="en-ja">{strings.langEn} {'\u2192'} {strings.langJa}</option>
-          </select>
-          {effectiveTitleId && (
-            <button
-              type="button"
-              className="btn-secondary pressable"
-              onClick={() => onNavigate(`/kamus/${effectiveTitleId}`)}
-            >
-              {strings.glossary}
-            </button>
-          )}
-          {safeExternalUrl && (
-            <button
-              type="button"
-              className={view === 'site' ? 'btn-primary pressable' : 'btn-secondary pressable'}
-              onClick={() => openChapterUrl(safeExternalUrl, 'site')}
-            >
-              <IconLink size={15} />
-              {strings.openAutoTranslatedTab}
-            </button>
-          )}
-        </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <select
+                className="field-select"
+                style={{ minHeight: '36px', padding: '4px 10px', fontSize: '13px' }}
+                value={mode}
+                onChange={(e) => setMode(e.target.value as ModePair)}
+                aria-label={strings.langMenuTitle}
+              >
+                <option value="auto-id">{strings.langAuto} {'\u2192'} {strings.langId}</option>
+                <option value="auto-en">{strings.langAuto} {'\u2192'} {strings.langEn}</option>
+                <option value="auto-ja">{strings.langAuto} {'\u2192'} {strings.langJa}</option>
+                <option value="ja-id">{strings.langJa} {'\u2192'} {strings.langId}</option>
+                <option value="ja-en">{strings.langJa} {'\u2192'} {strings.langEn}</option>
+                <option value="id-ja">{strings.langId} {'\u2192'} {strings.langJa}</option>
+                <option value="id-en">{strings.langId} {'\u2192'} {strings.langEn}</option>
+                <option value="en-id">{strings.langEn} {'\u2192'} {strings.langId}</option>
+                <option value="en-ja">{strings.langEn} {'\u2192'} {strings.langJa}</option>
+              </select>
+              {effectiveTitleId && (
+                <button
+                  type="button"
+                  className="btn-secondary pressable"
+                  onClick={() => onNavigate(`/kamus/${effectiveTitleId}`)}
+                >
+                  {strings.glossary}
+                </button>
+              )}
+              {safeExternalUrl && (
+                <button
+                  type="button"
+                  className={view === 'site' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                  onClick={() => openChapterUrl(safeExternalUrl, 'site')}
+                >
+                  <IconLink size={15} />
+                  {strings.openAutoTranslatedTab}
+                </button>
+              )}
+            </div>
+          </>
+        )}
         {view === 'reader' && !loading && !errorMsg && (
           <div className="ebook-reading-progress-track" aria-hidden="true">
             <div ref={progressBarRef} className="ebook-reading-progress-fill" />
@@ -1013,7 +1094,7 @@ export function TranslatedWebViewer({
         )}
       </header>
 
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+      <main style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
         {loading ? (
           <div className="novel-reader-wrap" role="status" aria-live="polite">
             <div className="ebook-skeleton-card">
@@ -1298,37 +1379,43 @@ export function TranslatedWebViewer({
             )}
           </article>
         ) : null}
-      </div>
+      </main>
 
       {!loading &&
         !errorMsg &&
         nav &&
         (nav.prevUrl || nav.nextUrl || nav.chapters?.length || nav.tocUrl) && (
           <nav className="novel-chapter-dock" aria-label={strings.chapterListBtn}>
-            <div className="novel-chapter-dock-inner">
+            <div className={`novel-chapter-dock-inner ${isMobile ? 'is-mobile' : ''}`}>
               <button
                 type="button"
                 className="btn-secondary pressable"
+                aria-label={strings.prevChapter}
                 disabled={!nav.prevUrl}
                 onClick={() => nav.prevUrl && openChapterUrl(nav.prevUrl)}
               >
-                {'\u2190'} {strings.prevChapter}
+                {'\u2190'} {isMobile ? strings.shortPrevChapter : strings.prevChapter}
               </button>
 
               <button
                 type="button"
                 className="btn-secondary pressable"
+                aria-label={`${strings.chapterListBtn}${nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}`}
                 onClick={() => setChaptersOpen(true)}
               >
                 <IconBook size={16} />
-                {strings.chapterListBtn}
-                {nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}
+                <span className="chapter-dock-center-label">
+                  {isMobile
+                    ? nav.chapterLabel || strings.chapterListBtn
+                    : `${strings.chapterListBtn}${nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}`}
+                </span>
               </button>
 
               {nav.nextUrl ? (
                 <button
                   type="button"
                   className="btn-primary pressable"
+                  aria-label={nav.isTocPage ? strings.startReadingCh1 : strings.nextChapter}
                   onMouseEnter={() =>
                     prefetchNextChapterTranslatedDirect(nav.nextUrl!, mode, effectiveTitleId)
                   }
@@ -1337,24 +1424,163 @@ export function TranslatedWebViewer({
                   }
                   onClick={() => openChapterUrl(nav.nextUrl!)}
                 >
-                  {nav.isTocPage ? strings.startReadingCh1 : strings.nextChapter} {'\u2192'}
+                  {isMobile
+                    ? nav.isTocPage
+                      ? 'Bab 1'
+                      : strings.shortNextChapter
+                    : nav.isTocPage
+                      ? strings.startReadingCh1
+                      : strings.nextChapter}{' '}
+                  {'\u2192'}
                 </button>
               ) : canRestartFromCh1 && nav.firstUrl ? (
                 <button
                   type="button"
                   className="btn-primary pressable"
+                  aria-label={strings.readFromChapter1}
                   onClick={() => openChapterUrl(nav.firstUrl!)}
                 >
-                  {strings.readFromChapter1}
+                  {isMobile ? 'Bab 1' : strings.readFromChapter1}
                 </button>
               ) : (
-                <button type="button" className="btn-secondary" disabled>
-                  {strings.nextChapter} {'\u2192'}
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  aria-label={strings.nextChapter}
+                  disabled
+                >
+                  {isMobile ? strings.shortNextChapter : strings.nextChapter} {'\u2192'}
                 </button>
               )}
             </div>
           </nav>
         )}
+
+      {isMobile && readerMenuOpen && (
+        <div className="bottom-sheet-backdrop" onClick={() => setReaderMenuOpen(false)}>
+          <div
+            className="bottom-sheet glass-regular-surface"
+            role="dialog"
+            aria-modal="true"
+            aria-label={strings.readerMenuLabel}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="sheet-handle-btn"
+              aria-label={strings.closeLabel}
+              onClick={() => setReaderMenuOpen(false)}
+            >
+              <span className="sheet-handle-pill" />
+            </button>
+            <div className="reader-sheet-section">
+              <div className="reader-sheet-label">{strings.langMenuTitle}</div>
+              <select
+                className="field-select"
+                style={{ width: '100%', minHeight: '44px', fontSize: '16px' }}
+                value={mode}
+                onChange={(e) => {
+                  setMode(e.target.value as ModePair);
+                  setReaderMenuOpen(false);
+                }}
+                aria-label={strings.langMenuTitle}
+              >
+                <option value="auto-id">{strings.langAuto} {'\u2192'} {strings.langId}</option>
+                <option value="auto-en">{strings.langAuto} {'\u2192'} {strings.langEn}</option>
+                <option value="auto-ja">{strings.langAuto} {'\u2192'} {strings.langJa}</option>
+                <option value="ja-id">{strings.langJa} {'\u2192'} {strings.langId}</option>
+                <option value="ja-en">{strings.langJa} {'\u2192'} {strings.langEn}</option>
+                <option value="id-ja">{strings.langId} {'\u2192'} {strings.langJa}</option>
+                <option value="id-en">{strings.langId} {'\u2192'} {strings.langEn}</option>
+                <option value="en-id">{strings.langEn} {'\u2192'} {strings.langId}</option>
+                <option value="en-ja">{strings.langEn} {'\u2192'} {strings.langJa}</option>
+              </select>
+            </div>
+            <div className="menu-divider" />
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => {
+                setView('reader');
+                setReaderMenuOpen(false);
+              }}
+            >
+              <IconBook size={20} />
+              <span style={{ flex: 1 }}>{strings.readerModeTab}</span>
+              {view === 'reader' && <IconCheck size={18} style={{ color: 'var(--accent)' }} />}
+            </button>
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => {
+                setView('site');
+                setReaderMenuOpen(false);
+              }}
+            >
+              <IconGlobe size={20} />
+              <span style={{ flex: 1 }}>{strings.translatedSiteTab}</span>
+              {view === 'site' && <IconCheck size={18} style={{ color: 'var(--accent)' }} />}
+            </button>
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => {
+                setView('original');
+                setReaderMenuOpen(false);
+              }}
+            >
+              <IconLink size={20} />
+              <span style={{ flex: 1 }}>{strings.originalViewTab}</span>
+              {view === 'original' && <IconCheck size={18} style={{ color: 'var(--accent)' }} />}
+            </button>
+            {view === 'reader' && !nav?.isTocPage && (
+              <button
+                type="button"
+                className="sheet-row-btn"
+                aria-pressed={bilingual}
+                onClick={() => {
+                  setBilingual((v) => !v);
+                  setReaderMenuOpen(false);
+                }}
+              >
+                <IconColumns size={20} />
+                <span style={{ flex: 1 }}>{strings.bilingualToggle}</span>
+                {bilingual && <IconCheck size={18} style={{ color: 'var(--accent)' }} />}
+              </button>
+            )}
+            <div className="menu-divider" />
+            {nav && (nav.chapters?.length || nav.tocUrl) && (
+              <button
+                type="button"
+                className="sheet-row-btn"
+                onClick={() => {
+                  setReaderMenuOpen(false);
+                  setChaptersOpen(true);
+                }}
+              >
+                <IconBook size={20} />
+                <span style={{ flex: 1 }}>
+                  {strings.chapterListBtn}
+                  {nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}
+                </span>
+              </button>
+            )}
+            {effectiveTitleId && (
+              <button
+                type="button"
+                className="sheet-row-btn"
+                onClick={() => {
+                  setReaderMenuOpen(false);
+                  onNavigate(`/kamus/${effectiveTitleId}`);
+                }}
+              >
+                <IconBook size={20} />
+                <span style={{ flex: 1 }}>{strings.glossary}</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {chaptersOpen && nav && (
         <div className="scrim-backdrop" onClick={() => setChaptersOpen(false)}>

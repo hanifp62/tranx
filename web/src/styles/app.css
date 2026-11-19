@@ -17,6 +17,8 @@ body,
   font-size: 16px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
   text-rendering: optimizeLegibility;
 }
 
@@ -26,6 +28,16 @@ select,
 textarea {
   font-family: inherit;
   color: inherit;
+}
+
+button,
+[role="button"],
+a.btn-primary,
+a.btn-secondary,
+a.sheet-row-btn {
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* Visible high-contrast keyboard focus ring across both themes (R-32) */
@@ -1181,6 +1193,9 @@ textarea {
 .bottom-sheet {
   width: 100%;
   max-width: 480px;
+  max-height: 84dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border-radius: var(--r-island) var(--r-island) 0 0;
   padding: 4px 16px calc(28px + env(safe-area-inset-bottom, 0px)) 16px;
   animation: sheetUp var(--dur-sheet-in) var(--ease-sheet);
@@ -1261,13 +1276,74 @@ textarea {
   width: 100%;
   background: var(--bg);
   border-bottom: 1px solid var(--border);
-  padding: 10px 16px;
+  padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 10px 16px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
   flex-wrap: wrap;
   z-index: 30;
+}
+
+.web-viewer-topbar.is-mobile {
+  padding: calc(6px + env(safe-area-inset-top, 0px)) 8px 6px 8px;
+  flex-wrap: nowrap;
+}
+
+.reader-mobile-bar {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 44px;
+}
+
+.reader-mobile-seg {
+  flex: 1;
+  max-width: 224px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 12px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+}
+
+.reader-mobile-seg-btn {
+  min-height: 38px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.reader-mobile-seg-btn.active {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.reader-sheet-section {
+  padding: 6px 12px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.reader-sheet-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
 }
 
 /* Novel & Article Reader Canvas (Mode Baca) */
@@ -1347,6 +1423,26 @@ textarea {
   justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.novel-chapter-dock-inner.is-mobile {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.novel-chapter-dock-inner.is-mobile > button {
+  padding: 0 10px;
+  font-size: 13px;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.chapter-dock-center-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .novel-inline-nav {
@@ -1652,20 +1748,60 @@ textarea {
 
 /* Mobile Distinct Reflow (< 768px): Laci 320px over Scrim, 44x44px tap targets, Mode bar ABOVE Composer */
 @media (max-width: 767px) {
+  /* Prevent iOS Safari auto-zoom on form focus without disabling pinch zoom */
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+
   .sidebar {
     position: fixed;
     left: 0;
     top: 0;
     bottom: 0;
     width: min(320px, calc(100vw - 56px));
+    padding-top: calc(8px + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
     z-index: 55;
     box-shadow: var(--shadow-e2);
     transform: translateX(0);
+    overscroll-behavior: contain;
   }
 
   .sidebar.mobile-closed {
     transform: translateX(-105%);
     pointer-events: none;
+  }
+
+  .sidebar-history-scroll {
+    overscroll-behavior: contain;
+  }
+
+  .stage-header {
+    height: auto;
+    min-height: 56px;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 10px 8px 10px;
+    gap: 6px;
+  }
+
+  .scrim-backdrop {
+    align-items: flex-end;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px)) 12px;
+  }
+
+  .modal-dialog {
+    width: 100%;
+    max-height: 86dvh;
+    border-radius: var(--r-island);
+  }
+
+  .novel-reader-wrap {
+    padding: 18px 16px 88px 16px;
+  }
+
+  .novel-chapter-dock {
+    padding: 8px 10px calc(10px + env(safe-area-inset-bottom, 0px)) 10px;
   }
 
   .sidebar-nav-btn,
@@ -1687,11 +1823,6 @@ textarea {
   .btn-danger,
   .action-chip-btn {
     min-height: 44px;
-  }
-
-  .stage-header {
-    padding: 8px 10px;
-    gap: 6px;
   }
 
   .header-left,

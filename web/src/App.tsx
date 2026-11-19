@@ -271,6 +271,7 @@ export function App() {
   const cameraInputRef = useRef<HTMLInputElement | null>(null);
   const docInputRef = useRef<HTMLInputElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const drawerTouchStartRef = useRef<{ x: number; y: number } | null>(null);
 
   const closeAllPopovers = useCallback(() => {
     setMoreMenuOpen(false);
@@ -436,6 +437,7 @@ export function App() {
 
   const handleInstallAppClick = useCallback(async () => {
     setAccountMenuOpen(false);
+    setMobileDrawerOpen(false);
     if (pwaState.canNativePrompt) {
       const outcome = await triggerNativePwaInstall();
       if (outcome === 'unavailable') {
@@ -445,6 +447,32 @@ export function App() {
     }
     setInstallGuideOpen(true);
   }, [pwaState.canNativePrompt]);
+
+  // Lock background page scroll while a mobile drawer or sheet is active
+  useEffect(() => {
+    const anyMobileOverlay =
+      isMobile &&
+      (mobileDrawerOpen ||
+        moreMenuOpen ||
+        accountMenuOpen ||
+        Boolean(langPickerSide) ||
+        Boolean(historyMenuTarget) ||
+        Boolean(mobileTurnSheet));
+    if (!anyMobileOverlay) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [
+    isMobile,
+    mobileDrawerOpen,
+    moreMenuOpen,
+    accountMenuOpen,
+    langPickerSide,
+    historyMenuTarget,
+    mobileTurnSheet,
+  ]);
 
   useEffect(() => {
     if (!user) return;
@@ -595,19 +623,42 @@ export function App() {
           pushToast(strings.copiedToast);
         }
       } else if (e.key === 'Escape') {
+        const hadSheetOrPopover = Boolean(
+          langPickerSide ||
+            moreMenuOpen ||
+            accountMenuOpen ||
+            historyMenuTarget ||
+            mobileTurnSheet ||
+            inlineChaptersNav ||
+            installGuideOpen
+        );
         setLangPickerSide(null);
         setMoreMenuOpen(false);
         setAccountMenuOpen(false);
         setHistoryMenuTarget(null);
         setMobileTurnSheet(null);
-        setMobileDrawerOpen(false);
         setInlineChaptersNav(null);
         setInstallGuideOpen(false);
+        if (!hadSheetOrPopover) {
+          setMobileDrawerOpen(false);
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [user, messages, pushToast, strings.copiedToast]);
+  }, [
+    user,
+    messages,
+    pushToast,
+    strings.copiedToast,
+    langPickerSide,
+    moreMenuOpen,
+    accountMenuOpen,
+    historyMenuTarget,
+    mobileTurnSheet,
+    inlineChaptersNav,
+    installGuideOpen,
+  ]);
 
   useEffect(() => {
     if (!isDictating) {
@@ -1853,6 +1904,23 @@ export function App() {
       <aside
         aria-label="Navigasi riwayat"
         inert={(isMobile && !mobileDrawerOpen) || (!isMobile && sidebarCollapsed) || undefined}
+        onTouchStart={(e) => {
+          if (!isMobile || !mobileDrawerOpen) return;
+          const t = e.touches[0];
+          if (t) drawerTouchStartRef.current = { x: t.clientX, y: t.clientY };
+        }}
+        onTouchEnd={(e) => {
+          if (!isMobile || !mobileDrawerOpen || !drawerTouchStartRef.current) return;
+          const t = e.changedTouches[0];
+          const start = drawerTouchStartRef.current;
+          drawerTouchStartRef.current = null;
+          if (!t) return;
+          const dx = t.clientX - start.x;
+          const dy = Math.abs(t.clientY - start.y);
+          if (dx < -60 && dy < 56) {
+            setMobileDrawerOpen(false);
+          }
+        }}
         className={`sidebar ${
           isMobile
             ? mobileDrawerOpen
@@ -2069,6 +2137,7 @@ export function App() {
                 type="button"
                 className="icon-square-btn pressable"
                 aria-label="Menu"
+                aria-expanded={isMobile ? mobileDrawerOpen : !sidebarCollapsed}
                 onClick={() =>
                   isMobile ? setMobileDrawerOpen(true) : setSidebarCollapsed(false)
                 }
@@ -2871,11 +2940,12 @@ export function App() {
         )}
       </main>
 
-      {/* Root-level Non-Overlapping Popovers with Shared Click-Outside Dismissal Backdrop */}
-      {(moreMenuOpen ||
-        accountMenuOpen ||
-        (!isMobile && Boolean(langPickerSide)) ||
-        (!isMobile && Boolean(historyMenuTarget))) && (
+      {/* Root-level Desktop Non-Overlapping Popovers with Shared Click-Outside Dismissal Backdrop */}
+      {!isMobile &&
+        (moreMenuOpen ||
+          accountMenuOpen ||
+          Boolean(langPickerSide) ||
+          Boolean(historyMenuTarget)) && (
         <>
           <div className="popover-dismiss-backdrop" onClick={closeAllPopovers} />
 
@@ -3229,6 +3299,162 @@ export function App() {
         </>
       )}
 
+      {/* Mobile K/Lembar bawah for "Lainnya" (More) Menu */}
+      {isMobile && moreMenuOpen && (
+        <div className="bottom-sheet-backdrop" onClick={() => setMoreMenuOpen(false)}>
+          <div
+            className="bottom-sheet glass-regular-surface"
+            role="dialog"
+            aria-modal="true"
+            aria-label={strings.sidebarMore}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="sheet-handle-btn"
+              aria-label={strings.cancel}
+              onClick={() => setMoreMenuOpen(false)}
+            >
+              <span className="sheet-handle-pill" />
+            </button>
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => navigate('/berkas')}
+            >
+              <IconFolder size={20} />
+              <span>{strings.myFiles}</span>
+            </button>
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => navigate('/kamus')}
+            >
+              <IconBook size={20} />
+              <span>{strings.glossary}</span>
+            </button>
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => {
+                setMoreMenuOpen(false);
+                setMobileDrawerOpen(false);
+                setShortcutsOpen(true);
+              }}
+            >
+              <IconKeyboard size={20} />
+              <span>{strings.shortcuts}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Mobile K/Lembar bawah for Account Menu */}
+      {isMobile && accountMenuOpen && (
+        <div className="bottom-sheet-backdrop" onClick={() => setAccountMenuOpen(false)}>
+          <div
+            className="bottom-sheet glass-regular-surface"
+            role="dialog"
+            aria-modal="true"
+            aria-label={user.displayName || user.email || strings.settingsAccount}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="sheet-handle-btn"
+              aria-label={strings.cancel}
+              onClick={() => setAccountMenuOpen(false)}
+            >
+              <span className="sheet-handle-pill" />
+            </button>
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => {
+                setAccountMenuOpen(false);
+                setMobileDrawerOpen(false);
+                setSettingsOpen(true);
+              }}
+            >
+              <IconSettings size={20} />
+              <span>{strings.settings}</span>
+            </button>
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => {
+                setAccountMenuOpen(false);
+                handleChangeUiLang(settings.uiLang === 'id' ? 'en' : 'id');
+              }}
+            >
+              <IconGlobe size={20} />
+              <span style={{ flex: 1 }}>{strings.uiLanguage}</span>
+              <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--accent)' }}>
+                {settings.uiLang === 'id' ? 'ID \u2192 EN' : 'EN \u2192 ID'}
+              </span>
+            </button>
+            {!pwaState.isInstalled && (
+              <button
+                type="button"
+                className="sheet-row-btn"
+                onClick={handleInstallAppClick}
+              >
+                <IconDownload size={20} />
+                <span>{strings.installAppMenu}</span>
+              </button>
+            )}
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => {
+                setAccountMenuOpen(false);
+                setMobileDrawerOpen(false);
+                setInfoModalKind('help');
+              }}
+            >
+              <IconHelp size={20} />
+              <span>{strings.help}</span>
+            </button>
+            <a
+              className="sheet-row-btn"
+              href="mailto:hanifp633@gmail.com?subject=Masukan%20tranX"
+              onClick={() => {
+                setAccountMenuOpen(false);
+                setMobileDrawerOpen(false);
+              }}
+            >
+              <IconMail size={20} />
+              <span>{strings.sendFeedback}</span>
+            </a>
+            <button
+              type="button"
+              className="sheet-row-btn"
+              onClick={() => {
+                setAccountMenuOpen(false);
+                setMobileDrawerOpen(false);
+                setInfoModalKind('about');
+              }}
+            >
+              <IconInfo size={20} />
+              <span>{strings.learnMore}</span>
+            </button>
+            <div className="menu-divider" />
+            <button
+              type="button"
+              className="sheet-row-btn danger"
+              onClick={() => {
+                setAccountMenuOpen(false);
+                setMobileDrawerOpen(false);
+                setLogoutOpen(true);
+              }}
+            >
+              <IconLogout size={20} />
+              <span>{strings.signOut}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Mobile K/Lembar bawah for History Context Menu */}
       {isMobile && historyMenuTarget && (
         <div
@@ -3285,6 +3511,7 @@ export function App() {
               onClick={() => {
                 const target = historyMenuTarget.conv;
                 setHistoryMenuTarget(null);
+                setMobileDrawerOpen(false);
                 setRenameTarget(target);
               }}
             >
