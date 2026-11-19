@@ -447,56 +447,32 @@ textarea {
   font-weight: 500;
 }
 
-/* Native-grade PWA Install Notification Bar */
-.pwa-install-banner {
-  margin: 8px auto 0 auto;
-  width: min(720px, calc(100% - 32px));
-  padding: 12px 14px;
-  border-radius: var(--r-card);
-  background: var(--surface);
+/* Compact Header Install App Button (visible only when not yet installed on this device) */
+.install-app-btn {
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: var(--r-control);
   border: 1px solid var(--border-strong);
-  box-shadow: var(--shadow-e1);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.pwa-install-banner-left {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-  flex: 1 1 240px;
-}
-
-.pwa-install-banner-text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.pwa-install-banner-title {
-  font-size: 14px;
-  line-height: 20px;
-  font-weight: 600;
+  background: var(--surface);
   color: var(--text);
-}
-
-.pwa-install-banner-desc {
   font-size: 13px;
   line-height: 18px;
-  color: var(--text-muted);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  white-space: nowrap;
 }
 
-.pwa-install-banner-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-  flex-wrap: wrap;
+.install-app-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.install-app-icon-btn {
+  color: var(--accent);
 }
 
 /* Centered Empty Composition vs Active Stream Composition */
@@ -1713,21 +1689,31 @@ textarea {
     min-height: 44px;
   }
 
+  .stage-header {
+    padding: 8px 10px;
+    gap: 6px;
+  }
+
+  .header-left,
+  .header-right {
+    gap: 4px;
+  }
+
   .lang-pair-bar {
     gap: 2px;
-    max-width: calc(100vw - 116px);
+    max-width: calc(100vw - 152px);
   }
 
   .lang-pill-btn {
     min-height: 40px;
-    padding: 0 8px;
-    font-size: 12.5px;
+    padding: 0 7px;
+    font-size: 12px;
   }
 
   .lang-swap-btn {
-    min-width: 36px;
+    min-width: 32px;
     min-height: 40px;
-    padding: 0 4px;
+    padding: 0 3px;
   }
 
   .mic-round-btn,

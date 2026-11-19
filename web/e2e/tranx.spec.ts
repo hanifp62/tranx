@@ -1574,18 +1574,31 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect((await page.request.get('/screenshots/mobile-narrow.png')).status()).toBe(200);
     expect(manifest.shortcuts?.length).toBeGreaterThanOrEqual(3);
 
-    // 4. Verify Install App Notification Banner on beforeinstallprompt + Axe WCAG 2.2 AA + native prompt() + appinstalled toast!
+    // 4. Verify persistent Install App button (no notification banner): visible when NOT installed, disappears when installed, reappears if uninstalled!
     await page.goto('/?e2e=1');
     await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toBeVisible();
+    await expect(page.locator('.pwa-install-banner')).toHaveCount(0);
 
-    // Account menu always exposes "Pasang aplikasi" when not installed
-    await page.locator('.account-row-btn').click();
-    await expect(page.getByRole('menuitem', { name: 'Pasang aplikasi' })).toBeVisible();
-    await page.getByRole('menuitem', { name: 'Pasang aplikasi' }).click();
+    const headerInstallBtn = page.locator('.stage-header').getByRole('button', { name: 'Pasang aplikasi' });
+    await expect(headerInstallBtn).toBeVisible();
+
+    // Without beforeinstallprompt, clicking Install App button opens platform install guide dialog
+    await headerInstallBtn.click();
     await expect(page.getByRole('heading', { name: 'Cara memasang aplikasi tranX' })).toBeVisible();
     await page.keyboard.press('Escape');
 
-    // Simulate browser firing native beforeinstallprompt event
+    // Account menu also shows "Pasang aplikasi" while not installed
+    await page.locator('.account-row-btn').click();
+    await expect(page.getByRole('menuitem', { name: 'Pasang aplikasi' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    // Axe WCAG 2.2 AA check with Install App button visible in header
+    const axeInstall = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeInstall.violations).toEqual([]);
+
+    // Simulate browser firing native beforeinstallprompt -> clicking header button invokes native prompt() and hides button once installed!
     await page.evaluate(() => {
       const ev = new Event('beforeinstallprompt', { cancelable: true }) as Event & {
         prompt?: () => Promise<void>;
@@ -1599,21 +1612,32 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       window.dispatchEvent(ev);
     });
 
-    const installBanner = page.getByRole('region', { name: 'Pasang aplikasi tranX' });
-    await expect(installBanner).toBeVisible();
-
-    // Axe WCAG 2.2 AA check with install notification visible
-    const axeInstall = await new AxeBuilder({ page })
-      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
-      .analyze();
-    expect(axeInstall.violations).toEqual([]);
-
-    await installBanner.getByRole('button', { name: 'Pasang sekarang' }).click();
+    await headerInstallBtn.click();
     const promptInvoked = await page.evaluate(
       () => (window as unknown as { __pwaPromptCalled?: boolean }).__pwaPromptCalled
     );
     expect(promptInvoked).toBe(true);
-    await expect(installBanner).toHaveCount(0);
+    await expect(headerInstallBtn).toHaveCount(0);
     await expect(page.getByText('tranX berhasil dipasang sebagai aplikasi!')).toBeVisible();
+
+    // Reloading on an already-installed device keeps the Install App button hidden (header & Account menu!)
+    await page.reload();
+    await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toBeVisible();
+    await expect(headerInstallBtn).toHaveCount(0);
+    await page.locator('.account-row-btn').click();
+    await expect(page.getByRole('menuitem', { name: 'Pasang aplikasi' })).toHaveCount(0);
+    await page.keyboard.press('Escape');
+
+    // If later uninstalled and browser fires beforeinstallprompt again -> Install App button reappears!
+    await page.evaluate(() => {
+      const ev = new Event('beforeinstallprompt', { cancelable: true }) as Event & {
+        prompt?: () => Promise<void>;
+        userChoice?: Promise<{ outcome: 'dismissed'; platform: string }>;
+      };
+      ev.prompt = async () => {};
+      ev.userChoice = Promise.resolve({ outcome: 'dismissed', platform: 'web' });
+      window.dispatchEvent(ev);
+    });
+    await expect(headerInstallBtn).toBeVisible();
   });
 });

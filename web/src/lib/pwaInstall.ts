@@ -9,11 +9,9 @@ export interface PwaInstallState {
   isInstalled: boolean;
   isIosSafari: boolean;
   isMacSafari: boolean;
-  isDismissed: boolean;
 }
 
-const DISMISS_KEY = 'tranx_pwa_install_dismissed_at';
-const DISMISS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const INSTALLED_DEVICE_KEY = 'tranx_pwa_installed_device_v1';
 
 let deferredPrompt: BeforeInstallPromptEvent | null = null;
 let installedFlag = false;
@@ -27,6 +25,28 @@ function detectStandaloneInstalled(): boolean {
   if ((window.navigator as Navigator & { standalone?: boolean }).standalone === true) return true;
   if (typeof document !== 'undefined' && document.referrer.startsWith('android-app://')) return true;
   return false;
+}
+
+function readInstalledDeviceFlag(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(INSTALLED_DEVICE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeInstalledDeviceFlag(installed: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (installed) {
+      window.localStorage.setItem(INSTALLED_DEVICE_KEY, '1');
+    } else {
+      window.localStorage.removeItem(INSTALLED_DEVICE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
 }
 
 function detectPlatform(): { isIosSafari: boolean; isMacSafari: boolean } {
@@ -43,26 +63,14 @@ function detectPlatform(): { isIosSafari: boolean; isMacSafari: boolean } {
   };
 }
 
-function readDismissed(): boolean {
-  if (typeof window === 'undefined') return false;
-  try {
-    const raw = window.localStorage.getItem(DISMISS_KEY);
-    if (!raw) return false;
-    const ts = Number(raw);
-    return Number.isFinite(ts) && Date.now() - ts < DISMISS_TTL_MS;
-  } catch {
-    return false;
-  }
-}
-
 export function getPwaInstallState(): PwaInstallState {
   const { isIosSafari, isMacSafari } = detectPlatform();
+  const isStandalone = detectStandaloneInstalled();
   return {
     canNativePrompt: deferredPrompt !== null,
-    isInstalled: installedFlag || detectStandaloneInstalled(),
+    isInstalled: installedFlag || isStandalone || readInstalledDeviceFlag(),
     isIosSafari,
     isMacSafari,
-    isDismissed: readDismissed(),
   };
 }
 
@@ -74,22 +82,42 @@ function emit(): void {
 export function initPwaInstallCapture(): void {
   if (initialized || typeof window === 'undefined') return;
   initialized = true;
-  installedFlag = detectStandaloneInstalled();
+  installedFlag = detectStandaloneInstalled() || readInstalledDeviceFlag();
+  if (detectStandaloneInstalled()) {
+    writeInstalledDeviceFlag(true);
+  }
 
+  // Native OS check on Chromium browsers (works even when opened in a regular tab!)
+  const navWithRelated = navigator as Navigator & {
+    getInstalledRelatedApps?: () => Promise<Array<{ platform?: string; url?: string }>>;
+  };
+  if (typeof navWithRelated.getInstalledRelatedApps === 'function') {
+    navWithRelated
+      .getInstalledRelatedApps()
+      .then((apps) => {
+        if (Array.isArray(apps) && apps.length > 0) {
+          installedFlag = true;
+          writeInstalledDeviceFlag(true);
+          deferredPrompt = null;
+          emit();
+        }
+      })
+      .catch(() => {});
+  }
+
+  // Browser fires beforeinstallprompt ONLY when the app is NOT currently installed on this device
   window.addEventListener('beforeinstallprompt', (ev: Event) => {
     ev.preventDefault();
     deferredPrompt = ev as BeforeInstallPromptEvent;
+    installedFlag = false;
+    writeInstalledDeviceFlag(false);
     emit();
   });
 
   window.addEventListener('appinstalled', () => {
     deferredPrompt = null;
     installedFlag = true;
-    try {
-      window.localStorage.removeItem(DISMISS_KEY);
-    } catch {
-      // ignore
-    }
+    writeInstalledDeviceFlag(true);
     emit();
   });
 
@@ -97,6 +125,7 @@ export function initPwaInstallCapture(): void {
   mq?.addEventListener?.('change', (e) => {
     if (e.matches) {
       installedFlag = true;
+      writeInstalledDeviceFlag(true);
       deferredPrompt = null;
       emit();
     }
@@ -112,17 +141,6 @@ export function subscribePwaInstallState(fn: (state: PwaInstallState) => void): 
   };
 }
 
-export function dismissPwaInstallBanner(): void {
-  if (typeof window !== 'undefined') {
-    try {
-      window.localStorage.setItem(DISMISS_KEY, String(Date.now()));
-    } catch {
-      // ignore
-    }
-  }
-  emit();
-}
-
 export async function triggerNativePwaInstall(): Promise<'accepted' | 'dismissed' | 'unavailable'> {
   if (!deferredPrompt) return 'unavailable';
   const promptEvent = deferredPrompt;
@@ -133,6 +151,7 @@ export async function triggerNativePwaInstall(): Promise<'accepted' | 'dismissed
     const choice = await promptEvent.userChoice;
     if (choice?.outcome === 'accepted') {
       installedFlag = true;
+      writeInstalledDeviceFlag(true);
       emit();
       return 'accepted';
     }

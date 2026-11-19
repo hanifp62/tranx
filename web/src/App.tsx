@@ -72,13 +72,11 @@ import {
 } from './lib/directEngine';
 import { startVoiceDictation, type DictationHandle } from './lib/speech';
 import {
-  dismissPwaInstallBanner,
   getPwaInstallState,
   subscribePwaInstallState,
   triggerNativePwaInstall,
   type PwaInstallState,
 } from './lib/pwaInstall';
-import { isLocalE2EMode } from './lib/firebase';
 import {
   BrandAppTile,
   BrandWordmark,
@@ -2130,6 +2128,27 @@ export function App() {
           </div>
 
           <div className="header-right">
+            {!pwaState.isInstalled &&
+              (isMobile ? (
+                <button
+                  type="button"
+                  className="icon-square-btn install-app-icon-btn pressable"
+                  aria-label={strings.installAppMenu}
+                  title={strings.installAppMenu}
+                  onClick={handleInstallAppClick}
+                >
+                  <IconDownload size={19} />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="install-app-btn pressable"
+                  onClick={handleInstallAppClick}
+                >
+                  <IconDownload size={15} />
+                  <span>{strings.installAppMenu}</span>
+                </button>
+              ))}
             {isMobile && (
               <button
                 type="button"
@@ -2155,44 +2174,6 @@ export function App() {
             {strings.offlineBanner}
           </div>
         )}
-
-        {!pwaState.isInstalled &&
-          !pwaState.isDismissed &&
-          (pwaState.canNativePrompt ||
-            pwaState.isIosSafari ||
-            pwaState.isMacSafari ||
-            !isLocalE2EMode()) && (
-            <section
-              className="pwa-install-banner"
-              role="region"
-              aria-label={strings.installBannerTitle}
-            >
-              <div className="pwa-install-banner-left">
-                <BrandAppTile size={34} />
-                <div className="pwa-install-banner-text">
-                  <div className="pwa-install-banner-title">{strings.installBannerTitle}</div>
-                  <div className="pwa-install-banner-desc">{strings.installBannerDesc}</div>
-                </div>
-              </div>
-              <div className="pwa-install-banner-actions">
-                <button
-                  type="button"
-                  className="btn-primary pressable"
-                  onClick={handleInstallAppClick}
-                >
-                  <IconDownload size={16} />
-                  {strings.installNowBtn}
-                </button>
-                <button
-                  type="button"
-                  className="btn-secondary pressable"
-                  onClick={dismissPwaInstallBanner}
-                >
-                  {strings.installLaterBtn}
-                </button>
-              </div>
-            </section>
-          )}
 
         {pathname === '/berkas' ? (
           <Suspense fallback={<div className="subpage-container"><div className="result-card">...</div></div>}>

@@ -30,6 +30,13 @@ export default defineConfig({
         scope: '/',
         lang: 'id',
         categories: ['books', 'productivity', 'utilities'],
+        prefer_related_applications: false,
+        related_applications: [
+          {
+            platform: 'webapp',
+            url: 'https://tranx-hanif-id.web.app/manifest.webmanifest',
+          },
+        ],
         icons: [
           {
             src: '/icons/icon-192.png',
