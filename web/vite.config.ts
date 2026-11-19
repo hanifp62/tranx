@@ -62,14 +62,19 @@ export default defineConfig({
         ],
       },
       workbox: {
+        skipWaiting: true,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true,
+        maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
         globPatterns: ['**/*.{js,css,html,svg,png}'],
+        globIgnores: ['**/pdf.worker*', '**/worker.min*'],
         navigateFallback: '/index.html',
         navigateFallbackDenylist: [/^\/v1\//],
       },
     }),
   ],
   build: {
-    target: 'es2022',
+    target: 'esnext',
     sourcemap: false,
     rollupOptions: {
       output: {

@@ -651,6 +651,7 @@ export function TranslatedWebViewer({
   url,
   initialMode,
   titleId,
+  backPath = '/',
   strings,
   onNavigate,
 }: {
@@ -658,6 +659,7 @@ export function TranslatedWebViewer({
   url: string;
   initialMode: ModePair;
   titleId?: string;
+  backPath?: string;
   strings: UiStrings;
   onNavigate: (path: string) => void;
 }) {
@@ -694,30 +696,14 @@ export function TranslatedWebViewer({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100dvh' }}>
-      <div
-        className="glass-regular-surface"
-        style={{
-          position: 'sticky',
-          top: '10px',
-          margin: '10px auto',
-          width: 'min(920px, calc(100% - 20px))',
-          borderRadius: 'var(--r-popover)',
-          padding: '8px 12px',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: '8px',
-          flexWrap: 'wrap',
-          zIndex: 30,
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+      <header className="web-viewer-topbar">
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
           <button
             type="button"
             className="btn-secondary pressable"
-            onClick={() => onNavigate('/')}
+            onClick={() => onNavigate(backPath)}
           >
-            Kembali
+            {strings.backBtn}
           </button>
           <div style={{ display: 'inline-flex', gap: '4px' }}>
             <button
@@ -727,7 +713,7 @@ export function TranslatedWebViewer({
               }
               onClick={() => setView('translated')}
             >
-              Terjemahan
+              {strings.translatedViewTab}
             </button>
             <button
               type="button"
@@ -736,7 +722,7 @@ export function TranslatedWebViewer({
               }
               onClick={() => setView('original')}
             >
-              Situs Asli
+              {strings.originalViewTab}
             </button>
           </div>
         </div>
@@ -780,16 +766,16 @@ export function TranslatedWebViewer({
             </a>
           )}
         </div>
-      </div>
+      </header>
 
       {loading ? (
         <div className="subpage-container">
-          <div className="result-card">Memuat dan menerjemahkan halaman web...</div>
+          <div className="result-card">{strings.loadingWebPage}</div>
         </div>
       ) : errorMsg ? (
         <div className="subpage-container">
           <div className="result-card">
-            <span className="status-badge error">Tidak dapat diterjemahkan langsung</span>
+            <span className="status-badge error">{strings.cannotTranslateWeb}</span>
             <div>{errorMsg}</div>
             {safeExternalUrl && (
               <div>
@@ -813,7 +799,7 @@ export function TranslatedWebViewer({
           style={{
             flex: 1,
             width: '100%',
-            minHeight: 'calc(100dvh - 80px)',
+            minHeight: 'calc(100dvh - 64px)',
             border: 'none',
             background: 'var(--bg)',
           }}

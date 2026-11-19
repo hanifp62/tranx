@@ -181,21 +181,36 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       page.getByRole('button', { name: 'Bahasa tujuan: Inggris' })
     ).toBeVisible();
 
-    // 8. Verify Mode Gambar: Berdampingan & Hamparan gambar (<canvas>)
+    // 8. Verify True Mode Page Switching (zero Teks bubble / textarea overlap) + Mode Gambar
+    await page.getByRole('tab', { name: 'Gambar' }).click();
+    await expect(page.locator('textarea.composer-textarea')).toHaveCount(0);
+    await expect(page.locator('.user-bubble')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Pilih gambar' })).toBeVisible();
+
+    await page.getByRole('tab', { name: 'Dokumen' }).click();
+    await expect(page.locator('textarea.composer-textarea')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Pilih berkas' })).toBeVisible();
+
+    // Clicking Lainnya and then clicking outside dismisses popover cleanly without overlapping Search
+    await page.getByRole('button', { name: 'Lainnya' }).click();
+    await expect(page.getByRole('menuitem', { name: 'Berkas saya' })).toBeVisible();
+    await page.locator('.popover-dismiss-backdrop').click({ position: { x: 640, y: 200 } });
+    await expect(page.getByRole('menuitem', { name: 'Berkas saya' })).toHaveCount(0);
+
     await page.getByRole('tab', { name: 'Gambar' }).click();
     await page.locator('input[type="file"][accept*="image/png"]').setInputFiles({
       name: 'panel-manga.png',
       mimeType: 'image/png',
       buffer: createTinyPngBuffer(),
     });
-    await page.getByRole('button', { name: 'Kirim' }).click();
+    await page.getByRole('button', { name: 'Terjemahkan gambar' }).click();
     await expect(page.getByRole('tab', { name: 'Berdampingan' })).toBeVisible();
     await page.getByRole('tab', { name: 'Hamparan gambar' }).click();
     await expect(page.locator('canvas')).toBeVisible();
 
     // 9. Verify Mode Dokumen: arsip.rar stays visible with Galat reason, .srt uploads & opens Baca berdampingan
-    await page.getByRole('button', { name: 'Baru' }).click();
     await page.getByRole('tab', { name: 'Dokumen' }).click();
+    await expect(page.locator('textarea.composer-textarea')).toHaveCount(0);
     const docInput = page.locator('input[type="file"][accept*=".epub"]');
     await docInput.setInputFiles({
       name: 'arsip.rar',
@@ -203,7 +218,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       buffer: Buffer.from('Rar!'),
     });
     await expect(page.getByText(/Format \.rar tidak didukung/)).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Kirim' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Terjemahkan dokumen' })).toBeDisabled();
     await page.getByRole('button', { name: 'Hapus lampiran arsip.rar' }).click();
 
     await docInput.setInputFiles({
@@ -211,15 +226,15 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       mimeType: 'text/plain',
       buffer: Buffer.from('1\n00:00:01,000 --> 00:00:03,000\n千早は走った。\n'),
     });
-    await page.getByRole('button', { name: 'Kirim' }).click();
+    await page.getByRole('button', { name: 'Terjemahkan dokumen' }).click();
     await expect(page.getByRole('button', { name: 'Baca berdampingan' })).toBeVisible();
     await page.getByRole('button', { name: 'Baca berdampingan' }).click();
     await expect(page.getByRole('button', { name: 'Kembali ke percakapan' })).toBeVisible();
     await page.getByRole('button', { name: 'Kembali ke percakapan' }).click();
 
-    // 10. Verify Mode Link + /web viewer
-    await page.getByRole('button', { name: 'Baru' }).click();
+    // 10. Verify Mode Link switches directly to dedicated Link page + /web viewer
     await page.getByRole('tab', { name: 'Link' }).click();
+    await expect(page.locator('textarea.composer-textarea')).toHaveCount(0);
     await page.getByPlaceholder(/https:\/\//).fill('https://www.aozora.gr.jp/cards/1.html');
     await page.getByRole('button', { name: 'Terjemahkan halaman' }).click();
     await expect(
@@ -270,7 +285,8 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_desktop_gelap.png',
     });
 
-    // Switch UI Language to English and back via Undo
+    // Switch UI Language to English and back via Undo (first return to empty Baru page)
+    await page.getByRole('button', { name: 'Baru' }).click();
     await page.locator('.account-row-btn').click();
     await page.getByRole('menuitem', { name: /Bahasa tampilan/ }).click();
     await expect(
@@ -301,7 +317,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       await route.fulfill({ status: 404, body: 'Not Found' });
     });
 
-    // CORS-enabled Jina Reader mock matching real r.jina.ai JSON schema
+    // CORS-enabled Jina Reader mock matching real r.jina.ai JSON schema (including pure-punctuation line)
     await page.route('https://r.jina.ai/**', async (route) => {
       await route.fulfill({
         status: 200,
@@ -312,18 +328,19 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
           data: {
             title: 'The Rainy Gate of Kyoto',
             content:
-              'Chihaya stood quietly under the wooden gate while listening to the rain.\n\nShe opened her notebook and read the letter from Tokyo.',
+              'Chihaya stood quietly under the wooden gate while listening to the rain.\n\n「…………」\n\nShe opened her notebook and read the letter from Tokyo.',
             url: 'https://www.aozora.gr.jp/cards/1.html',
           },
         }),
       });
     });
 
-    // CORS-enabled Google GTX mock preserving [[E0]] glossary shield tokens
+    // CORS-enabled Google GTX mock supporting both batched POST and GET while preserving [[E0]] & [[#0]] markers
     await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
       const reqUrl = new URL(route.request().url());
       const tl = reqUrl.searchParams.get('tl') || 'id';
-      const q = reqUrl.searchParams.get('q') || '';
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const q = postParams.get('q') || reqUrl.searchParams.get('q') || '';
       const lines = q.split('\n');
       const translatedLines = lines.map((line) => {
         if (tl === 'ja') {
@@ -399,7 +416,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.locator('.assistant-prose').first()).toContainText('千早');
     await expect(page.locator('.assistant-prose').first()).toContainText('駅を静かに歩いた');
 
-    // 4. Native FlateDecode PDF extraction & translation in Direct Spark Mode (zero Blaze needed)
+    // 4. Real pdfjs-dist PDF extraction & translation in Direct Spark Mode (zero Blaze needed)
     await page.getByRole('button', { name: 'Baru' }).click();
     await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
     await page.getByRole('menuitemradio', { name: 'Inggris' }).click();
@@ -414,7 +431,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
         'She opened her notebook and read the letter from Tokyo.'
       ),
     });
-    await page.getByRole('button', { name: 'Kirim' }).click();
+    await page.getByRole('button', { name: 'Terjemahkan dokumen' }).click();
     await expect(page.getByRole('button', { name: 'Baca berdampingan' })).toBeVisible();
     await expect(page.getByRole('main')).toContainText(
       'Ia membuka buku catatannya dan membaca surat dari Tokyo'
@@ -446,7 +463,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       mimeType: 'text/plain',
       buffer: Buffer.from(assSample, 'utf-8'),
     });
-    await page.getByRole('button', { name: 'Kirim' }).click();
+    await page.getByRole('button', { name: 'Terjemahkan dokumen' }).click();
     await expect(page.getByRole('button', { name: 'Baca berdampingan' })).toBeVisible();
 
     await page.getByRole('button', { name: 'Lainnya' }).click();
@@ -470,6 +487,33 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect(docxBytes[1]).toBe(0x4b);
     expect(docxBytes.toString('latin1')).toContain('word/document.xml');
     expect(docxBytes.toString('utf-8')).toContain('Gerbang Hujan di Kyoto');
+
+    // 6. Real Zero-Key Browser Image OCR via tesseract.js WASM (no Gemini API key needed!)
+    await page.getByRole('button', { name: 'Kembali ke ruang baca' }).click();
+    await page.getByRole('tab', { name: 'Gambar' }).click();
+    const renderedPngBase64 = await page.evaluate(() => {
+      const c = document.createElement('canvas');
+      c.width = 720;
+      c.height = 180;
+      const ctx = c.getContext('2d')!;
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, c.width, c.height);
+      ctx.fillStyle = '#000000';
+      ctx.font = 'bold 40px Arial, sans-serif';
+      ctx.fillText('The Rainy Gate of Kyoto', 36, 108);
+      return c.toDataURL('image/png').split(',')[1];
+    });
+    await page.locator('input[type="file"][accept*="image/png"]').setInputFiles({
+      name: 'ocr-banner.png',
+      mimeType: 'image/png',
+      buffer: Buffer.from(renderedPngBase64, 'base64'),
+    });
+    await page.getByRole('button', { name: 'Terjemahkan gambar' }).click();
+    await expect(page.getByRole('tab', { name: 'Berdampingan' })).toBeVisible({
+      timeout: 25000,
+    });
+    await expect(page.getByRole('main')).toContainText('Gerbang Hujan di Kyoto');
+    await expect(page.getByText(/simpan kunci API Gemini/i)).toHaveCount(0);
   });
 
   test('Tablet 820x1180 & Mobile 390x844: Zero horizontal overflow, unclipped split language bar, >= 44px tap targets, Mode bar ABOVE Composer, Laci & Bottom Sheets', async ({
@@ -597,7 +641,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(
       page.getByText(/Isi biner berkas bukan gambar PNG, JPG, atau WEBP yang sah/i)
     ).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Kirim' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Terjemahkan gambar' })).toBeDisabled();
     await page.getByRole('button', { name: 'Hapus lampiran spoofed-svg.png' }).click();
 
     await page.getByRole('tab', { name: 'Dokumen' }).click();
@@ -609,7 +653,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(
       page.getByText(/Isi biner berkas bukan dokumen PDF yang sah/i)
     ).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Kirim' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Terjemahkan dokumen' })).toBeDisabled();
     await page.getByRole('button', { name: 'Hapus lampiran spoofed-html.pdf' }).click();
     await page.getByRole('tab', { name: 'Teks' }).click();
 
@@ -662,7 +706,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       mimeType: 'text/plain',
       buffer: Buffer.from('1\n00:00:01,000 --> 00:00:03,000\n千早は走った。\n'),
     });
-    await page.getByRole('button', { name: 'Kirim' }).click();
+    await page.getByRole('button', { name: 'Terjemahkan dokumen' }).click();
     await expect(page.getByRole('button', { name: 'Baca berdampingan' })).toBeVisible();
 
     await page.getByRole('button', { name: 'Lainnya' }).click();

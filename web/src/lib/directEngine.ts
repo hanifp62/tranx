@@ -240,67 +240,230 @@ function unmaskWithGlossary(text: string, map: Map<string, string>): string {
   return out;
 }
 
-async function translateViaGoogleGtx(
-  text: string,
+function hasTranslatableLetters(text: string): boolean {
+  return /[\p{L}\p{N}\u3040-\u30ff\u3400-\u9fff]/u.test(text);
+}
+
+function cleanCjkSpacing(raw: string): string {
+  return raw.replace(
+    /([\u3000-\u30ff\u3400-\u9fff\uff00-\uffef])\s+(?=[\u3000-\u30ff\u3400-\u9fff\uff00-\uffef])/g,
+    '$1'
+  );
+}
+
+async function requestGtxSingleChunk(
+  chunk: string,
   src: SourceLang,
   tgt: TargetLang,
   signal?: AbortSignal
-): Promise<{ translated: string; detected: TargetLang }> {
-  const clean = text.trim();
-  if (!clean) return { translated: '', detected: src === 'auto' ? 'ja' : src };
+): Promise<{ translated: string; detected?: TargetLang }> {
+  const clean = chunk.trim();
+  if (!clean || !hasTranslatableLetters(clean)) {
+    return { translated: chunk };
+  }
 
-  // Split long inputs safely into <= 1350-char chunks along paragraph/sentence boundaries
-  const chunks: string[] = [];
-  let cursor = '';
-  for (const part of clean.split(/(\n+)/)) {
-    if ((cursor + part).length > 1350 && cursor) {
-      chunks.push(cursor);
-      cursor = part;
-    } else {
-      cursor += part;
+  const queryMeta = new URLSearchParams({
+    client: 'gtx',
+    sl: src,
+    tl: tgt,
+    dt: 't',
+  });
+  const bodyForm = new URLSearchParams({ q: clean });
+
+  try {
+    const resp = await fetch(
+      `https://translate.googleapis.com/translate_a/single?${queryMeta.toString()}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        body: bodyForm.toString(),
+        signal,
+      }
+    );
+    if (resp.ok) {
+      const data = await resp.json();
+      const pieces: string[] = Array.isArray(data?.[0])
+        ? data[0]
+            .map((seg: unknown) =>
+              Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''
+            )
+            .filter(Boolean)
+        : [];
+      const serverSrc = String(data?.[2] || '').toLowerCase();
+      const detected =
+        serverSrc === 'ja' || serverSrc === 'id' || serverSrc === 'en'
+          ? (serverSrc as TargetLang)
+          : undefined;
+      return { translated: pieces.join(''), detected };
+    }
+  } catch (err) {
+    if ((err as { name?: string })?.name === 'AbortError') throw err;
+  }
+
+  // Fallback 1: GET for short payloads or alternate Google endpoint
+  if (clean.length <= 450) {
+    try {
+      const qs = new URLSearchParams({
+        client: 'gtx',
+        sl: src,
+        tl: tgt,
+        dt: 't',
+        q: clean,
+      });
+      const respGet = await fetch(
+        `https://translate.googleapis.com/translate_a/single?${qs.toString()}`,
+        { method: 'GET', signal }
+      );
+      if (respGet.ok) {
+        const data = await respGet.json();
+        const pieces: string[] = Array.isArray(data?.[0])
+          ? data[0]
+              .map((seg: unknown) =>
+                Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''
+              )
+              .filter(Boolean)
+          : [];
+        return { translated: pieces.join('') };
+      }
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') throw err;
     }
   }
-  if (cursor) chunks.push(cursor);
 
-  const translatedChunks: string[] = [];
+  // Fallback 2: MyMemory public translation API for short chunks
+  if (clean.length <= 480) {
+    try {
+      const effSrc = src === 'auto' ? detectLanguageLocal(clean, tgt === 'ja' ? 'id' : 'ja') : src;
+      const mmQs = new URLSearchParams({
+        q: clean,
+        langpair: `${effSrc}|${tgt}`,
+      });
+      const mmResp = await fetch(
+        `https://api.mymemory.translated.net/get?${mmQs.toString()}`,
+        { signal }
+      );
+      if (mmResp.ok) {
+        const mmData = await mmResp.json();
+        const mmText = String(mmData?.responseData?.translatedText || '').trim();
+        if (mmText) return { translated: mmText, detected: effSrc };
+      }
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') throw err;
+    }
+  }
+
+  throw new Error('Layanan terjemahan sedang sibuk. Silakan coba sesaat lagi.');
+}
+
+async function translateBatchViaGoogleGtx(
+  paragraphs: string[],
+  src: SourceLang,
+  tgt: TargetLang,
+  signal?: AbortSignal
+): Promise<{ outputs: string[]; detected: TargetLang }> {
+  const outputs = new Array<string>(paragraphs.length).fill('');
   let detected: TargetLang =
     src === 'auto'
-      ? detectLanguageLocal(clean, tgt === 'ja' ? 'id' : 'ja')
+      ? detectLanguageLocal(paragraphs.slice(0, 6).join('\n'), tgt === 'ja' ? 'id' : 'ja')
       : src;
 
-  for (const chunk of chunks) {
-    if (!chunk.trim()) {
-      translatedChunks.push(chunk);
+  const work: Array<{ idx: number; text: string }> = [];
+  paragraphs.forEach((p, idx) => {
+    const trimmed = p.trim();
+    if (!trimmed || !hasTranslatableLetters(trimmed)) {
+      outputs[idx] = p;
+    } else {
+      work.push({ idx, text: trimmed });
+    }
+  });
+
+  let cursor = 0;
+  while (cursor < work.length) {
+    const batch: Array<{ idx: number; text: string }> = [];
+    let charCount = 0;
+    while (
+      cursor < work.length &&
+      batch.length < 18 &&
+      charCount + work[cursor].text.length <= 1650
+    ) {
+      batch.push(work[cursor]);
+      charCount += work[cursor].text.length + 12;
+      cursor += 1;
+    }
+    if (batch.length === 0) {
+      batch.push(work[cursor]);
+      cursor += 1;
+    }
+
+    if (batch.length === 1 && batch[0].text.length > 1650) {
+      // Split single very long paragraph along sentence boundaries
+      const parts = batch[0].text.split(/(?<=[。！？.!?\n])/);
+      const subChunks: string[] = [];
+      let acc = '';
+      for (const part of parts) {
+        if ((acc + part).length > 1200 && acc) {
+          subChunks.push(acc);
+          acc = part;
+        } else {
+          acc += part;
+        }
+      }
+      if (acc) subChunks.push(acc);
+      const translatedSubs: string[] = [];
+      for (const sc of subChunks) {
+        const r = await requestGtxSingleChunk(sc, src, tgt, signal);
+        if (r.detected) detected = r.detected;
+        translatedSubs.push(r.translated);
+      }
+      outputs[batch[0].idx] = translatedSubs.join(' ').trim();
       continue;
     }
-    const qs = new URLSearchParams({
-      client: 'gtx',
-      sl: src,
-      tl: tgt,
-      dt: 't',
-      q: chunk,
-    });
-    const resp = await fetch(
-      `https://translate.googleapis.com/translate_a/single?${qs.toString()}`,
-      { method: 'GET', signal }
-    );
-    if (!resp.ok) {
-      throw new Error(`Layanan terjemahan mengembalikan status ${resp.status}.`);
+
+    if (batch.length === 1) {
+      try {
+        const res = await requestGtxSingleChunk(batch[0].text, src, tgt, signal);
+        if (res.detected) detected = res.detected;
+        outputs[batch[0].idx] = res.translated || batch[0].text;
+      } catch (err) {
+        if ((err as { name?: string })?.name === 'AbortError') throw err;
+        if (work.length === 1) throw err;
+        outputs[batch[0].idx] = batch[0].text;
+      }
+      continue;
     }
-    const data = await resp.json();
-    const pieces: string[] = Array.isArray(data?.[0])
-      ? data[0]
-          .map((seg: unknown) => (Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''))
-          .filter(Boolean)
-      : [];
-    const serverSrc = String(data?.[2] || '').toLowerCase();
-    if (serverSrc === 'ja' || serverSrc === 'id' || serverSrc === 'en') {
-      detected = serverSrc;
+
+    const joined = batch.map((b, k) => `[[#${k}]] ${b.text}`).join('\n');
+    try {
+      const res = await requestGtxSingleChunk(joined, src, tgt, signal);
+      if (res.detected) detected = res.detected;
+      const splitParts = res.translated.split(/\[\[\s*#\s*(\d+)\s*\]\]/);
+      for (let p = 1; p + 1 < splitParts.length; p += 2) {
+        const slot = Number(splitParts[p]);
+        if (batch[slot]) {
+          outputs[batch[slot].idx] = splitParts[p + 1].trim();
+        }
+      }
+      for (const b of batch) {
+        if (!outputs[b.idx]) {
+          const singleRes = await requestGtxSingleChunk(b.text, src, tgt, signal).catch(
+            () => ({ translated: b.text })
+          );
+          outputs[b.idx] = singleRes.translated || b.text;
+        }
+      }
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') throw err;
+      // Graceful per-item fallback so one noisy paragraph never aborts a whole chapter
+      for (const b of batch) {
+        const singleRes = await requestGtxSingleChunk(b.text, src, tgt, signal).catch(() => ({
+          translated: b.text,
+        }));
+        outputs[b.idx] = singleRes.translated || b.text;
+      }
     }
-    translatedChunks.push(pieces.join(''));
   }
 
-  return { translated: translatedChunks.join(''), detected };
+  return { outputs, detected };
 }
 
 async function translateViaGeminiDirect(
@@ -429,13 +592,16 @@ export async function translateParagraphsDirect(params: {
     }
   }
 
-  const outputs: string[] = [];
-  for (let i = 0; i < maskedList.length; i += 1) {
-    const item = maskedList[i];
-    const res = await translateViaGoogleGtx(item.masked, src, tgt, params.signal);
-    if (i === 0) detectedSource = res.detected;
-    outputs.push(unmaskWithGlossary(res.translated, item.map));
-  }
+  const batchedRes = await translateBatchViaGoogleGtx(
+    maskedList.map((m) => m.masked),
+    src,
+    tgt,
+    params.signal
+  );
+  detectedSource = batchedRes.detected;
+  const outputs = batchedRes.outputs.map((raw, i) =>
+    unmaskWithGlossary(raw, maskedList[i].map)
+  );
 
   return {
     outputs,
@@ -454,6 +620,7 @@ interface CachedWebEntry {
 }
 
 const webArticleCache = new Map<string, CachedWebEntry>();
+const translatedWebCache = new Map<string, { heading: string; paras: string[] }>();
 
 function cleanReaderMarkdownToParagraphs(md: string): string[] {
   const lines = md.split(/\r?\n/);
@@ -502,40 +669,76 @@ async function fetchWebArticleDirect(rawUrl: string): Promise<CachedWebEntry> {
 
   const host = new URL(cleanUrl).hostname;
   const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), 22000);
+  const timer = window.setTimeout(() => ctrl.abort(), 24000);
 
   try {
-    const resp = await fetch(`https://r.jina.ai/${cleanUrl}`, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      signal: ctrl.signal,
-    });
-    if (!resp.ok) {
-      throw new Error(
-        `Halaman ${host} menolak pembacaan otomatis (HTTP ${resp.status}). Gunakan tombol Buka situs asli.`
-      );
-    }
-    const ctype = resp.headers.get('content-type') || '';
     let titleSrc = host;
-    let contentText = '';
+    let srcParas: string[] = [];
     let finalUrl = cleanUrl;
 
-    if (ctype.includes('application/json')) {
-      const json = await resp.json();
-      const d = json?.data || {};
-      titleSrc = String(d.title || host).trim() || host;
-      contentText = String(d.content || d.description || '').trim();
-      if (typeof d.url === 'string' && d.url.startsWith('http')) {
-        finalUrl = d.url;
+    try {
+      const resp = await fetch(`https://r.jina.ai/${cleanUrl}`, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        signal: ctrl.signal,
+      });
+      if (resp.ok) {
+        const ctype = resp.headers.get('content-type') || '';
+        let contentText = '';
+        if (ctype.includes('application/json')) {
+          const json = await resp.json();
+          const d = json?.data || {};
+          titleSrc = String(d.title || host).trim() || host;
+          contentText = String(d.content || d.description || '').trim();
+          if (typeof d.url === 'string' && d.url.startsWith('http')) {
+            finalUrl = d.url;
+          }
+        } else {
+          const rawTxt = await resp.text();
+          const titleMatch = rawTxt.match(/^Title:\s*(.+)$/m);
+          if (titleMatch) titleSrc = titleMatch[1].trim();
+          contentText = rawTxt;
+        }
+        srcParas = cleanReaderMarkdownToParagraphs(contentText);
       }
-    } else {
-      const rawTxt = await resp.text();
-      const titleMatch = rawTxt.match(/^Title:\s*(.+)$/m);
-      if (titleMatch) titleSrc = titleMatch[1].trim();
-      contentText = rawTxt;
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') throw err;
     }
 
-    const srcParas = cleanReaderMarkdownToParagraphs(contentText);
+    // Fallback CORS HTML extractor if Jina Reader returned empty or blocked
+    if (srcParas.length === 0) {
+      const proxyResp = await fetch(
+        `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`,
+        { method: 'GET', signal: ctrl.signal }
+      );
+      if (!proxyResp.ok) {
+        throw new Error(
+          `Halaman ${host} menolak pembacaan otomatis (HTTP ${proxyResp.status}). Gunakan tombol Buka situs asli.`
+        );
+      }
+      const rawHtml = await proxyResp.text();
+      const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+      doc
+        .querySelectorAll('script, style, noscript, nav, footer, header, aside, svg')
+        .forEach((el) => el.remove());
+      titleSrc = (doc.title || host).trim() || host;
+      const root =
+        doc.querySelector('article, main, .widget-episodeBody, #novel_honbun, .main_text') ||
+        doc.body;
+      const nodes = Array.from(root?.querySelectorAll('h1, h2, h3, p') || []);
+      srcParas = nodes
+        .map((n) => (n.textContent || '').replace(/\s+/g, ' ').trim())
+        .filter((s) => s.length >= 2)
+        .slice(0, 140);
+      if (srcParas.length === 0 && root?.textContent) {
+        srcParas = root.textContent
+          .split(/\n{2,}/)
+          .map((s) => s.replace(/\s+/g, ' ').trim())
+          .filter((s) => s.length >= 2)
+          .slice(0, 140);
+      }
+    }
+
     if (srcParas.length === 0) {
       throw new Error(
         `Tidak ditemukan paragraf teks yang dapat dibaca pada ${host}. Halaman mungkin memerlukan login.`
@@ -575,24 +778,37 @@ export async function directPreviewLink(params: {
   const tid = params.titleId || `t_web_${article.host.replace(/[^a-z0-9]/gi, '_').slice(0, 24)}`;
   const mid = `lnk_${Date.now().toString(36)}`;
 
-  const sampleInputs = [article.titleSrc, ...article.srcParas.slice(0, 3)];
+  const cappedParas = article.srcParas.slice(0, 80);
+  const fullInputs = [article.titleSrc, ...cappedParas];
   const { outputs, detectedSource, matchedChips } = await translateParagraphsDirect({
-    paragraphs: sampleInputs,
+    paragraphs: fullInputs,
     mode: params.mode,
     titleId: tid,
   });
 
   const titleDst = outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
-  const excerptSrc = article.srcParas
+  const translatedParas = outputs.slice(1).map((s) => s.replace(/^#{1,6}\s+/, ''));
+  translatedWebCache.set(`${article.url}::${params.mode}`, {
+    heading: titleDst,
+    paras: outputs.slice(1),
+  });
+  translatedWebCache.set(`${normalizeWebUrl(params.url)}::${params.mode}`, {
+    heading: titleDst,
+    paras: outputs.slice(1),
+  });
+
+  const excerptSrc = cappedParas
     .slice(0, 2)
     .map((s) => s.replace(/^#{1,6}\s+/, ''))
     .join(' ')
     .slice(0, 260);
-  const excerptDst = outputs
-    .slice(1)
-    .map((s) => s.replace(/^#{1,6}\s+/, ''))
-    .join(' ')
-    .slice(0, 280);
+  const excerptDst = translatedParas.slice(0, 3).join(' ').slice(0, 320);
+  const fullTranslatedText = translatedParas.join('\n\n');
+  const sentences: SentencePair[] = cappedParas.map((srcLine, idx) => ({
+    i: idx,
+    src: srcLine.replace(/^#{1,6}\s+/, ''),
+    dst: translatedParas[idx] || srcLine,
+  }));
 
   const preview: LinkPreviewPayload = {
     mid,
@@ -605,7 +821,7 @@ export async function directPreviewLink(params: {
     titleDst,
     excerptSrc,
     excerptDst,
-    paragraphCount: article.srcParas.length,
+    paragraphCount: cappedParas.length,
     lockedNames: matchedChips.length,
     readerSupported: true,
   };
@@ -624,7 +840,9 @@ export async function directPreviewLink(params: {
     mode: params.mode,
     detectedSource,
     titleId: tid,
-    text: excerptDst,
+    srcText: article.url,
+    text: fullTranslatedText,
+    sentences,
     linkPreview: preview,
     state: 'done',
   });
@@ -657,14 +875,23 @@ export async function directFetchTranslatedWebHtml(params: {
   let bodyParas = article.srcParas;
 
   if (params.view === 'translated') {
-    const batch = [article.titleSrc, ...article.srcParas.slice(0, 60)];
-    const { outputs } = await translateParagraphsDirect({
-      paragraphs: batch,
-      mode: params.mode,
-      titleId: params.titleId,
-    });
-    headingText = outputs[0] || article.titleSrc;
-    bodyParas = outputs.slice(1);
+    const cacheKey1 = `${article.url}::${params.mode}`;
+    const cacheKey2 = `${normalizeWebUrl(params.url)}::${params.mode}`;
+    const preTranslated = translatedWebCache.get(cacheKey1) || translatedWebCache.get(cacheKey2);
+    if (preTranslated) {
+      headingText = preTranslated.heading;
+      bodyParas = preTranslated.paras;
+    } else {
+      const batch = [article.titleSrc, ...article.srcParas.slice(0, 80)];
+      const { outputs } = await translateParagraphsDirect({
+        paragraphs: batch,
+        mode: params.mode,
+        titleId: params.titleId,
+      });
+      headingText = outputs[0] || article.titleSrc;
+      bodyParas = outputs.slice(1);
+      translatedWebCache.set(cacheKey1, { heading: headingText, paras: bodyParas });
+    }
   }
 
   const renderedParas = bodyParas
@@ -1279,51 +1506,173 @@ async function extractPdfUnitsNative(buffer: ArrayBuffer): Promise<ParsedDocUnit
   return units;
 }
 
-async function extractPdfUnitsViaGemini(
-  buffer: ArrayBuffer,
-  geminiKey: string
-): Promise<ParsedDocUnit[]> {
-  if (buffer.byteLength > 18 * 1024 * 1024) {
-    throw new Error('PDF pindaian untuk ekstraksi multimodal dibatasi maksimal 18 MB.');
-  }
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  const b64 = btoa(binary);
-  const resp = await fetch(
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { inlineData: { mimeType: 'application/pdf', data: b64 } },
-              {
-                text: 'Extract all readable paragraphs from this PDF in reading order. Return strict JSON: {"paragraphs":["..."]}',
-              },
-            ],
-          },
-        ],
-        generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
-      }),
+async function runTesseractOcrBoxes(
+  imageSource: string | HTMLCanvasElement,
+  imgW: number,
+  imgH: number,
+  srcLang: SourceLang
+): Promise<Array<{ id: number; box_2d: number[]; text: string }>> {
+  const [{ createWorker }, workerUrlMod] = await Promise.all([
+    import('tesseract.js'),
+    import('tesseract.js/dist/worker.min.js?url'),
+  ]);
+
+  const langs =
+    srcLang === 'ja'
+      ? ['jpn', 'eng']
+      : srcLang === 'id'
+        ? ['ind', 'eng']
+        : srcLang === 'en'
+          ? ['eng']
+          : ['jpn', 'eng'];
+
+  const resolvedWorkerUrl =
+    typeof window !== 'undefined'
+      ? new URL(workerUrlMod.default, window.location.origin).href
+      : workerUrlMod.default;
+
+  const worker = await createWorker(langs, 1, {
+    workerPath: resolvedWorkerUrl,
+    workerBlobURL: false,
+    logger: () => {},
+  });
+
+  try {
+    const { data } = await worker.recognize(
+      imageSource,
+      {},
+      { text: true, blocks: true }
+    );
+    const out: Array<{ id: number; box_2d: number[]; text: string }> = [];
+    const blocks = Array.isArray(data?.blocks) ? data.blocks : [];
+
+    for (const blk of blocks) {
+      const paras = Array.isArray(blk.paragraphs) ? blk.paragraphs : [];
+      for (const para of paras) {
+        const cleaned = cleanCjkSpacing((para.text || '').replace(/\s+/g, ' ').trim());
+        if (!cleaned || !hasTranslatableLetters(cleaned)) continue;
+        const bb = para.bbox || blk.bbox;
+        if (bb) {
+          const ymin = Math.max(0, Math.min(1000, Math.round((bb.y0 / imgH) * 1000)));
+          const xmin = Math.max(0, Math.min(1000, Math.round((bb.x0 / imgW) * 1000)));
+          const ymax = Math.max(0, Math.min(1000, Math.round((bb.y1 / imgH) * 1000)));
+          const xmax = Math.max(0, Math.min(1000, Math.round((bb.x1 / imgW) * 1000)));
+          out.push({ id: out.length + 1, box_2d: [ymin, xmin, ymax, xmax], text: cleaned });
+        }
+      }
     }
-  );
-  if (!resp.ok) {
-    throw new Error(`Ekstraksi PDF Gemini mengembalikan status HTTP ${resp.status}.`);
+
+    if (out.length === 0 && data?.text) {
+      const fallbackLines = data.text
+        .split(/\r?\n/)
+        .map((l) => cleanCjkSpacing(l.trim()))
+        .filter((l) => l.length > 0 && hasTranslatableLetters(l));
+      const count = Math.max(fallbackLines.length, 1);
+      fallbackLines.forEach((line, idx) => {
+        const ymin = Math.round(((idx + 0.3) / (count + 0.6)) * 1000);
+        const ymax = Math.min(1000, ymin + Math.round(700 / count));
+        out.push({ id: idx + 1, box_2d: [ymin, 50, ymax, 950], text: line });
+      });
+    }
+
+    return out;
+  } finally {
+    await worker.terminate().catch(() => {});
   }
-  const data = await resp.json();
-  const parsed = JSON.parse(data?.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
-  const paras: unknown[] = Array.isArray(parsed.paragraphs) ? parsed.paragraphs : [];
-  return paras
-    .map((p) => String(p || '').trim())
-    .filter(Boolean)
-    .map((text) => ({ text }));
+}
+
+async function extractPdfUnitsWithPdfJs(
+  buffer: ArrayBuffer,
+  mode: ModePair
+): Promise<ParsedDocUnit[]> {
+  const [pdfjs, workerUrlMod] = await Promise.all([
+    import('pdfjs-dist'),
+    import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+  ]);
+  pdfjs.GlobalWorkerOptions.workerSrc = workerUrlMod.default;
+
+  const loadingTask = pdfjs.getDocument({
+    data: new Uint8Array(buffer.slice(0)),
+    cMapUrl: `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjs.version}/cmaps/`,
+    cMapPacked: true,
+    standardFontDataUrl: `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjs.version}/standard_fonts/`,
+  });
+  const pdf = await loadingTask.promise;
+
+  if (pdf.numPages > 500) {
+    throw new Error(`PDF memiliki ${pdf.numPages} halaman (batas maksimum 500 halaman).`);
+  }
+
+  const units: ParsedDocUnit[] = [];
+  const maxPages = Math.min(pdf.numPages, 120);
+
+  for (let p = 1; p <= maxPages; p += 1) {
+    const page = await pdf.getPage(p);
+    const textContent = await page.getTextContent();
+    const lines: string[] = [];
+    let curLine = '';
+    let prevY: number | null = null;
+
+    for (const rawItem of textContent.items) {
+      if (!('str' in rawItem)) continue;
+      const str = rawItem.str || '';
+      const tx = Array.isArray(rawItem.transform) ? Number(rawItem.transform[5]) : null;
+      if (prevY !== null && tx !== null && Math.abs(tx - prevY) > 4) {
+        if (curLine.trim()) lines.push(cleanCjkSpacing(curLine.trim()));
+        curLine = str;
+      } else {
+        curLine += curLine && !curLine.endsWith(' ') && !CJK_RE.test(str) ? ` ${str}` : str;
+      }
+      if (tx !== null) prevY = tx;
+      if (rawItem.hasEOL && curLine.trim()) {
+        lines.push(cleanCjkSpacing(curLine.trim()));
+        curLine = '';
+        prevY = null;
+      }
+    }
+    if (curLine.trim()) lines.push(cleanCjkSpacing(curLine.trim()));
+
+    let paraBuf: string[] = [];
+    for (const ln of lines) {
+      if (!ln) continue;
+      paraBuf.push(ln);
+      if (/[.!?。！？」』]$/.test(ln) || paraBuf.join(' ').length >= 260) {
+        const sep = CJK_RE.test(ln) ? '' : ' ';
+        units.push({ text: cleanCjkSpacing(paraBuf.join(sep).trim()) });
+        paraBuf = [];
+      }
+    }
+    if (paraBuf.length > 0) {
+      const joined = paraBuf.join(' ');
+      units.push({ text: cleanCjkSpacing(joined.trim()) });
+    }
+  }
+
+  if (units.length > 0) {
+    await loadingTask.destroy().catch(() => {});
+    return units;
+  }
+
+  // Scanned image-only PDF: render pages to canvas and OCR via Tesseract
+  const { src } = parseModePair(mode);
+  const ocrPages = Math.min(pdf.numPages, 6);
+  for (let p = 1; p <= ocrPages; p += 1) {
+    const page = await pdf.getPage(p);
+    const viewport = page.getViewport({ scale: 1.7 });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.floor(viewport.width));
+    canvas.height = Math.max(1, Math.floor(viewport.height));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) continue;
+    await page.render({ canvasContext: ctx, canvas, viewport }).promise;
+    const boxes = await runTesseractOcrBoxes(canvas, canvas.width, canvas.height, src);
+    for (const b of boxes) {
+      if (b.text.trim()) units.push({ text: b.text.trim() });
+    }
+  }
+
+  await loadingTask.destroy().catch(() => {});
+  return units;
 }
 
 function parseAssSubtitleUnits(rawText: string): {
@@ -1384,7 +1733,10 @@ function parseAssSubtitleUnits(rawText: string): {
   return { headerDoc: headerLines.join('\n').trimEnd(), units };
 }
 
-async function parseDocumentUnitsInBrowser(file: File): Promise<{
+async function parseDocumentUnitsInBrowser(
+  file: File,
+  mode: ModePair = 'auto-id'
+): Promise<{
   fmt: string;
   headerDoc?: string;
   units: ParsedDocUnit[];
@@ -1431,20 +1783,19 @@ async function parseDocumentUnitsInBrowser(file: File): Promise<{
   }
 
   if (ext === 'pdf') {
+    try {
+      const pdfJsUnits = await extractPdfUnitsWithPdfJs(fullBuf, mode);
+      if (pdfJsUnits.length > 0) {
+        return { fmt: 'pdf', units: pdfJsUnits };
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('batas maksimum')) throw err;
+    }
     const nativeUnits = await extractPdfUnitsNative(fullBuf);
     if (nativeUnits.length > 0) {
       return { fmt: 'pdf', units: nativeUnits };
     }
-    const geminiKey = await getOwnerGeminiKey();
-    if (geminiKey) {
-      const ocrUnits = await extractPdfUnitsViaGemini(fullBuf, geminiKey);
-      if (ocrUnits.length > 0) {
-        return { fmt: 'pdf', units: ocrUnits };
-      }
-    }
-    throw new Error(
-      'PDF ini berisi hasil pindaian gambar tanpa lapisan teks. Simpan kunci API Gemini di Setelan -> Lanjutan untuk mengekstrak teks pindaian secara otomatis.'
-    );
+    throw new Error('Berkas PDF tidak memiliki teks yang dapat dibaca.');
   }
 
   const rawText = new TextDecoder('utf-8', { fatal: false }).decode(fullBuf);
@@ -1650,7 +2001,10 @@ export async function directTranslateDocumentFile(params: {
   onProgress?: (pct: number) => void;
 }): Promise<string> {
   const jobId = `job_${Date.now().toString(36)}`;
-  const { fmt, headerDoc, units } = await parseDocumentUnitsInBrowser(params.file);
+  const { fmt, headerDoc, units } = await parseDocumentUnitsInBrowser(
+    params.file,
+    params.mode
+  );
   if (units.length === 0) {
     throw new Error('Berkas tidak memiliki teks yang dapat diterjemahkan.');
   }
@@ -2030,33 +2384,43 @@ export async function directTranslateImage(params: {
         };
       }
     ).TextDetector;
-    if (!DetectorCtor) {
-      throw new Error(
-        'Untuk menerjemahkan teks pada gambar secara langsung, simpan kunci API Gemini Anda di Setelan -> Lanjutan.'
+    if (DetectorCtor) {
+      try {
+        const detector = new DetectorCtor();
+        const detectedBoxes = await detector.detect(imgDims.imgEl);
+        usedModel = 'browser-text-detector';
+        validBubbles = detectedBoxes
+          .filter((d) => typeof d.rawValue === 'string' && d.rawValue.trim() && d.boundingBox)
+          .map((d, idx) => {
+            const bb = d.boundingBox!;
+            const ymin = Math.round((bb.y / imgDims.h) * 1000);
+            const xmin = Math.round((bb.x / imgDims.w) * 1000);
+            const ymax = Math.round(((bb.y + bb.height) / imgDims.h) * 1000);
+            const xmax = Math.round(((bb.x + bb.width) / imgDims.w) * 1000);
+            return {
+              id: idx + 1,
+              box_2d: [ymin, xmin, ymax, xmax],
+              text: d.rawValue!.trim(),
+            };
+          });
+      } catch {
+        validBubbles = [];
+      }
+    }
+
+    if (validBubbles.length === 0) {
+      const { src } = parseModePair(params.mode);
+      usedModel = 'tesseract-wasm-ocr';
+      validBubbles = await runTesseractOcrBoxes(
+        params.imageDataUrl,
+        imgDims.w,
+        imgDims.h,
+        src
       );
     }
-    try {
-      const detector = new DetectorCtor();
-      const detectedBoxes = await detector.detect(imgDims.imgEl);
-      usedModel = 'browser-text-detector';
-      validBubbles = detectedBoxes
-        .filter((d) => typeof d.rawValue === 'string' && d.rawValue.trim() && d.boundingBox)
-        .map((d, idx) => {
-          const bb = d.boundingBox!;
-          const ymin = Math.round((bb.y / imgDims.h) * 1000);
-          const xmin = Math.round((bb.x / imgDims.w) * 1000);
-          const ymax = Math.round(((bb.y + bb.height) / imgDims.h) * 1000);
-          const xmax = Math.round(((bb.x + bb.width) / imgDims.w) * 1000);
-          return {
-            id: idx + 1,
-            box_2d: [ymin, xmin, ymax, xmax],
-            text: d.rawValue!.trim(),
-          };
-        });
-    } catch {
-      throw new Error(
-        'Untuk menerjemahkan teks pada gambar secara langsung, simpan kunci API Gemini Anda di Setelan -> Lanjutan.'
-      );
+
+    if (validBubbles.length === 0) {
+      throw new Error('Tidak ditemukan teks yang dapat dibaca pada gambar ini.');
     }
   }
 

@@ -179,6 +179,7 @@ export function App() {
   const [linkUrlInput, setLinkUrlInput] = useState('');
   const [isFetchingLink, setIsFetchingLink] = useState(false);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [isSubmittingAttachment, setIsSubmittingAttachment] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
 
@@ -190,8 +191,11 @@ export function App() {
 
   /* Floating Glass Menu / Sheet State (strictly <= 1 floating menu open at once -> R-10 dose cap) */
   const [langPickerSide, setLangPickerSide] = useState<'source' | 'target' | null>(null);
+  const [langMenuRect, setLangMenuRect] = useState<DOMRect | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [moreMenuRect, setMoreMenuRect] = useState<DOMRect | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [accountMenuRect, setAccountMenuRect] = useState<DOMRect | null>(null);
   const [historyMenuTarget, setHistoryMenuTarget] = useState<{
     conv: ConversationDoc;
     rect: DOMRect | null;
@@ -218,17 +222,24 @@ export function App() {
   const docInputRef = useRef<HTMLInputElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
-  const navigate = useCallback((nextPath: string) => {
-    if (window.location.pathname + window.location.search !== nextPath) {
-      window.history.pushState({}, '', nextPath);
-    }
-    setRoutePath(nextPath);
-    setMobileDrawerOpen(false);
+  const closeAllPopovers = useCallback(() => {
     setMoreMenuOpen(false);
     setAccountMenuOpen(false);
     setLangPickerSide(null);
     setHistoryMenuTarget(null);
   }, []);
+
+  const navigate = useCallback(
+    (nextPath: string) => {
+      if (window.location.pathname + window.location.search !== nextPath) {
+        window.history.pushState({}, '', nextPath);
+      }
+      setRoutePath(nextPath);
+      setMobileDrawerOpen(false);
+      closeAllPopovers();
+    },
+    [closeAllPopovers]
+  );
 
   const pushToast = useCallback(
     (message: string, undoLabel?: string, onUndo?: () => void) => {
@@ -243,6 +254,10 @@ export function App() {
 
   const parsedUrl = useMemo(() => new URL(routePath, window.location.origin), [routePath]);
   const pathname = parsedUrl.pathname;
+  const lastNonWebPathRef = useRef<string>('/');
+  if (pathname !== '/web') {
+    lastNonWebPathRef.current = routePath;
+  }
   const activeCid = useMemo(() => {
     const match = pathname.match(/^\/c\/([^/]+)/);
     return match ? decodeURIComponent(match[1]) : '';
@@ -385,14 +400,19 @@ export function App() {
     [conversations, activeCid]
   );
 
+  const prevSyncedCidRef = useRef<string>('');
   useEffect(() => {
-    if (activeConversation) {
+    if (activeConversation && activeConversation.id !== prevSyncedCidRef.current) {
+      prevSyncedCidRef.current = activeConversation.id;
       setActiveMode(activeConversation.mode);
+      setActiveTab(activeConversation.activeTab || 'teks');
       if (activeConversation.detectedSource) {
         setLastDetectedSource(activeConversation.detectedSource);
       }
+    } else if (!activeCid) {
+      prevSyncedCidRef.current = '';
     }
-  }, [activeConversation]);
+  }, [activeConversation, activeCid]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -614,6 +634,44 @@ export function App() {
     pushToast(strings.deletedToast);
   };
 
+  const handleSelectWorkTab = useCallback(
+    (nextTab: WorkTab) => {
+      closeAllPopovers();
+      if (isDictating) {
+        dictationRef.current?.stop();
+        setIsDictating(false);
+      }
+      setAttachments([]);
+      setStreamingTurn(null);
+      setActiveTab(nextTab);
+
+      const convTab: WorkTab = activeConversation?.activeTab || 'teks';
+      if (activeCid && convTab !== nextTab) {
+        setComposerText('');
+        setLinkUrlInput('');
+        navigate(nextTab === 'teks' ? '/' : `/?tab=${nextTab}`);
+        return;
+      }
+      if (!activeCid) {
+        navigate(nextTab === 'teks' ? '/' : `/?tab=${nextTab}`);
+      }
+    },
+    [activeCid, activeConversation, closeAllPopovers, isDictating, navigate]
+  );
+
+  useEffect(() => {
+    if (activeTab !== 'gambar') return;
+    const onGlobalPaste = (e: ClipboardEvent) => {
+      const files = e.clipboardData?.files;
+      if (files && files.length > 0 && files[0].type.startsWith('image/')) {
+        e.preventDefault();
+        handleStageFiles([files[0]], 'gambar');
+      }
+    };
+    window.addEventListener('paste', onGlobalPaste);
+    return () => window.removeEventListener('paste', onGlobalPaste);
+  }, [activeTab]);
+
   /* Submit Link Preview (L5 / H7): works both from Link tab and standalone URLs in Teks */
   const handleSubmitLink = async (e?: React.FormEvent, explicitUrl?: string) => {
     e?.preventDefault();
@@ -621,19 +679,23 @@ export function App() {
     const rawUrl = (explicitUrl ?? (linkUrlInput || composerText)).trim();
     if (!rawUrl) return;
 
-    const cid = activeCid || `c_${Date.now().toString(36)}`;
+    const reuseCid =
+      activeCid && (!activeConversation || activeConversation.activeTab === 'link');
+    const cid = reuseCid ? activeCid : `c_${Date.now().toString(36)}`;
     const tempId = `lnk_wait_${Date.now().toString(36)}`;
+    prevSyncedCidRef.current = cid;
+    setActiveTab('link');
     setLinkUrlInput('');
     if (!explicitUrl) setComposerText('');
     setIsFetchingLink(true);
-    if (!activeCid) navigate(`/c/${cid}`);
+    if (activeCid !== cid) navigate(`/c/${cid}`);
 
     setStreamingTurn({
       id: tempId,
       role: 'assistant',
       kind: 'text',
       mode: activeMode,
-      text: 'Membaca dan menerjemahkan halaman web...',
+      text: strings.loadingWebPage,
       state: 'running',
       createdAt: Date.now(),
     });
@@ -644,7 +706,7 @@ export function App() {
         cid,
         url: rawUrl,
         mode: activeMode,
-        titleId: activeConversation?.titleId || undefined,
+        titleId: reuseCid ? activeConversation?.titleId || undefined : undefined,
       });
       setStreamingTurn(null);
     } catch (err) {
@@ -682,13 +744,17 @@ export function App() {
       return;
     }
 
-    const cid = activeCid || `c_${Date.now().toString(36)}`;
+    const reuseCid =
+      activeCid && (!activeConversation || (activeConversation.activeTab || 'teks') === 'teks');
+    const cid = reuseCid ? activeCid : `c_${Date.now().toString(36)}`;
     const clientMsgId = `m_${Date.now().toString(36)}_u`;
     const asstId = `${clientMsgId}_r`;
-    const titleId = activeConversation?.titleId || undefined;
+    const titleId = reuseCid ? activeConversation?.titleId || undefined : undefined;
 
+    prevSyncedCidRef.current = cid;
+    setActiveTab('teks');
     if (!overrideText) setComposerText('');
-    if (!activeCid) navigate(`/c/${cid}`);
+    if (activeCid !== cid) navigate(`/c/${cid}`);
 
     const abort = new AbortController();
     streamAbortRef.current = abort;
@@ -804,57 +870,66 @@ export function App() {
   };
 
   const handleSendAttachments = async () => {
-    if (!user) return;
+    if (!user || isSubmittingAttachment) return;
     const readyItems = attachments.filter((a) => a.status === 'ready' && a.file);
     if (!readyItems.length) return;
 
-    const cid = activeCid || `c_${Date.now().toString(36)}`;
-    if (!activeCid) navigate(`/c/${cid}`);
+    const targetTab: WorkTab = activeTab === 'gambar' ? 'gambar' : 'dokumen';
+    const reuseCid =
+      activeCid && (!activeConversation || activeConversation.activeTab === targetTab);
+    const cid = reuseCid ? activeCid : `c_${Date.now().toString(36)}`;
+    prevSyncedCidRef.current = cid;
+    if (activeCid !== cid) navigate(`/c/${cid}`);
 
-    for (const item of readyItems) {
-      setAttachments((prev) =>
-        prev.map((a) => (a.id === item.id ? { ...a, status: 'reading' } : a))
-      );
-      try {
-        if (activeTab === 'gambar' && item.file) {
-          const dataUrl = await readFileAsDataUrl(item.file);
-          await translateImageRequest({
-            user,
-            cid,
-            mode: activeMode,
-            fileName: item.name,
-            imageDataUrl: dataUrl,
-            titleId: activeConversation?.titleId || undefined,
-          });
-        } else if (item.file) {
-          const mid = `doc_${Date.now().toString(36)}`;
-          setUploadPct(5);
-          await processDocumentSubmission({
-            uid: user.uid,
-            cid,
-            mid,
-            mode: activeMode,
-            titleId: activeConversation?.titleId || undefined,
-            file: item.file,
-            onProgress: (pct) => setUploadPct(pct),
-          });
-          setUploadPct(null);
-        }
-        setAttachments((prev) => prev.filter((a) => a.id !== item.id));
-      } catch (err) {
-        setUploadPct(null);
+    setIsSubmittingAttachment(true);
+    try {
+      for (const item of readyItems) {
         setAttachments((prev) =>
-          prev.map((a) =>
-            a.id === item.id
-              ? {
-                  ...a,
-                  status: 'error',
-                  reason: humanizeFetchError(err, 'Gagal memproses berkas.'),
-                }
-              : a
-          )
+          prev.map((a) => (a.id === item.id ? { ...a, status: 'reading' } : a))
         );
+        try {
+          if (targetTab === 'gambar' && item.file) {
+            const dataUrl = await readFileAsDataUrl(item.file);
+            await translateImageRequest({
+              user,
+              cid,
+              mode: activeMode,
+              fileName: item.name,
+              imageDataUrl: dataUrl,
+              titleId: reuseCid ? activeConversation?.titleId || undefined : undefined,
+            });
+          } else if (item.file) {
+            const mid = `doc_${Date.now().toString(36)}`;
+            setUploadPct(5);
+            await processDocumentSubmission({
+              uid: user.uid,
+              cid,
+              mid,
+              mode: activeMode,
+              titleId: reuseCid ? activeConversation?.titleId || undefined : undefined,
+              file: item.file,
+              onProgress: (pct) => setUploadPct(pct),
+            });
+            setUploadPct(null);
+          }
+          setAttachments((prev) => prev.filter((a) => a.id !== item.id));
+        } catch (err) {
+          setUploadPct(null);
+          setAttachments((prev) =>
+            prev.map((a) =>
+              a.id === item.id
+                ? {
+                    ...a,
+                    status: 'error',
+                    reason: humanizeFetchError(err, 'Gagal memproses berkas.'),
+                  }
+                : a
+            )
+          );
+        }
       }
+    } finally {
+      setIsSubmittingAttachment(false);
     }
   };
 
@@ -1031,20 +1106,37 @@ export function App() {
         url={targetUrl}
         initialMode={qMode}
         titleId={qTid}
+        backPath={lastNonWebPathRef.current || '/'}
         strings={strings}
         onNavigate={navigate}
       />
     );
   }
 
-  const isStageEmpty = !activeCid || displayedMessages.length === 0;
+  const modeMessages = displayedMessages.filter((turn) => {
+    if (activeTab === 'gambar') return turn.kind === 'image';
+    if (activeTab === 'dokumen') return turn.kind === 'document';
+    if (activeTab === 'link') {
+      return turn.kind === 'link' || Boolean(streamingTurn && turn.id === streamingTurn.id);
+    }
+    return (
+      turn.role === 'user' ||
+      !turn.kind ||
+      turn.kind === 'text' ||
+      turn.kind === 'long'
+    );
+  });
+
+  const isStageEmpty = !activeCid || modeMessages.length === 0;
   const readyAttachmentCount = attachments.filter((a) => a.status === 'ready').length;
   const canSendNow =
     activeTab === 'teks'
       ? composerText.trim().length > 0
       : activeTab === 'link'
-        ? (linkUrlInput || composerText).trim().length > 0 && !isFetchingLink
-        : readyAttachmentCount > 0;
+        ? linkUrlInput.trim().length > 0 && !isFetchingLink
+        : readyAttachmentCount > 0 && !isSubmittingAttachment;
+
+  const numLocale = settings.uiLang === 'en' ? 'en-US' : 'id-ID';
 
   const sourcePillLabel =
     currentSrcLang === 'auto'
@@ -1068,82 +1160,258 @@ export function App() {
       ? (['id', 'en', 'ja'] as const).filter((l) => l !== liveDetectedLang)
       : [];
 
+  const renderStagedAttachmentList = (modeKind: 'gambar' | 'dokumen') => (
+    <div className="attachment-list">
+      {attachments.map((att) => (
+        <div
+          key={att.id}
+          className={`attachment-chip ${att.status === 'error' ? 'is-error' : ''}`}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
+            {att.status === 'error' ? (
+              <IconAlert size={20} style={{ color: 'var(--danger)', flexShrink: 0 }} />
+            ) : modeKind === 'gambar' ? (
+              <IconPhoto size={20} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+            ) : (
+              <IconFileText size={20} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+            )}
+            <div style={{ minWidth: 0 }}>
+              <div className="attachment-chip-title">{att.name}</div>
+              <div className="attachment-chip-sub">
+                {att.status === 'error'
+                  ? att.reason
+                  : att.status === 'reading'
+                    ? modeKind === 'gambar'
+                      ? strings.readingImageOcr
+                      : uploadPct !== null
+                        ? `${strings.processingDoc} (${uploadPct}%)`
+                        : strings.processingDoc
+                    : `${strings.readyToSend} (${(att.sizeBytes / 1024).toFixed(1)} KB)`}
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="icon-square-btn"
+            disabled={att.status === 'reading'}
+            aria-label={`Hapus lampiran ${att.name}`}
+            onClick={() => setAttachments((prev) => prev.filter((x) => x.id !== att.id))}
+          >
+            <IconX size={18} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+
   const renderComposerAndModeZone = () => (
     <div className="composer-zone-wrapper">
       <div className="composer-slot">
-        {activeTab === 'gambar' && isStageEmpty && attachments.length === 0 ? (
-          <div
-            className={`task-drop-card ${isDraggingFile ? 'dragging' : ''}`}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setIsDraggingFile(true);
-            }}
-            onDragLeave={() => setIsDraggingFile(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setIsDraggingFile(false);
-              if (e.dataTransfer.files.length) {
-                handleStageFiles(e.dataTransfer.files, 'gambar');
-              }
-            }}
-          >
-            <IconPhoto size={28} />
-            <div style={{ fontWeight: 600, fontSize: '16px' }}>{strings.pickImage}</div>
-            <div style={{ fontSize: '14px', color: 'var(--text-muted)', maxWidth: '460px' }}>
-              {strings.supportedImageHint}
+        {activeTab === 'gambar' ? (
+          attachments.length > 0 ? (
+            <div className="composer-island">
+              {renderStagedAttachmentList('gambar')}
+              <div className="composer-footer">
+                <div className="composer-meta-left">
+                  <button
+                    type="button"
+                    className="btn-secondary pressable"
+                    disabled={isSubmittingAttachment}
+                    onClick={() => imageInputRef.current?.click()}
+                  >
+                    <IconPhoto size={16} />
+                    {strings.pickImage}
+                  </button>
+                </div>
+                <div className="composer-controls-right">
+                  <button
+                    type="button"
+                    className="btn-primary pressable"
+                    disabled={!canSendNow}
+                    onClick={() => handleSendAttachments()}
+                  >
+                    <IconPhoto size={17} />
+                    {isSubmittingAttachment
+                      ? strings.readingImageOcr
+                      : strings.translateImageBtn}
+                  </button>
+                </div>
+              </div>
             </div>
-            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', justifyContent: 'center' }}>
+          ) : isStageEmpty ? (
+            <div
+              className={`task-drop-card ${isDraggingFile ? 'dragging' : ''}`}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setIsDraggingFile(true);
+              }}
+              onDragLeave={() => setIsDraggingFile(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDraggingFile(false);
+                if (e.dataTransfer.files.length) {
+                  handleStageFiles(e.dataTransfer.files, 'gambar');
+                }
+              }}
+            >
+              <IconPhoto size={28} />
+              <div style={{ fontWeight: 600, fontSize: '16px' }}>{strings.pickImage}</div>
+              <div style={{ fontSize: '14px', color: 'var(--text-muted)', maxWidth: '460px' }}>
+                {strings.supportedImageHint}
+              </div>
+              <div
+                style={{
+                  display: 'flex',
+                  gap: '10px',
+                  flexWrap: 'wrap',
+                  justifyContent: 'center',
+                }}
+              >
+                <button
+                  type="button"
+                  className="btn-primary pressable"
+                  onClick={() => imageInputRef.current?.click()}
+                >
+                  <IconPhoto size={18} />
+                  {isMobile ? strings.pickFromGallery : strings.pickImage}
+                </button>
+                {isMobile && (
+                  <button
+                    type="button"
+                    className="btn-secondary pressable"
+                    onClick={() => cameraInputRef.current?.click()}
+                  >
+                    <IconCamera size={18} />
+                    {strings.takeCameraPhoto}
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div
+              className="composer-island"
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+              }}
+            >
+              <span style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
+                {strings.supportedImageHint}
+              </span>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn-primary pressable"
+                  onClick={() => imageInputRef.current?.click()}
+                >
+                  <IconPhoto size={17} />
+                  {strings.translateAnotherImage}
+                </button>
+                {isMobile && (
+                  <button
+                    type="button"
+                    className="btn-secondary pressable"
+                    onClick={() => cameraInputRef.current?.click()}
+                  >
+                    <IconCamera size={17} />
+                    {strings.takeCameraPhoto}
+                  </button>
+                )}
+              </div>
+            </div>
+          )
+        ) : activeTab === 'dokumen' ? (
+          attachments.length > 0 ? (
+            <div className="composer-island">
+              {renderStagedAttachmentList('dokumen')}
+              {isSubmittingAttachment && uploadPct !== null && (
+                <div className="progress-track">
+                  <div className="progress-fill" style={{ width: `${uploadPct}%` }} />
+                </div>
+              )}
+              <div className="composer-footer">
+                <div className="composer-meta-left">
+                  <button
+                    type="button"
+                    className="btn-secondary pressable"
+                    disabled={isSubmittingAttachment}
+                    onClick={() => docInputRef.current?.click()}
+                  >
+                    <IconFileText size={16} />
+                    {strings.addMoreFiles}
+                  </button>
+                </div>
+                <div className="composer-controls-right">
+                  <button
+                    type="button"
+                    className="btn-primary pressable"
+                    disabled={!canSendNow}
+                    onClick={() => handleSendAttachments()}
+                  >
+                    <IconFileText size={17} />
+                    {isSubmittingAttachment
+                      ? strings.processingDoc
+                      : strings.translateDocBtn}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : isStageEmpty ? (
+            <div
+              className={`task-drop-card ${isDraggingFile ? 'dragging' : ''}`}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setIsDraggingFile(true);
+              }}
+              onDragLeave={() => setIsDraggingFile(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDraggingFile(false);
+                if (e.dataTransfer.files.length) {
+                  handleStageFiles(e.dataTransfer.files, 'dokumen');
+                }
+              }}
+            >
+              <IconFileText size={28} />
+              <div style={{ fontWeight: 600, fontSize: '16px' }}>{strings.pickDocument}</div>
+              <div style={{ fontSize: '14px', color: 'var(--text-muted)', maxWidth: '480px' }}>
+                {strings.supportedDocHint}
+              </div>
               <button
                 type="button"
                 className="btn-primary pressable"
-                onClick={() => imageInputRef.current?.click()}
+                onClick={() => docInputRef.current?.click()}
               >
-                <IconPhoto size={18} />
-                {isMobile ? strings.pickFromGallery : strings.pickImage}
+                <IconFileText size={18} />
+                {strings.pickDocument}
               </button>
-              {isMobile && (
-                <button
-                  type="button"
-                  className="btn-secondary pressable"
-                  onClick={() => cameraInputRef.current?.click()}
-                >
-                  <IconCamera size={18} />
-                  {strings.takeCameraPhoto}
-                </button>
-              )}
             </div>
-          </div>
-        ) : activeTab === 'dokumen' && isStageEmpty && attachments.length === 0 ? (
-          <div
-            className={`task-drop-card ${isDraggingFile ? 'dragging' : ''}`}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setIsDraggingFile(true);
-            }}
-            onDragLeave={() => setIsDraggingFile(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setIsDraggingFile(false);
-              if (e.dataTransfer.files.length) {
-                handleStageFiles(e.dataTransfer.files, 'dokumen');
-              }
-            }}
-          >
-            <IconFileText size={28} />
-            <div style={{ fontWeight: 600, fontSize: '16px' }}>{strings.pickDocument}</div>
-            <div style={{ fontSize: '14px', color: 'var(--text-muted)', maxWidth: '480px' }}>
-              {strings.supportedDocHint}
-            </div>
-            <button
-              type="button"
-              className="btn-primary pressable"
-              onClick={() => docInputRef.current?.click()}
+          ) : (
+            <div
+              className="composer-island"
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+              }}
             >
-              <IconFileText size={18} />
-              {strings.pickDocument}
-            </button>
-          </div>
-        ) : activeTab === 'link' && isStageEmpty ? (
+              <span style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
+                {strings.supportedDocHint}
+              </span>
+              <button
+                type="button"
+                className="btn-primary pressable"
+                onClick={() => docInputRef.current?.click()}
+              >
+                <IconFileText size={17} />
+                {strings.translateAnotherDoc}
+              </button>
+            </div>
+          )
+        ) : activeTab === 'link' ? (
           <form onSubmit={(e) => handleSubmitLink(e)} className="composer-island">
             <label className="field-label">
               <span>{strings.pasteLinkLabel}</span>
@@ -1157,60 +1425,47 @@ export function App() {
                 required
               />
             </label>
-            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '8px',
+                flexWrap: 'wrap',
+              }}
+            >
+              <button
+                type="button"
+                className="btn-secondary pressable"
+                disabled={isFetchingLink}
+                onClick={async () => {
+                  try {
+                    const clip = (await navigator.clipboard.readText()).trim();
+                    if (clip) {
+                      setLinkUrlInput(clip);
+                    } else {
+                      pushToast('Papan klip masih kosong.');
+                    }
+                  } catch {
+                    pushToast('Tempel URL dengan Cmd/Ctrl+V.');
+                  }
+                }}
+              >
+                <IconCopy size={16} />
+                {strings.pasteUrlBtn}
+              </button>
               <button
                 type="submit"
                 className="btn-primary pressable"
                 disabled={isFetchingLink || !linkUrlInput.trim()}
               >
                 <IconLink size={18} />
-                {isFetchingLink ? 'Memuat halaman...' : strings.translateLinkBtn}
+                {isFetchingLink ? strings.loadingWebPage : strings.translateLinkBtn}
               </button>
             </div>
           </form>
         ) : (
           <div className="composer-island">
-            {attachments.length > 0 && (
-              <div className="attachment-list">
-                {attachments.map((att) => (
-                  <div
-                    key={att.id}
-                    className={`attachment-chip ${att.status === 'error' ? 'is-error' : ''}`}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
-                      {att.status === 'error' ? (
-                        <IconAlert size={20} style={{ color: 'var(--danger)', flexShrink: 0 }} />
-                      ) : (
-                        <IconFileText size={20} style={{ color: 'var(--accent)', flexShrink: 0 }} />
-                      )}
-                      <div style={{ minWidth: 0 }}>
-                        <div className="attachment-chip-title">{att.name}</div>
-                        <div className="attachment-chip-sub">
-                          {att.status === 'error'
-                            ? att.reason
-                            : att.status === 'reading'
-                              ? uploadPct !== null
-                                ? `Memproses ${uploadPct}%...`
-                                : 'Membaca dan menerjemahkan...'
-                              : `Siap dikirim (${(att.sizeBytes / 1024).toFixed(1)} KB)`}
-                        </div>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      className="icon-square-btn"
-                      aria-label={`Hapus lampiran ${att.name}`}
-                      onClick={() =>
-                        setAttachments((prev) => prev.filter((x) => x.id !== att.id))
-                      }
-                    >
-                      <IconX size={18} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-
             {isDictating ? (
               <div className="dictation-panel" role="status" aria-live="polite">
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -1251,8 +1506,8 @@ export function App() {
                 }}
               >
                 <span>
-                  {strings.detectedPrefix} {labelForLang(liveDetectedLang as TargetLang, strings)} ·
-                  Terjemahkan ke:
+                  {strings.detectedPrefix} {labelForLang(liveDetectedLang as TargetLang, strings)}
+                  {' \u2192 '}
                 </span>
                 {autoSameLangSuggestions.map((sug) => (
                   <button
@@ -1270,15 +1525,7 @@ export function App() {
             <textarea
               className="composer-textarea"
               aria-label={strings.composerPlaceholder}
-              placeholder={
-                activeTab === 'link'
-                  ? strings.composerLinkPlaceholder
-                  : activeTab === 'gambar'
-                    ? strings.composerImagePlaceholder
-                    : activeTab === 'dokumen'
-                      ? strings.composerDocPlaceholder
-                      : strings.composerPlaceholder
-              }
+              placeholder={strings.composerPlaceholder}
               value={composerText}
               onChange={(e) => setComposerText(e.target.value)}
               onPaste={(e) => {
@@ -1286,7 +1533,7 @@ export function App() {
                   const f = e.clipboardData.files[0];
                   if (f.type.startsWith('image/')) {
                     e.preventDefault();
-                    setActiveTab('gambar');
+                    handleSelectWorkTab('gambar');
                     handleStageFiles([f], 'gambar');
                   }
                 }
@@ -1299,12 +1546,8 @@ export function App() {
                   e.keyCode !== 229
                 ) {
                   e.preventDefault();
-                  if (activeTab === 'teks' && composerText.trim()) {
+                  if (composerText.trim()) {
                     handleSendText();
-                  } else if (activeTab === 'link' && composerText.trim()) {
-                    handleSubmitLink(undefined, composerText.trim());
-                  } else if (readyAttachmentCount > 0) {
-                    handleSendAttachments();
                   }
                 }
               }}
@@ -1312,32 +1555,12 @@ export function App() {
 
             <div className="composer-footer">
               <div className="composer-meta-left">
-                {activeTab === 'gambar' && (
-                  <button
-                    type="button"
-                    className="btn-secondary pressable"
-                    onClick={() => imageInputRef.current?.click()}
-                  >
-                    <IconPhoto size={16} />
-                    {strings.pickImage}
-                  </button>
-                )}
-                {activeTab === 'dokumen' && (
-                  <button
-                    type="button"
-                    className="btn-secondary pressable"
-                    onClick={() => docInputRef.current?.click()}
-                  >
-                    <IconFileText size={16} />
-                    {strings.pickDocument}
-                  </button>
-                )}
                 {composerText.length > 0 && (
                   <span>
-                    {composerText.length.toLocaleString('id-ID')} /{' '}
+                    {composerText.length.toLocaleString(numLocale)} /{' '}
                     {composerText.length <= settings.chatMaxChars
-                      ? `${settings.chatMaxChars.toLocaleString('id-ID')} cepat`
-                      : `${settings.longMaxChars.toLocaleString('id-ID')} naskah panjang`}
+                      ? `${settings.chatMaxChars.toLocaleString(numLocale)} ${strings.fastLimitUnit}`
+                      : `${settings.longMaxChars.toLocaleString(numLocale)} ${strings.longLimitUnit}`}
                   </span>
                 )}
               </div>
@@ -1369,15 +1592,7 @@ export function App() {
                     className="send-round-btn pressable"
                     aria-label={strings.send}
                     disabled={!canSendNow}
-                    onClick={() => {
-                      if (activeTab === 'teks') {
-                        handleSendText();
-                      } else if (activeTab === 'link') {
-                        handleSubmitLink(undefined, linkUrlInput || composerText);
-                      } else {
-                        handleSendAttachments();
-                      }
-                    }}
+                    onClick={() => handleSendText()}
                   >
                     <IconArrowUp size={19} />
                   </button>
@@ -1409,7 +1624,7 @@ export function App() {
               role="tab"
               aria-selected={activeTab === tabId}
               className="mode-seg-btn pressable"
-              onClick={() => setActiveTab(tabId)}
+              onClick={() => handleSelectWorkTab(tabId)}
             >
               <TabIcon size={17} />
               <span>{label}</span>
@@ -1431,7 +1646,7 @@ export function App() {
           e.preventDefault();
           const first = e.dataTransfer.files[0];
           const nextTab: WorkTab = first.type.startsWith('image/') ? 'gambar' : 'dokumen';
-          setActiveTab(nextTab);
+          handleSelectWorkTab(nextTab);
           handleStageFiles(e.dataTransfer.files, nextTab);
         }
       }}
@@ -1511,7 +1726,9 @@ export function App() {
             onClick={() => {
               setAttachments([]);
               setComposerText('');
+              setLinkUrlInput('');
               setStreamingTurn(null);
+              setActiveTab('teks');
               navigate('/');
             }}
           >
@@ -1525,6 +1742,7 @@ export function App() {
             type="button"
             className="sidebar-nav-btn pressable"
             onClick={() => {
+              closeAllPopovers();
               setSearchOpen((v) => !v);
               window.setTimeout(() => searchInputRef.current?.focus(), 30);
             }}
@@ -1533,70 +1751,22 @@ export function App() {
             <span>{strings.sidebarSearch}</span>
           </button>
 
-          <div style={{ position: 'relative' }}>
-            <button
-              type="button"
-              className="sidebar-nav-btn pressable"
-              aria-expanded={moreMenuOpen}
-              onClick={() => {
-                setAccountMenuOpen(false);
-                setLangPickerSide(null);
-                setHistoryMenuTarget(null);
-                setMoreMenuOpen((v) => !v);
-              }}
-            >
-              <IconDots size={18} />
-              <span>{strings.sidebarMore}</span>
-            </button>
-
-            {moreMenuOpen && (
-              <div
-                className="context-popover glass-regular-surface"
-                style={{ position: 'absolute', left: '8px', top: '40px' }}
-                role="menu"
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="menu-item-btn"
-                  onClick={() => navigate('/berkas')}
-                >
-                  <span className="menu-item-left">
-                    <IconFolder size={18} />
-                    {strings.myFiles}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="menu-item-btn"
-                  onClick={() => navigate('/kamus')}
-                >
-                  <span className="menu-item-left">
-                    <IconBook size={18} />
-                    {strings.glossary}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="menu-item-btn"
-                  onClick={() => {
-                    setMoreMenuOpen(false);
-                    setShortcutsOpen(true);
-                  }}
-                >
-                  <span className="menu-item-left">
-                    <IconKeyboard size={18} />
-                    {strings.shortcuts}
-                  </span>
-                  <span style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
-                    Ctrl+/
-                  </span>
-                </button>
-              </div>
-            )}
-          </div>
+          <button
+            type="button"
+            className="sidebar-nav-btn pressable"
+            aria-expanded={moreMenuOpen}
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              setAccountMenuOpen(false);
+              setLangPickerSide(null);
+              setHistoryMenuTarget(null);
+              setMoreMenuRect(rect);
+              setMoreMenuOpen((v) => !v);
+            }}
+          >
+            <IconDots size={18} />
+            <span>{strings.sidebarMore}</span>
+          </button>
         </div>
 
         {searchOpen && (
@@ -1711,10 +1881,12 @@ export function App() {
             type="button"
             className="account-row-btn pressable"
             aria-expanded={accountMenuOpen}
-            onClick={() => {
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
               setMoreMenuOpen(false);
               setLangPickerSide(null);
               setHistoryMenuTarget(null);
+              setAccountMenuRect(rect);
               setAccountMenuOpen((v) => !v);
             }}
           >
@@ -1727,104 +1899,6 @@ export function App() {
             </span>
             <IconDots size={17} />
           </button>
-
-          {accountMenuOpen && (
-            <div
-              className="context-popover glass-regular-surface"
-              style={{ position: 'absolute', left: '4px', bottom: '60px', width: '236px' }}
-              role="menu"
-            >
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => {
-                  setAccountMenuOpen(false);
-                  setSettingsOpen(true);
-                }}
-              >
-                <span className="menu-item-left">
-                  <IconSettings size={18} />
-                  {strings.settings}
-                </span>
-                <span style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>Ctrl+,</span>
-              </button>
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => handleChangeUiLang(settings.uiLang === 'id' ? 'en' : 'id')}
-              >
-                <span className="menu-item-left">
-                  <IconGlobe size={18} />
-                  {strings.uiLanguage}
-                </span>
-                <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--accent)' }}>
-                  {settings.uiLang === 'id' ? 'ID \u2192 EN' : 'EN \u2192 ID'}
-                </span>
-              </button>
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => {
-                  setAccountMenuOpen(false);
-                  setInfoModalKind('help');
-                }}
-              >
-                <span className="menu-item-left">
-                  <IconHelp size={18} />
-                  {strings.help}
-                </span>
-              </button>
-
-              <a
-                role="menuitem"
-                className="menu-item-btn"
-                href="mailto:hanifp633@gmail.com?subject=Masukan%20tranX"
-                onClick={() => setAccountMenuOpen(false)}
-              >
-                <span className="menu-item-left">
-                  <IconMail size={18} />
-                  {strings.sendFeedback}
-                </span>
-              </a>
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => {
-                  setAccountMenuOpen(false);
-                  setInfoModalKind('about');
-                }}
-              >
-                <span className="menu-item-left">
-                  <IconInfo size={18} />
-                  {strings.learnMore}
-                </span>
-              </button>
-
-              <div className="menu-divider" />
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn danger"
-                onClick={() => {
-                  setAccountMenuOpen(false);
-                  setLogoutOpen(true);
-                }}
-              >
-                <span className="menu-item-left">
-                  <IconLogout size={18} />
-                  {strings.signOut}
-                </span>
-              </button>
-            </div>
-          )}
         </div>
       </aside>
 
@@ -1846,16 +1920,18 @@ export function App() {
             )}
 
             {/* Split Bidirectional & Auto-Detect Language Selector (Sumber <-> Tujuan) */}
-            <div style={{ position: 'relative' }} className="lang-pair-bar">
+            <div className="lang-pair-bar">
               <button
                 type="button"
                 className="lang-pill-btn pressable"
                 aria-label={`${strings.sourceLangTitle}: ${sourcePillLabel}`}
                 aria-expanded={langPickerSide === 'source'}
-                onClick={() => {
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
                   setMoreMenuOpen(false);
                   setAccountMenuOpen(false);
                   setHistoryMenuTarget(null);
+                  setLangMenuRect(rect);
                   setLangPickerSide((p) => (p === 'source' ? null : 'source'));
                 }}
               >
@@ -1878,90 +1954,18 @@ export function App() {
                 className="lang-pill-btn pressable"
                 aria-label={`${strings.targetLangTitle}: ${targetPillLabel}`}
                 aria-expanded={langPickerSide === 'target'}
-                onClick={() => {
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
                   setMoreMenuOpen(false);
                   setAccountMenuOpen(false);
                   setHistoryMenuTarget(null);
+                  setLangMenuRect(rect);
                   setLangPickerSide((p) => (p === 'target' ? null : 'target'));
                 }}
               >
                 <span>{targetPillLabel}</span>
                 <IconChevronDown size={15} />
               </button>
-
-              {/* Desktop Source Language Popover */}
-              {!isMobile && langPickerSide === 'source' && (
-                <div
-                  className="context-popover glass-regular-surface"
-                  style={{ position: 'absolute', left: 0, top: '42px', width: '240px' }}
-                  role="menu"
-                  aria-label={strings.sourceLangTitle}
-                >
-                  <div
-                    style={{
-                      padding: '4px 10px 6px 10px',
-                      fontSize: '12px',
-                      color: 'var(--text-subtle)',
-                    }}
-                  >
-                    {strings.sourceAutoHint}
-                  </div>
-                  {(
-                    [
-                      ['auto', strings.langAuto],
-                      ['id', strings.langId],
-                      ['en', strings.langEn],
-                      ['ja', strings.langJa],
-                    ] as const
-                  ).map(([code, label]) => (
-                    <button
-                      key={code}
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={currentSrcLang === code}
-                      className="menu-item-btn"
-                      onClick={() => handleSelectSourceLang(code)}
-                    >
-                      <span>{label}</span>
-                      {currentSrcLang === code && (
-                        <IconCheck size={17} style={{ color: 'var(--accent)' }} />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              )}
-
-              {/* Desktop Target Language Popover */}
-              {!isMobile && langPickerSide === 'target' && (
-                <div
-                  className="context-popover glass-regular-surface"
-                  style={{ position: 'absolute', right: 0, top: '42px', width: '216px' }}
-                  role="menu"
-                  aria-label={strings.targetLangTitle}
-                >
-                  {(
-                    [
-                      ['id', strings.langId],
-                      ['en', strings.langEn],
-                      ['ja', strings.langJa],
-                    ] as const
-                  ).map(([code, label]) => (
-                    <button
-                      key={code}
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={currentTgtLang === code}
-                      className="menu-item-btn"
-                      onClick={() => handleSelectTargetLang(code)}
-                    >
-                      <span>{label}</span>
-                      {currentTgtLang === code && (
-                        <IconCheck size={17} style={{ color: 'var(--accent)' }} />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              )}
             </div>
           </div>
 
@@ -1973,8 +1977,10 @@ export function App() {
                 aria-label={strings.sidebarNew}
                 onClick={() => {
                   setComposerText('');
+                  setLinkUrlInput('');
                   setAttachments([]);
                   setStreamingTurn(null);
+                  setActiveTab('teks');
                   navigate('/');
                 }}
               >
@@ -2079,7 +2085,7 @@ export function App() {
         ) : (
           <div className="stage-body">
             <div className="stream-column">
-              {displayedMessages.map((turn) => {
+              {modeMessages.map((turn) => {
                 const { src: turnSrc, tgt: turnTgt } = parseModePair(turn.mode);
                 const effectiveTurnSrc = turn.detectedSource || (turnSrc === 'auto' ? 'ja' : turnSrc);
 
@@ -2180,20 +2186,18 @@ export function App() {
 
                 if (turn.kind === 'link' && turn.linkPreview) {
                   const lp = turn.linkPreview;
+                  const fullArticleText = turn.text || lp.excerptDst;
                   return (
                     <div key={turn.id} className="turn-assistant-wrap">
                       <div className="result-card">
                         <div style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
-                          {lp.host} · {lp.paragraphCount} paragraf
-                          {lp.lockedNames > 0 ? ` · ${lp.lockedNames} nama terkunci` : ''}
+                          {lp.host} · {lp.paragraphCount} {strings.paragraphsUnit}
+                          {lp.lockedNames > 0
+                            ? ` · ${lp.lockedNames} ${strings.lockedNamesUnit}`
+                            : ''}
                         </div>
-                        <div style={{ fontWeight: 600, fontSize: '17px' }}>{lp.titleDst}</div>
-                        <div
-                          className={`assistant-prose ${turnTgt === 'ja' ? 'is-jp' : ''}`}
-                          style={{ fontSize: '16px', lineHeight: '26px' }}
-                          lang={turnTgt}
-                        >
-                          {lp.excerptDst}
+                        <div style={{ fontWeight: 700, fontSize: '20px', lineHeight: '28px' }}>
+                          {lp.titleDst}
                         </div>
 
                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
@@ -2220,6 +2224,32 @@ export function App() {
                               {strings.openOriginalSite}
                             </a>
                           )}
+                          <button
+                            type="button"
+                            className="btn-secondary pressable"
+                            onClick={() => {
+                              navigator.clipboard?.writeText(
+                                `${lp.titleDst}\n\n${fullArticleText}`
+                              );
+                              pushToast(strings.copiedToast);
+                            }}
+                          >
+                            <IconCopy size={16} />
+                            {strings.copyTranslation}
+                          </button>
+                        </div>
+
+                        <div
+                          className={`assistant-prose ${turnTgt === 'ja' ? 'is-jp' : ''}`}
+                          style={{
+                            fontSize: '17px',
+                            lineHeight: '29px',
+                            paddingTop: '8px',
+                            borderTop: '1px solid var(--border)',
+                          }}
+                          lang={turnTgt}
+                        >
+                          {fullArticleText}
                         </div>
                       </div>
                     </div>
@@ -2538,86 +2568,347 @@ export function App() {
         )}
       </main>
 
-      {/* Desktop K/Menu riwayat (216px Liquid Glass Popover) */}
-      {!isMobile && historyMenuTarget && (
+      {/* Root-level Non-Overlapping Popovers with Shared Click-Outside Dismissal Backdrop */}
+      {(moreMenuOpen ||
+        accountMenuOpen ||
+        (!isMobile && Boolean(langPickerSide)) ||
+        (!isMobile && Boolean(historyMenuTarget))) && (
         <>
-          <div
-            style={{ position: 'fixed', inset: 0, zIndex: 58 }}
-            onClick={() => setHistoryMenuTarget(null)}
-          />
-          <div
-            className="context-popover glass-regular-surface"
-            style={{
-              width: '216px',
-              left: `${Math.min(
-                window.innerWidth - 228,
-                Math.max(12, historyMenuTarget.rect?.right || 220)
-              )}px`,
-              top: `${Math.min(
-                window.innerHeight - 210,
-                Math.max(12, historyMenuTarget.rect?.top || 120)
-              )}px`,
-            }}
-            role="menu"
-          >
-            <button
-              type="button"
-              role="menuitem"
-              className="menu-item-btn"
-              onClick={() => handleTogglePin(historyMenuTarget.conv)}
-            >
-              <span className="menu-item-left">
-                {historyMenuTarget.conv.pinned ? (
-                  <IconPinOff size={18} />
-                ) : (
-                  <IconPin size={18} />
-                )}
-                {historyMenuTarget.conv.pinned ? strings.unpinChat : strings.pinChat}
-              </span>
-            </button>
+          <div className="popover-dismiss-backdrop" onClick={closeAllPopovers} />
 
-            <button
-              type="button"
-              role="menuitem"
-              className="menu-item-btn"
-              onClick={() => {
-                const target = historyMenuTarget.conv;
-                setHistoryMenuTarget(null);
-                setRenameTarget(target);
+          {moreMenuOpen && (
+            <div
+              className="context-popover glass-regular-surface"
+              style={{
+                width: '224px',
+                left: `${Math.min(
+                  window.innerWidth - 236,
+                  Math.max(12, moreMenuRect?.left || 14)
+                )}px`,
+                top: `${Math.min(
+                  window.innerHeight - 170,
+                  Math.max(12, (moreMenuRect?.bottom || 152) + 6)
+                )}px`,
               }}
+              role="menu"
             >
-              <span className="menu-item-left">
-                <IconEdit size={18} />
-                {strings.renameChat}
-              </span>
-            </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => navigate('/berkas')}
+              >
+                <span className="menu-item-left">
+                  <IconFolder size={18} />
+                  {strings.myFiles}
+                </span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => navigate('/kamus')}
+              >
+                <span className="menu-item-left">
+                  <IconBook size={18} />
+                  {strings.glossary}
+                </span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => {
+                  setMoreMenuOpen(false);
+                  setShortcutsOpen(true);
+                }}
+              >
+                <span className="menu-item-left">
+                  <IconKeyboard size={18} />
+                  {strings.shortcuts}
+                </span>
+                <span style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
+                  Ctrl+/
+                </span>
+              </button>
+            </div>
+          )}
 
-            <button
-              type="button"
-              role="menuitem"
-              className="menu-item-btn"
-              onClick={() => handleShareConversation(historyMenuTarget.conv)}
+          {accountMenuOpen && (
+            <div
+              className="context-popover glass-regular-surface"
+              style={{
+                width: '236px',
+                left: `${Math.min(
+                  window.innerWidth - 248,
+                  Math.max(12, accountMenuRect?.left || 12)
+                )}px`,
+                bottom: `${Math.max(
+                  12,
+                  window.innerHeight - (accountMenuRect?.top || window.innerHeight - 64) + 8
+                )}px`,
+              }}
+              role="menu"
             >
-              <span className="menu-item-left">
-                <IconShare size={18} />
-                {strings.shareChat}
-              </span>
-            </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => {
+                  setAccountMenuOpen(false);
+                  setSettingsOpen(true);
+                }}
+              >
+                <span className="menu-item-left">
+                  <IconSettings size={18} />
+                  {strings.settings}
+                </span>
+                <span style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>Ctrl+,</span>
+              </button>
 
-            <div className="menu-divider" />
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => handleChangeUiLang(settings.uiLang === 'id' ? 'en' : 'id')}
+              >
+                <span className="menu-item-left">
+                  <IconGlobe size={18} />
+                  {strings.uiLanguage}
+                </span>
+                <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--accent)' }}>
+                  {settings.uiLang === 'id' ? 'ID \u2192 EN' : 'EN \u2192 ID'}
+                </span>
+              </button>
 
-            <button
-              type="button"
-              role="menuitem"
-              className="menu-item-btn danger"
-              onClick={() => handleDeleteConversation(historyMenuTarget.conv)}
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => {
+                  setAccountMenuOpen(false);
+                  setInfoModalKind('help');
+                }}
+              >
+                <span className="menu-item-left">
+                  <IconHelp size={18} />
+                  {strings.help}
+                </span>
+              </button>
+
+              <a
+                role="menuitem"
+                className="menu-item-btn"
+                href="mailto:hanifp633@gmail.com?subject=Masukan%20tranX"
+                onClick={() => setAccountMenuOpen(false)}
+              >
+                <span className="menu-item-left">
+                  <IconMail size={18} />
+                  {strings.sendFeedback}
+                </span>
+              </a>
+
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => {
+                  setAccountMenuOpen(false);
+                  setInfoModalKind('about');
+                }}
+              >
+                <span className="menu-item-left">
+                  <IconInfo size={18} />
+                  {strings.learnMore}
+                </span>
+              </button>
+
+              <div className="menu-divider" />
+
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn danger"
+                onClick={() => {
+                  setAccountMenuOpen(false);
+                  setLogoutOpen(true);
+                }}
+              >
+                <span className="menu-item-left">
+                  <IconLogout size={18} />
+                  {strings.signOut}
+                </span>
+              </button>
+            </div>
+          )}
+
+          {!isMobile && langPickerSide === 'source' && (
+            <div
+              className="context-popover glass-regular-surface"
+              style={{
+                width: '240px',
+                left: `${Math.min(
+                  window.innerWidth - 252,
+                  Math.max(12, langMenuRect?.left || 276)
+                )}px`,
+                top: `${Math.min(
+                  window.innerHeight - 230,
+                  Math.max(12, (langMenuRect?.bottom || 48) + 6)
+                )}px`,
+              }}
+              role="menu"
+              aria-label={strings.sourceLangTitle}
             >
-              <span className="menu-item-left">
-                <IconTrash size={18} />
-                {strings.deleteChat}
-              </span>
-            </button>
-          </div>
+              <div
+                style={{
+                  padding: '4px 10px 6px 10px',
+                  fontSize: '12px',
+                  color: 'var(--text-subtle)',
+                }}
+              >
+                {strings.sourceAutoHint}
+              </div>
+              {(
+                [
+                  ['auto', strings.langAuto],
+                  ['id', strings.langId],
+                  ['en', strings.langEn],
+                  ['ja', strings.langJa],
+                ] as const
+              ).map(([code, label]) => (
+                <button
+                  key={code}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={currentSrcLang === code}
+                  className="menu-item-btn"
+                  onClick={() => handleSelectSourceLang(code)}
+                >
+                  <span>{label}</span>
+                  {currentSrcLang === code && (
+                    <IconCheck size={17} style={{ color: 'var(--accent)' }} />
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {!isMobile && langPickerSide === 'target' && (
+            <div
+              className="context-popover glass-regular-surface"
+              style={{
+                width: '216px',
+                left: `${Math.min(
+                  window.innerWidth - 228,
+                  Math.max(12, langMenuRect?.left || 380)
+                )}px`,
+                top: `${Math.min(
+                  window.innerHeight - 190,
+                  Math.max(12, (langMenuRect?.bottom || 48) + 6)
+                )}px`,
+              }}
+              role="menu"
+              aria-label={strings.targetLangTitle}
+            >
+              {(
+                [
+                  ['id', strings.langId],
+                  ['en', strings.langEn],
+                  ['ja', strings.langJa],
+                ] as const
+              ).map(([code, label]) => (
+                <button
+                  key={code}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={currentTgtLang === code}
+                  className="menu-item-btn"
+                  onClick={() => handleSelectTargetLang(code)}
+                >
+                  <span>{label}</span>
+                  {currentTgtLang === code && (
+                    <IconCheck size={17} style={{ color: 'var(--accent)' }} />
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {!isMobile && historyMenuTarget && (
+            <div
+              className="context-popover glass-regular-surface"
+              style={{
+                width: '216px',
+                left: `${Math.min(
+                  window.innerWidth - 228,
+                  Math.max(12, historyMenuTarget.rect?.right || 220)
+                )}px`,
+                top: `${Math.min(
+                  window.innerHeight - 210,
+                  Math.max(12, historyMenuTarget.rect?.top || 120)
+                )}px`,
+              }}
+              role="menu"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => handleTogglePin(historyMenuTarget.conv)}
+              >
+                <span className="menu-item-left">
+                  {historyMenuTarget.conv.pinned ? (
+                    <IconPinOff size={18} />
+                  ) : (
+                    <IconPin size={18} />
+                  )}
+                  {historyMenuTarget.conv.pinned ? strings.unpinChat : strings.pinChat}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => {
+                  const target = historyMenuTarget.conv;
+                  setHistoryMenuTarget(null);
+                  setRenameTarget(target);
+                }}
+              >
+                <span className="menu-item-left">
+                  <IconEdit size={18} />
+                  {strings.renameChat}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn"
+                onClick={() => handleShareConversation(historyMenuTarget.conv)}
+              >
+                <span className="menu-item-left">
+                  <IconShare size={18} />
+                  {strings.shareChat}
+                </span>
+              </button>
+
+              <div className="menu-divider" />
+
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item-btn danger"
+                onClick={() => handleDeleteConversation(historyMenuTarget.conv)}
+              >
+                <span className="menu-item-left">
+                  <IconTrash size={18} />
+                  {strings.deleteChat}
+                </span>
+              </button>
+            </div>
+          )}
         </>
       )}
 

@@ -113,6 +113,25 @@ export interface UiStrings {
   inboxFromShortcut: string;
   translateNow: string;
   dismiss: string;
+  translateImageBtn: string;
+  translateDocBtn: string;
+  translateAnotherImage: string;
+  translateAnotherDoc: string;
+  translateAnotherLink: string;
+  addMoreFiles: string;
+  pasteUrlBtn: string;
+  backBtn: string;
+  translatedViewTab: string;
+  originalViewTab: string;
+  loadingWebPage: string;
+  cannotTranslateWeb: string;
+  readingImageOcr: string;
+  processingDoc: string;
+  readyToSend: string;
+  fastLimitUnit: string;
+  longLimitUnit: string;
+  paragraphsUnit: string;
+  lockedNamesUnit: string;
 }
 
 export const STRINGS: Record<UiLang, UiStrings> = {
@@ -229,6 +248,25 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     inboxFromShortcut: 'Kiriman baru dari Pintasan',
     translateNow: 'Terjemahkan sekarang',
     dismiss: 'Abaikan',
+    translateImageBtn: 'Terjemahkan gambar',
+    translateDocBtn: 'Terjemahkan dokumen',
+    translateAnotherImage: 'Terjemahkan gambar lain',
+    translateAnotherDoc: 'Terjemahkan dokumen lain',
+    translateAnotherLink: 'Terjemahkan tautan lain',
+    addMoreFiles: 'Tambah berkas',
+    pasteUrlBtn: 'Tempel URL',
+    backBtn: 'Kembali',
+    translatedViewTab: 'Terjemahan',
+    originalViewTab: 'Situs asli',
+    loadingWebPage: 'Memuat dan menerjemahkan halaman web...',
+    cannotTranslateWeb: 'Tidak dapat diterjemahkan langsung',
+    readingImageOcr: 'Mendeteksi teks pada gambar dan menerjemahkan...',
+    processingDoc: 'Membaca dan menerjemahkan dokumen...',
+    readyToSend: 'Siap diterjemahkan',
+    fastLimitUnit: 'cepat',
+    longLimitUnit: 'naskah panjang',
+    paragraphsUnit: 'paragraf',
+    lockedNamesUnit: 'nama terkunci',
   },
   en: {
     greeting: 'What would you like to read today?',
@@ -343,6 +381,25 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     inboxFromShortcut: 'New capture from Shortcuts',
     translateNow: 'Translate now',
     dismiss: 'Dismiss',
+    translateImageBtn: 'Translate image',
+    translateDocBtn: 'Translate document',
+    translateAnotherImage: 'Translate another image',
+    translateAnotherDoc: 'Translate another document',
+    translateAnotherLink: 'Translate another link',
+    addMoreFiles: 'Add file',
+    pasteUrlBtn: 'Paste URL',
+    backBtn: 'Back',
+    translatedViewTab: 'Translated',
+    originalViewTab: 'Original site',
+    loadingWebPage: 'Loading and translating web page...',
+    cannotTranslateWeb: 'Cannot translate directly',
+    readingImageOcr: 'Detecting text in image and translating...',
+    processingDoc: 'Reading and translating document...',
+    readyToSend: 'Ready to translate',
+    fastLimitUnit: 'fast',
+    longLimitUnit: 'long text',
+    paragraphsUnit: 'paragraphs',
+    lockedNamesUnit: 'locked names',
   },
 };
 
