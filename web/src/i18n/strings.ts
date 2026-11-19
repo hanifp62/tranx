@@ -151,6 +151,8 @@ export interface UiStrings {
   loadingNextChapter: string;
   noChaptersFound: string;
   openTocSite: string;
+  resumeReadingChapter: string;
+  streamingProgressLabel: string;
   closeLabel: string;
 }
 
@@ -306,6 +308,8 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     loadingNextChapter: 'Memuat bab berikutnya...',
     noChaptersFound: 'Daftar bab belum tersedia pada halaman ini. Gunakan tombol Bab sebelumnya / Bab berikutnya.',
     openTocSite: 'Buka halaman daftar isi (terjemahan)',
+    resumeReadingChapter: 'Lanjutkan baca',
+    streamingProgressLabel: 'Menerjemahkan',
     closeLabel: 'Tutup',
   },
   en: {
@@ -459,6 +463,8 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     loadingNextChapter: 'Loading next chapter...',
     noChaptersFound: 'Chapter list was not embedded on this page. Use Previous / Next chapter controls.',
     openTocSite: 'Open translated table of contents',
+    resumeReadingChapter: 'Resume reading',
+    streamingProgressLabel: 'Translating',
     closeLabel: 'Close',
   },
 };

@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { STRINGS, labelForLang } from './i18n/strings';
 import type {
   AppSettingsDoc,
@@ -56,6 +65,7 @@ import {
   detectLanguageLocal,
   isSingleStandaloneUrl,
   parseModePair,
+  prefetchNextChapterTranslatedDirect,
   swapModePair,
   toSafeHttpUrl,
   translateChapterTitlesDirect,
@@ -102,20 +112,36 @@ import {
   IconTrash,
   IconX,
 } from './components/Icons';
-import { ImageResultCard } from './components/ImageOverlayCanvas';
-import {
-  InfoModal,
-  LogoutDialog,
-  RenameDialog,
-  SettingsModal,
-  ShortcutsModal,
-} from './components/Modals';
-import {
-  GlossaryView,
-  MyFilesView,
-  SideBySideReaderView,
-  TranslatedWebViewer,
-} from './components/SubViews';
+const ImageResultCard = lazy(() =>
+  import('./components/ImageOverlayCanvas').then((m) => ({ default: m.ImageResultCard }))
+);
+const InfoModal = lazy(() =>
+  import('./components/Modals').then((m) => ({ default: m.InfoModal }))
+);
+const LogoutDialog = lazy(() =>
+  import('./components/Modals').then((m) => ({ default: m.LogoutDialog }))
+);
+const RenameDialog = lazy(() =>
+  import('./components/Modals').then((m) => ({ default: m.RenameDialog }))
+);
+const SettingsModal = lazy(() =>
+  import('./components/Modals').then((m) => ({ default: m.SettingsModal }))
+);
+const ShortcutsModal = lazy(() =>
+  import('./components/Modals').then((m) => ({ default: m.ShortcutsModal }))
+);
+const GlossaryView = lazy(() =>
+  import('./components/SubViews').then((m) => ({ default: m.GlossaryView }))
+);
+const MyFilesView = lazy(() =>
+  import('./components/SubViews').then((m) => ({ default: m.MyFilesView }))
+);
+const SideBySideReaderView = lazy(() =>
+  import('./components/SubViews').then((m) => ({ default: m.SideBySideReaderView }))
+);
+const TranslatedWebViewer = lazy(() =>
+  import('./components/SubViews').then((m) => ({ default: m.TranslatedWebViewer }))
+);
 
 const SUPPORTED_DOC_EXTS = new Set([
   'epub',
@@ -513,8 +539,11 @@ export function App() {
     return () => window.clearInterval(id);
   }, [isDictating]);
 
+  const deferredSearchQuery = useDeferredValue(searchQuery);
+  const deferredInlineChapterQuery = useDeferredValue(inlineChapterQuery);
+
   const { pinnedList, recentList } = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
+    const q = deferredSearchQuery.trim().toLowerCase();
     const filtered = q
       ? conversations.filter(
           (c) =>
@@ -528,7 +557,7 @@ export function App() {
       .filter((c) => !c.pinned)
       .sort((a, b) => b.updatedAt - a.updatedAt);
     return { pinnedList: pinned, recentList: recent };
-  }, [conversations, searchQuery]);
+  }, [conversations, deferredSearchQuery]);
 
   const { src: currentSrcLang, tgt: currentTgtLang } = useMemo(
     () => parseModePair(activeMode),
@@ -551,6 +580,24 @@ export function App() {
     const exists = messages.some((m) => m.id === streamingTurn.id);
     return exists ? messages : [...messages, streamingTurn];
   }, [messages, streamingTurn]);
+
+  const modeMessages = useMemo(
+    () =>
+      displayedMessages.filter((turn) => {
+        if (activeTab === 'gambar') return turn.kind === 'image';
+        if (activeTab === 'dokumen') return turn.kind === 'document';
+        if (activeTab === 'link') {
+          return turn.kind === 'link' || Boolean(streamingTurn && turn.id === streamingTurn.id);
+        }
+        return (
+          turn.role === 'user' ||
+          !turn.kind ||
+          turn.kind === 'text' ||
+          turn.kind === 'long'
+        );
+      }),
+    [displayedMessages, activeTab, streamingTurn]
+  );
 
   const applyModeChange = useCallback(
     (nextMode: ModePair) => {
@@ -1161,16 +1208,28 @@ export function App() {
       rawView === 'site' || rawView === 'original' ? rawView : 'reader';
     return (
       <>
-        <TranslatedWebViewer
-          user={user}
-          url={targetUrl}
-          initialMode={qMode}
-          initialView={qView}
-          titleId={qTid}
-          backPath={lastNonWebPathRef.current || '/'}
-          strings={strings}
-          onNavigate={navigate}
-        />
+        <Suspense
+          fallback={
+            <div className="novel-reader-wrap">
+              <div className="ebook-skeleton-card">
+                <div className="skeleton-line skeleton-meta" />
+                <div className="skeleton-line skeleton-title" />
+                <div className="skeleton-line" />
+              </div>
+            </div>
+          }
+        >
+          <TranslatedWebViewer
+            user={user}
+            url={targetUrl}
+            initialMode={qMode}
+            initialView={qView}
+            titleId={qTid}
+            backPath={lastNonWebPathRef.current || '/'}
+            strings={strings}
+            onNavigate={navigate}
+          />
+        </Suspense>
         {toasts.length > 0 && (
           <div className="toast-container" role="status" aria-live="polite">
             {toasts.map((t) => (
@@ -1183,20 +1242,6 @@ export function App() {
       </>
     );
   }
-
-  const modeMessages = displayedMessages.filter((turn) => {
-    if (activeTab === 'gambar') return turn.kind === 'image';
-    if (activeTab === 'dokumen') return turn.kind === 'document';
-    if (activeTab === 'link') {
-      return turn.kind === 'link' || Boolean(streamingTurn && turn.id === streamingTurn.id);
-    }
-    return (
-      turn.role === 'user' ||
-      !turn.kind ||
-      turn.kind === 'text' ||
-      turn.kind === 'long'
-    );
-  });
 
   const isStageEmpty = !activeCid || modeMessages.length === 0;
   const readyAttachmentCount = attachments.filter((a) => a.status === 'ready').length;
@@ -2031,33 +2076,39 @@ export function App() {
         )}
 
         {pathname === '/berkas' ? (
-          <MyFilesView
-            user={user}
-            jobs={jobs}
-            resolvedTheme={resolvedTheme}
-            strings={strings}
-            onNavigate={navigate}
-            onNotify={(m) => pushToast(m)}
-          />
+          <Suspense fallback={<div className="subpage-container"><div className="result-card">...</div></div>}>
+            <MyFilesView
+              user={user}
+              jobs={jobs}
+              resolvedTheme={resolvedTheme}
+              strings={strings}
+              onNavigate={navigate}
+              onNotify={(m) => pushToast(m)}
+            />
+          </Suspense>
         ) : kamusMatch ? (
-          <GlossaryView
-            user={user}
-            titles={titles}
-            activeTitleId={kamusMatch.titleId}
-            strings={strings}
-            onNavigate={navigate}
-            onNotify={(m) => pushToast(m)}
-          />
+          <Suspense fallback={<div className="subpage-container"><div className="result-card">...</div></div>}>
+            <GlossaryView
+              user={user}
+              titles={titles}
+              activeTitleId={kamusMatch.titleId}
+              strings={strings}
+              onNavigate={navigate}
+              onNotify={(m) => pushToast(m)}
+            />
+          </Suspense>
         ) : readerMatch ? (
-          <SideBySideReaderView
-            user={user}
-            cid={readerMatch.cid}
-            mid={readerMatch.mid}
-            messages={messages}
-            resolvedTheme={resolvedTheme}
-            strings={strings}
-            onNavigate={navigate}
-          />
+          <Suspense fallback={<div className="subpage-container"><div className="result-card">...</div></div>}>
+            <SideBySideReaderView
+              user={user}
+              cid={readerMatch.cid}
+              mid={readerMatch.mid}
+              messages={messages}
+              resolvedTheme={resolvedTheme}
+              strings={strings}
+              onNavigate={navigate}
+            />
+          </Suspense>
         ) : isStageEmpty ? (
           <div className="stage-body is-empty">
             <div className="empty-center-stack">
@@ -2204,16 +2255,18 @@ export function App() {
                 if (turn.kind === 'image' && turn.imageResult) {
                   return (
                     <div key={turn.id} className="turn-assistant-wrap">
-                      <ImageResultCard
-                        result={turn.imageResult}
-                        fileName={turn.fileName}
-                        resolvedTheme={resolvedTheme}
-                        strings={strings}
-                        onCopy={(txt) => {
-                          navigator.clipboard?.writeText(txt);
-                          pushToast(strings.copiedToast);
-                        }}
-                      />
+                      <Suspense fallback={<div className="result-card">...</div>}>
+                        <ImageResultCard
+                          result={turn.imageResult}
+                          fileName={turn.fileName}
+                          resolvedTheme={resolvedTheme}
+                          strings={strings}
+                          onCopy={(txt) => {
+                            navigator.clipboard?.writeText(txt);
+                            pushToast(strings.copiedToast);
+                          }}
+                        />
+                      </Suspense>
                     </div>
                   );
                 }
@@ -2256,6 +2309,20 @@ export function App() {
                           <button
                             type="button"
                             className="btn-primary pressable"
+                            onMouseEnter={() =>
+                              prefetchNextChapterTranslatedDirect(
+                                nav?.isTocPage && nav.firstUrl ? nav.firstUrl : lp.url,
+                                turn.mode,
+                                lp.titleId
+                              )
+                            }
+                            onFocus={() =>
+                              prefetchNextChapterTranslatedDirect(
+                                nav?.isTocPage && nav.firstUrl ? nav.firstUrl : lp.url,
+                                turn.mode,
+                                lp.titleId
+                              )
+                            }
                             onClick={() =>
                               navigate(
                                 `/web?url=${encodeURIComponent(
@@ -2350,6 +2417,20 @@ export function App() {
                                 type="button"
                                 className="btn-primary pressable"
                                 disabled={isFetchingLink}
+                                onMouseEnter={() =>
+                                  prefetchNextChapterTranslatedDirect(
+                                    nav.nextUrl!,
+                                    turn.mode,
+                                    lp.titleId
+                                  )
+                                }
+                                onFocus={() =>
+                                  prefetchNextChapterTranslatedDirect(
+                                    nav.nextUrl!,
+                                    turn.mode,
+                                    lp.titleId
+                                  )
+                                }
                                 onClick={() => handleSubmitLink(undefined, nav.nextUrl!)}
                               >
                                 {isFetchingLink
@@ -3263,53 +3344,55 @@ export function App() {
         </div>
       )}
 
-      {settingsOpen && (
-        <SettingsModal
-          user={user}
-          settings={settings}
-          strings={strings}
-          onClose={() => setSettingsOpen(false)}
-          onChangeUiLang={handleChangeUiLang}
-          onNotify={(m) => pushToast(m)}
-        />
-      )}
+      <Suspense fallback={null}>
+        {settingsOpen && (
+          <SettingsModal
+            user={user}
+            settings={settings}
+            strings={strings}
+            onClose={() => setSettingsOpen(false)}
+            onChangeUiLang={handleChangeUiLang}
+            onNotify={(m) => pushToast(m)}
+          />
+        )}
 
-      {shortcutsOpen && (
-        <ShortcutsModal strings={strings} onClose={() => setShortcutsOpen(false)} />
-      )}
+        {shortcutsOpen && (
+          <ShortcutsModal strings={strings} onClose={() => setShortcutsOpen(false)} />
+        )}
 
-      {logoutOpen && (
-        <LogoutDialog
-          strings={strings}
-          onClose={() => setLogoutOpen(false)}
-          onConfirm={async () => {
-            setLogoutOpen(false);
-            await logoutSession();
-            navigate('/masuk');
-          }}
-        />
-      )}
+        {logoutOpen && (
+          <LogoutDialog
+            strings={strings}
+            onClose={() => setLogoutOpen(false)}
+            onConfirm={async () => {
+              setLogoutOpen(false);
+              await logoutSession();
+              navigate('/masuk');
+            }}
+          />
+        )}
 
-      {renameTarget && (
-        <RenameDialog
-          initialTitle={renameTarget.title}
-          strings={strings}
-          onClose={() => setRenameTarget(null)}
-          onSave={async (nextTitle) => {
-            const target = renameTarget;
-            setRenameTarget(null);
-            await renameConversationTitle(target.id, nextTitle);
-          }}
-        />
-      )}
+        {renameTarget && (
+          <RenameDialog
+            initialTitle={renameTarget.title}
+            strings={strings}
+            onClose={() => setRenameTarget(null)}
+            onSave={async (nextTitle) => {
+              const target = renameTarget;
+              setRenameTarget(null);
+              await renameConversationTitle(target.id, nextTitle);
+            }}
+          />
+        )}
 
-      {infoModalKind && (
-        <InfoModal
-          kind={infoModalKind}
-          strings={strings}
-          onClose={() => setInfoModalKind(null)}
-        />
-      )}
+        {infoModalKind && (
+          <InfoModal
+            kind={infoModalKind}
+            strings={strings}
+            onClose={() => setInfoModalKind(null)}
+          />
+        )}
+      </Suspense>
 
       {inlineChaptersNav && (
         <div className="scrim-backdrop" onClick={() => setInlineChaptersNav(null)}>
@@ -3350,8 +3433,8 @@ export function App() {
                 <div className="chapter-list-grid">
                   {inlineChaptersNav.nav.chapters
                     .filter((ch, idx) => {
-                      if (!inlineChapterQuery.trim()) return true;
-                      const q = inlineChapterQuery.trim().toLowerCase();
+                      if (!deferredInlineChapterQuery.trim()) return true;
+                      const q = deferredInlineChapterQuery.trim().toLowerCase();
                       const tDst = (inlineTranslatedTitles[ch.url] || ch.titleDst || '').toLowerCase();
                       return (
                         ch.title.toLowerCase().includes(q) ||

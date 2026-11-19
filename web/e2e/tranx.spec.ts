@@ -500,7 +500,9 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     });
 
     // CORS-enabled Google GTX mock supporting both batched POST and GET while preserving [[E0]] & [[#0]] markers
+    let gtxRequestCount = 0;
     await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      gtxRequestCount += 1;
       const reqUrl = new URL(route.request().url());
       const tl = reqUrl.searchParams.get('tl') || 'id';
       const postParams = new URLSearchParams(route.request().postData() || '');
@@ -527,7 +529,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
           .replace(/Chapter 2: The Lanterns of Kyoto/gi, 'Bab 2: Lentera di Kyoto')
           .replace(
             /Lantern light swayed quietly across the wet stone alley/gi,
-            'Cahaya lentera bergoyang tenang di sepanjang gang batu basah'
+            'Cahaya lentera ``Shobomaru" bergoyang tenang di sepanjang gang batu basah'
           )
           .replace(/Next Chapter/gi, 'Bab berikutnya')
           .replace(/Previous Chapter/gi, 'Bab sebelumnya')
@@ -627,16 +629,21 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await kakuSiteFrame.locator('a').first().click();
     await expect(page).toHaveURL(/episodes%2F102.*view=site|view=site.*episodes%2F102/);
     await expect(kakuSiteFrame.locator('body')).toContainText(
-      'Cahaya lentera bergoyang tenang di sepanjang gang batu basah'
+      'Cahaya lentera "Shobomaru" bergoyang tenang di sepanjang gang batu basah'
     );
+    await expect(kakuSiteFrame.locator('body')).not.toContainText('``Shobomaru"');
     await page.getByRole('button', { name: 'Mode Ebook' }).click();
     await expect(page.getByRole('heading', { name: 'Bab 2: Pengakuan Sepulang Sekolah' })).toBeVisible();
     await expect(page.getByText(/Ebook terdeteksi · 2 \/ 3/)).toBeVisible();
+    await expect(page.locator('.ebook-reading-progress-fill')).toBeAttached();
     await page.getByRole('button', { name: 'Kembali' }).click();
 
-    // 1a-ii. Kakuyomu Work/TOC URL -> auto-detected as Ebook TOC with "Mulai baca Bab 1"
+    // 1a-ii. Kakuyomu Work/TOC URL -> auto-detected as Ebook TOC with "Lanjutkan baca (2 / 3)" AND "Mulai baca Bab 1"
     await page.goto('/web?url=https%3A%2F%2Fkakuyomu.jp%2Fworks%2F2912051604668493030&mode=auto-id&view=reader');
     await expect(page.getByText(/Daftar isi Ebook/)).toBeVisible();
+    await expect(
+      page.locator('.ebook-toc-hero').getByRole('button', { name: /Lanjutkan baca \(2 \/ 3\)/ })
+    ).toBeVisible();
     await page.locator('.ebook-toc-hero').getByRole('button', { name: /Mulai baca Bab 1/ }).click();
     await expect(page.getByRole('heading', { name: 'Bab 1: Cara Terbaik Bolos Sekolah' })).toBeVisible();
     await page.getByRole('button', { name: 'Kembali' }).click();
@@ -671,6 +678,13 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     );
     await expect(mixedOut).toContainText('Gerbang Hujan di Kyoto');
     await expect(mixedOut).toContainText('Selamat pagi');
+
+    // 1d. L1/L2 Paragraph Translation Cache: repeating an identical phrase uses 0 extra GTX network calls!
+    const gtxCallsBeforeRepeat = gtxRequestCount;
+    await page.locator('textarea.composer-textarea').fill('おはようございます');
+    await page.locator('textarea.composer-textarea').press('Enter');
+    await expect(page.locator('.assistant-prose').last()).toContainText('Selamat pagi');
+    expect(gtxRequestCount).toBe(gtxCallsBeforeRepeat);
 
     // 2. Standalone URL pasted directly inside Mode Teks -> auto-routed to Link reader cleanly
     await page.getByRole('button', { name: 'Baru' }).click();

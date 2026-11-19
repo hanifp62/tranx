@@ -79,6 +79,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
+          'react-vendor': ['react', 'react-dom', 'react-dom/client', 'react/jsx-runtime'],
           'firebase-auth': ['firebase/app', 'firebase/auth', 'firebase/storage'],
           'firebase-db': ['firebase/firestore'],
         },

@@ -336,27 +336,55 @@ export async function streamChatTurn(params: {
     .filter(Boolean);
 
   const firstLine = (paras[0] || params.text).split('\n')[0].slice(0, 80) || 'Percakapan';
-  await upsertConversationMeta(params.cid, {
-    title: firstLine,
-    titleId: tid,
-    mode: params.mode,
-    activeTab: 'teks',
-    preview: firstLine,
-  });
-  await saveTurnMessageDirect(params.cid, params.clientMsgId, {
-    role: 'user',
-    kind: 'text',
-    mode: params.mode,
-    titleId: tid,
-    text: params.text,
-    state: 'done',
-  });
+  // Start initial Firestore persistence in parallel with translation so user sees zero pre-flight lag
+  const initialPersistPromise = Promise.all([
+    upsertConversationMeta(params.cid, {
+      title: firstLine,
+      titleId: tid,
+      mode: params.mode,
+      activeTab: 'teks',
+      preview: firstLine,
+    }),
+    saveTurnMessageDirect(params.cid, params.clientMsgId, {
+      role: 'user',
+      kind: 'text',
+      mode: params.mode,
+      titleId: tid,
+      text: params.text,
+      state: 'done',
+    }),
+  ]);
+
+  const inputParas = paras.length ? paras : [params.text];
+  let streamedPrefix = 0;
 
   const { outputs, detectedSource, model, matchedChips } = await translateParagraphsDirect({
-    paragraphs: paras.length ? paras : [params.text],
+    paragraphs: inputParas,
     mode: params.mode,
     titleId: tid,
     signal: params.signal,
+    onProgress:
+      inputParas.length > 1
+        ? (partialOutputs) => {
+            let nextPrefix = streamedPrefix;
+            while (nextPrefix < inputParas.length && partialOutputs[nextPrefix]) {
+              nextPrefix += 1;
+            }
+            if (nextPrefix > streamedPrefix) {
+              const newlyReady = partialOutputs.slice(streamedPrefix, nextPrefix).join('\n\n');
+              streamedPrefix = nextPrefix;
+              params.onEvent({
+                type: 'para',
+                cid: params.cid,
+                mid: asstMid,
+                titleId: tid,
+                dst: newlyReady,
+                doneParas: nextPrefix,
+                totalParas: inputParas.length,
+              });
+            }
+          }
+        : undefined,
   });
 
   const fullDst = outputs.join('\n\n');
@@ -386,28 +414,31 @@ export async function streamChatTurn(params: {
     ms: elapsed,
   });
 
-  await saveTurnMessageDirect(params.cid, asstMid, {
-    role: 'assistant',
-    kind: params.text.length > 5000 ? 'long' : 'text',
-    mode: params.mode,
-    detectedSource,
-    titleId: tid,
-    srcText: params.text,
-    text: fullDst,
-    sentences,
-    nameChips: matchedChips,
-    state: 'done',
-    model,
-    ms: elapsed,
-  });
-  await upsertConversationMeta(params.cid, {
-    title: firstLine,
-    titleId: tid,
-    mode: params.mode,
-    detectedSource,
-    activeTab: 'teks',
-    preview: fullDst.slice(0, 180) || firstLine,
-  });
+  await initialPersistPromise;
+  await Promise.all([
+    saveTurnMessageDirect(params.cid, asstMid, {
+      role: 'assistant',
+      kind: params.text.length > 5000 ? 'long' : 'text',
+      mode: params.mode,
+      detectedSource,
+      titleId: tid,
+      srcText: params.text,
+      text: fullDst,
+      sentences,
+      nameChips: matchedChips,
+      state: 'done',
+      model,
+      ms: elapsed,
+    }),
+    upsertConversationMeta(params.cid, {
+      title: firstLine,
+      titleId: tid,
+      mode: params.mode,
+      detectedSource,
+      activeTab: 'teks',
+      preview: fullDst.slice(0, 180) || firstLine,
+    }),
+  ]);
 }
 
 export async function lookupTurnNames(params: {
@@ -767,6 +798,7 @@ export async function fetchWebReaderBundle(params: {
   mode: ModePair;
   titleId?: string;
   view: 'reader' | 'site' | 'original';
+  onProgress?: (partialBundle: WebReaderBundle, doneCount: number, totalCount: number) => void;
 }): Promise<WebReaderBundle> {
   const cleanUrl = normalizeWebUrl(params.url);
 
@@ -865,6 +897,7 @@ export async function fetchWebReaderBundle(params: {
     mode: params.mode,
     titleId: params.titleId,
     view: params.view,
+    onProgress: params.onProgress,
   });
 }
 

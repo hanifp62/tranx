@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   EntityKind,
   GlossaryEntry,
@@ -19,7 +19,9 @@ import {
 } from '../lib/api';
 import {
   buildAutoTranslatedSiteUrl,
+  getReadingProgress,
   parseModePair,
+  prefetchNextChapterTranslatedDirect,
   toSafeHttpUrl,
   translateChapterTitlesDirect,
 } from '../lib/directEngine';
@@ -678,11 +680,14 @@ export function TranslatedWebViewer({
   const [bilingual, setBilingual] = useState(false);
   const [chaptersOpen, setChaptersOpen] = useState(false);
   const [chapterQuery, setChapterQuery] = useState('');
+  const deferredChapterQuery = useDeferredValue(chapterQuery);
   const [translatedTitles, setTranslatedTitles] = useState<Record<string, string>>({});
   const [translatingChapters, setTranslatingChapters] = useState(false);
   const [bundle, setBundle] = useState<WebReaderBundle | null>(null);
   const [loading, setLoading] = useState(true);
+  const [streamProgress, setStreamProgress] = useState<{ done: number; total: number } | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const progressBarRef = useRef<HTMLDivElement | null>(null);
   const autoTranslatedSiteUrl = buildAutoTranslatedSiteUrl(url, mode);
   const safeExternalUrl = toSafeHttpUrl(url);
 
@@ -697,15 +702,29 @@ export function TranslatedWebViewer({
   useEffect(() => {
     let active = true;
     setLoading(true);
+    setStreamProgress(null);
     setErrorMsg(null);
     setChaptersOpen(false);
     setChapterQuery('');
-    fetchWebReaderBundle({ user, url, mode, titleId, view })
+    window.scrollTo({ top: 0 });
+    fetchWebReaderBundle({
+      user,
+      url,
+      mode,
+      titleId,
+      view,
+      onProgress: (partial, doneCount, totalCount) => {
+        if (!active) return;
+        setBundle(partial);
+        setLoading(false);
+        setStreamProgress(doneCount < totalCount ? { done: doneCount, total: totalCount } : null);
+      },
+    })
       .then((res) => {
         if (active) {
           setBundle(res);
           setLoading(false);
-          window.scrollTo({ top: 0, behavior: 'smooth' });
+          setStreamProgress(null);
         }
       })
       .catch((err) => {
@@ -714,12 +733,39 @@ export function TranslatedWebViewer({
             err instanceof Error ? err.message : 'Halaman web tidak dapat dimuat.'
           );
           setLoading(false);
+          setStreamProgress(null);
         }
       });
     return () => {
       active = false;
     };
   }, [user, url, mode, titleId, view]);
+
+  // Passive GPU-composited scroll reading progress bar (0 React re-renders while scrolling)
+  useEffect(() => {
+    if (view !== 'reader' || loading || errorMsg) return;
+    let rafId = 0;
+    const updateBar = () => {
+      rafId = 0;
+      const el = progressBarRef.current;
+      if (!el) return;
+      const docEl = document.documentElement;
+      const maxScroll = Math.max(1, docEl.scrollHeight - window.innerHeight);
+      const ratio = Math.max(0, Math.min(1, window.scrollY / maxScroll));
+      el.style.transform = `scaleX(${ratio.toFixed(4)})`;
+    };
+    const onScroll = () => {
+      if (!rafId) rafId = window.requestAnimationFrame(updateBar);
+    };
+    updateBar();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onScroll);
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, [view, loading, errorMsg, bundle?.sentences.length]);
 
   const effectiveTitleId = titleId || bundle?.titleId;
   const nav = bundle?.novelNav;
@@ -786,26 +832,39 @@ export function TranslatedWebViewer({
     return () => window.removeEventListener('keydown', onKey);
   }, [nav, loading, mode, view, effectiveTitleId]);
 
-  const nextChapterObj =
-    nav?.chapters && nav.nextUrl
-      ? nav.chapters.find((c) => c.url === nav.nextUrl)
-      : undefined;
+  const nextChapterObj = useMemo(
+    () =>
+      nav?.chapters && nav.nextUrl
+        ? nav.chapters.find((c) => c.url === nav.nextUrl)
+        : undefined,
+    [nav?.chapters, nav?.nextUrl]
+  );
   const nextChapterDisplayTitle = nextChapterObj
     ? translatedTitles[nextChapterObj.url] || nextChapterObj.titleDst || nextChapterObj.title
     : '';
+  const savedProgress = useMemo(
+    () => getReadingProgress(nav?.tocUrl || effectiveTitleId),
+    [nav?.tocUrl, effectiveTitleId, bundle?.url]
+  );
+  const canResumeProgress = Boolean(
+    nav?.isTocPage && savedProgress && savedProgress.url && savedProgress.url !== bundle?.url
+  );
   const canRestartFromCh1 = Boolean(
     nav?.isNovel && !nav.nextUrl && !nav.isTocPage && nav.firstUrl && nav.firstUrl !== bundle?.url
   );
-  const filteredChapters = (nav?.chapters || []).filter((ch, idx) => {
-    if (!chapterQuery.trim()) return true;
-    const q = chapterQuery.trim().toLowerCase();
-    const tDst = (translatedTitles[ch.url] || ch.titleDst || '').toLowerCase();
-    return (
-      ch.title.toLowerCase().includes(q) ||
-      tDst.includes(q) ||
-      String(idx + 1).includes(q)
-    );
-  });
+  const filteredChapters = useMemo(() => {
+    const list = nav?.chapters || [];
+    const q = deferredChapterQuery.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter((ch, idx) => {
+      const tDst = (translatedTitles[ch.url] || ch.titleDst || '').toLowerCase();
+      return (
+        ch.title.toLowerCase().includes(q) ||
+        tDst.includes(q) ||
+        String(idx + 1).includes(q)
+      );
+    });
+  }, [nav?.chapters, deferredChapterQuery, translatedTitles]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100dvh' }}>
@@ -897,12 +956,47 @@ export function TranslatedWebViewer({
             </a>
           )}
         </div>
+        {view === 'reader' && !loading && !errorMsg && (
+          <div className="ebook-reading-progress-track" aria-hidden="true">
+            <div ref={progressBarRef} className="ebook-reading-progress-fill" />
+          </div>
+        )}
+        {streamProgress && streamProgress.total > 0 && (
+          <div
+            className="ebook-stream-bar"
+            role="status"
+            aria-label={`${strings.streamingProgressLabel} ${streamProgress.done}/${streamProgress.total}`}
+          >
+            <div
+              className="ebook-stream-bar-fill"
+              style={{
+                transform: `scaleX(${Math.max(
+                  0.06,
+                  Math.min(1, streamProgress.done / streamProgress.total)
+                )})`,
+              }}
+            />
+          </div>
+        )}
       </header>
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
         {loading ? (
-          <div className="subpage-container">
-            <div className="result-card">{strings.loadingWebPage}</div>
+          <div className="novel-reader-wrap" role="status" aria-live="polite">
+            <div className="ebook-skeleton-card">
+              <div className="skeleton-line skeleton-meta" />
+              <div className="skeleton-line skeleton-title" />
+              <div className="skeleton-line skeleton-title-short" />
+              <div className="skeleton-divider" />
+              <div className="skeleton-line" />
+              <div className="skeleton-line" />
+              <div className="skeleton-line skeleton-short" />
+              <div className="skeleton-line" />
+              <div className="skeleton-line skeleton-medium" />
+              <div style={{ fontSize: '13px', color: 'var(--text-subtle)', marginTop: '6px' }}>
+                {strings.loadingWebPage}
+              </div>
+            </div>
           </div>
         ) : errorMsg ? (
           <div className="subpage-container">
@@ -967,10 +1061,33 @@ export function TranslatedWebViewer({
             {nav?.isTocPage && nav.chapters && nav.chapters.length > 0 && view !== 'original' ? (
               <div className="ebook-toc-hero">
                 <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
-                  {nav.firstUrl && (
+                  {canResumeProgress && savedProgress && (
                     <button
                       type="button"
                       className="btn-primary pressable"
+                      onMouseEnter={() =>
+                        prefetchNextChapterTranslatedDirect(savedProgress.url, mode, effectiveTitleId)
+                      }
+                      onFocus={() =>
+                        prefetchNextChapterTranslatedDirect(savedProgress.url, mode, effectiveTitleId)
+                      }
+                      onClick={() => openChapterUrl(savedProgress.url, 'reader')}
+                    >
+                      <IconBook size={16} />
+                      {strings.resumeReadingChapter}
+                      {savedProgress.chapterLabel ? ` (${savedProgress.chapterLabel})` : ''} {'\u2192'}
+                    </button>
+                  )}
+                  {nav.firstUrl && (
+                    <button
+                      type="button"
+                      className={canResumeProgress ? 'btn-secondary pressable' : 'btn-primary pressable'}
+                      onMouseEnter={() =>
+                        prefetchNextChapterTranslatedDirect(nav.firstUrl!, mode, effectiveTitleId)
+                      }
+                      onFocus={() =>
+                        prefetchNextChapterTranslatedDirect(nav.firstUrl!, mode, effectiveTitleId)
+                      }
                       onClick={() => openChapterUrl(nav.firstUrl!, 'reader')}
                     >
                       <IconBook size={16} />
@@ -1035,7 +1152,16 @@ export function TranslatedWebViewer({
                   )}
                 </div>
 
-                {nav?.isNovel && (
+                {streamProgress && (
+                  <div className="ebook-stream-footer" role="status" aria-live="polite">
+                    <div className="skeleton-line skeleton-medium" />
+                    <div style={{ fontSize: '13px', color: 'var(--text-subtle)' }}>
+                      {strings.streamingProgressLabel} ({streamProgress.done}/{streamProgress.total})...
+                    </div>
+                  </div>
+                )}
+
+                {nav?.isNovel && !streamProgress && (
                   <div className="ebook-next-card">
                     {nav.nextUrl ? (
                       <>
@@ -1051,6 +1177,12 @@ export function TranslatedWebViewer({
                           <button
                             type="button"
                             className="btn-primary pressable"
+                            onMouseEnter={() =>
+                              prefetchNextChapterTranslatedDirect(nav.nextUrl!, mode, effectiveTitleId)
+                            }
+                            onFocus={() =>
+                              prefetchNextChapterTranslatedDirect(nav.nextUrl!, mode, effectiveTitleId)
+                            }
                             onClick={() => openChapterUrl(nav.nextUrl!)}
                           >
                             {strings.nextChapter} {'\u2192'}
@@ -1144,6 +1276,12 @@ export function TranslatedWebViewer({
                 <button
                   type="button"
                   className="btn-primary pressable"
+                  onMouseEnter={() =>
+                    prefetchNextChapterTranslatedDirect(nav.nextUrl!, mode, effectiveTitleId)
+                  }
+                  onFocus={() =>
+                    prefetchNextChapterTranslatedDirect(nav.nextUrl!, mode, effectiveTitleId)
+                  }
                   onClick={() => openChapterUrl(nav.nextUrl!)}
                 >
                   {nav.isTocPage ? strings.startReadingCh1 : strings.nextChapter} {'\u2192'}

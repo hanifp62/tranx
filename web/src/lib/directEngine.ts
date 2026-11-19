@@ -306,9 +306,120 @@ function unmaskWithGlossary(text: string, map: Map<string, string>): string {
   for (const [tok, val] of map.entries()) {
     out = out.split(tok).join(val);
     const num = tok.slice(3, -2);
-    out = out.replace(new RegExp(`\\[\\[\\s*E\\s*${num}\\s*\\]\\]`, 'gi'), val);
+    out = out.replace(new RegExp(`(?:\\[\\[|【【)\\s*E\\s*${num}\\s*(?:\\]\\]|】】)`, 'gi'), val);
   }
   return out;
+}
+
+/** Cleans machine-translation punctuation & spacing artifacts for crisp literary readability. */
+export function polishTranslatedProse(text: string, tgt: TargetLang): string {
+  if (!text) return text;
+  if (tgt === 'ja') {
+    return text.replace(/[ \t]{2,}/g, ' ').trim();
+  }
+  return text
+    .replace(/\u3000+/g, ' ')
+    .replace(/``\s*/g, '"')
+    .replace(/\s*''/g, '"')
+    .replace(/“\s+/g, '"')
+    .replace(/\s+”/g, '"')
+    .replace(/"\s+([^"\n]+?)\s+"/g, '"$1"')
+    .replace(/\s+([,.;:?!])/g, '$1')
+    .replace(/([.!?])(?=[^\s"”’)\].!?0-9])/g, '$1 ')
+    .replace(/\.{4,}/g, '...')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+/** Runs async worker tasks with bounded concurrency while preserving output order. */
+async function runConcurrentPool<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return;
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+  let nextIdx = 0;
+  const runners = Array.from({ length: limit }, async () => {
+    while (true) {
+      const idx = nextIdx;
+      nextIdx += 1;
+      if (idx >= items.length) break;
+      await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(runners);
+}
+
+const PARA_CACHE_STORAGE_KEY = 'tranx_para_cache_v2';
+const MAX_PARA_CACHE_MEM = 900;
+const MAX_PARA_CACHE_LS = 450;
+const paraTranslationCache = new Map<string, string>();
+let paraCacheHydrated = false;
+let paraCacheFlushTimer: number | null = null;
+
+function hydrateParaCacheOnce(): void {
+  if (paraCacheHydrated || typeof window === 'undefined') return;
+  paraCacheHydrated = true;
+  try {
+    const raw = window.localStorage.getItem(PARA_CACHE_STORAGE_KEY);
+    if (!raw) return;
+    const entries = JSON.parse(raw);
+    if (Array.isArray(entries)) {
+      for (const pair of entries) {
+        if (Array.isArray(pair) && typeof pair[0] === 'string' && typeof pair[1] === 'string') {
+          paraTranslationCache.set(pair[0], pair[1]);
+        }
+      }
+    }
+  } catch {
+    // Ignore storage read issues
+  }
+}
+
+function scheduleParaCacheFlush(): void {
+  if (typeof window === 'undefined' || paraCacheFlushTimer !== null) return;
+  paraCacheFlushTimer = window.setTimeout(() => {
+    paraCacheFlushTimer = null;
+    try {
+      const recent = Array.from(paraTranslationCache.entries()).slice(-MAX_PARA_CACHE_LS);
+      window.localStorage.setItem(PARA_CACHE_STORAGE_KEY, JSON.stringify(recent));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, 1500);
+}
+
+function makeParaCacheKey(
+  src: SourceLang,
+  tgt: TargetLang,
+  glossarySig: string,
+  text: string
+): string {
+  return `${src}>${tgt}|${glossarySig}|${text}`;
+}
+
+function getCachedParaTranslation(key: string): string | undefined {
+  hydrateParaCacheOnce();
+  const hit = paraTranslationCache.get(key);
+  if (hit !== undefined) {
+    // LRU touch
+    paraTranslationCache.delete(key);
+    paraTranslationCache.set(key, hit);
+  }
+  return hit;
+}
+
+function setCachedParaTranslation(key: string, translated: string): void {
+  if (!translated || key.length > 2400) return;
+  hydrateParaCacheOnce();
+  paraTranslationCache.delete(key);
+  paraTranslationCache.set(key, translated);
+  if (paraTranslationCache.size > MAX_PARA_CACHE_MEM) {
+    const oldestKey = paraTranslationCache.keys().next().value;
+    if (oldestKey !== undefined) paraTranslationCache.delete(oldestKey);
+  }
+  scheduleParaCacheFlush();
 }
 
 function hasTranslatableLetters(text: string): boolean {
@@ -430,7 +541,8 @@ async function translateBatchViaGoogleGtx(
   paragraphs: string[],
   src: SourceLang,
   tgt: TargetLang,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onSlotTranslated?: (slotIdx: number, translated: string) => void
 ): Promise<{ outputs: string[]; detected: TargetLang }> {
   const outputs = new Array<string>(paragraphs.length).fill('');
   let detected: TargetLang =
@@ -438,24 +550,43 @@ async function translateBatchViaGoogleGtx(
       ? detectLanguageLocal(paragraphs.slice(0, 6).join('\n'), tgt === 'ja' ? 'id' : 'ja')
       : src;
 
-  const work: Array<{ idx: number; text: string }> = [];
+  // Deduplicate identical lines within the same batch so repeated lines only translate once
+  const uniqueMap = new Map<string, number[]>();
+  const work: Array<{ text: string; slots: number[] }> = [];
   paragraphs.forEach((p, idx) => {
     const trimmed = p.trim();
     if (!trimmed || !hasTranslatableLetters(trimmed)) {
       outputs[idx] = p;
+      onSlotTranslated?.(idx, p);
+      return;
+    }
+    const existing = uniqueMap.get(trimmed);
+    if (existing) {
+      existing.push(idx);
     } else {
-      work.push({ idx, text: trimmed });
+      const slots = [idx];
+      uniqueMap.set(trimmed, slots);
+      work.push({ text: trimmed, slots });
     }
   });
 
+  const assignSlots = (slots: number[], translated: string) => {
+    for (const s of slots) {
+      outputs[s] = translated;
+      onSlotTranslated?.(s, translated);
+    }
+  };
+
+  // Pack optimal request batches (<= 18 items, <= 1,750 chars each)
+  const batches: Array<Array<{ text: string; slots: number[] }>> = [];
   let cursor = 0;
   while (cursor < work.length) {
-    const batch: Array<{ idx: number; text: string }> = [];
+    const batch: Array<{ text: string; slots: number[] }> = [];
     let charCount = 0;
     while (
       cursor < work.length &&
       batch.length < 18 &&
-      charCount + work[cursor].text.length <= 1650
+      charCount + work[cursor].text.length <= 1750
     ) {
       batch.push(work[cursor]);
       charCount += work[cursor].text.length + 12;
@@ -465,14 +596,19 @@ async function translateBatchViaGoogleGtx(
       batch.push(work[cursor]);
       cursor += 1;
     }
+    batches.push(batch);
+  }
 
-    if (batch.length === 1 && batch[0].text.length > 1650) {
-      // Split single very long paragraph along sentence boundaries
+  // Execute up to 3 batches concurrently for ~3.5x faster chapter & document translation!
+  await runConcurrentPool(batches, 3, async (batch) => {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+    if (batch.length === 1 && batch[0].text.length > 1750) {
       const parts = batch[0].text.split(/(?<=[。！？.!?\n])/);
       const subChunks: string[] = [];
       let acc = '';
       for (const part of parts) {
-        if ((acc + part).length > 1200 && acc) {
+        if ((acc + part).length > 1300 && acc) {
           subChunks.push(acc);
           acc = part;
         } else {
@@ -480,27 +616,27 @@ async function translateBatchViaGoogleGtx(
         }
       }
       if (acc) subChunks.push(acc);
-      const translatedSubs: string[] = [];
-      for (const sc of subChunks) {
+      const translatedSubs = new Array<string>(subChunks.length).fill('');
+      await runConcurrentPool(subChunks, 2, async (sc, scIdx) => {
         const r = await requestGtxSingleChunk(sc, src, tgt, signal);
         if (r.detected) detected = r.detected;
-        translatedSubs.push(r.translated);
-      }
-      outputs[batch[0].idx] = translatedSubs.join(' ').trim();
-      continue;
+        translatedSubs[scIdx] = r.translated;
+      });
+      assignSlots(batch[0].slots, translatedSubs.join(' ').trim());
+      return;
     }
 
     if (batch.length === 1) {
       try {
         const res = await requestGtxSingleChunk(batch[0].text, src, tgt, signal);
         if (res.detected) detected = res.detected;
-        outputs[batch[0].idx] = res.translated || batch[0].text;
+        assignSlots(batch[0].slots, res.translated || batch[0].text);
       } catch (err) {
         if ((err as { name?: string })?.name === 'AbortError') throw err;
         if (work.length === 1) throw err;
-        outputs[batch[0].idx] = batch[0].text;
+        assignSlots(batch[0].slots, batch[0].text);
       }
-      continue;
+      return;
     }
 
     const joined = batch.map((b, k) => `[[#${k}]] ${b.text}`).join('\n');
@@ -508,31 +644,33 @@ async function translateBatchViaGoogleGtx(
       const res = await requestGtxSingleChunk(joined, src, tgt, signal);
       if (res.detected) detected = res.detected;
       const splitParts = res.translated.split(/\[\[\s*#\s*(\d+)\s*\]\]/);
+      const batchOut = new Array<string>(batch.length).fill('');
       for (let p = 1; p + 1 < splitParts.length; p += 2) {
         const slot = Number(splitParts[p]);
         if (batch[slot]) {
-          outputs[batch[slot].idx] = splitParts[p + 1].trim();
+          batchOut[slot] = splitParts[p + 1].trim();
         }
       }
-      for (const b of batch) {
-        if (!outputs[b.idx]) {
-          const singleRes = await requestGtxSingleChunk(b.text, src, tgt, signal).catch(
-            () => ({ translated: b.text })
+      for (let bIdx = 0; bIdx < batch.length; bIdx += 1) {
+        if (batchOut[bIdx]) {
+          assignSlots(batch[bIdx].slots, batchOut[bIdx]);
+        } else {
+          const singleRes = await requestGtxSingleChunk(batch[bIdx].text, src, tgt, signal).catch(
+            () => ({ translated: batch[bIdx].text })
           );
-          outputs[b.idx] = singleRes.translated || b.text;
+          assignSlots(batch[bIdx].slots, singleRes.translated || batch[bIdx].text);
         }
       }
     } catch (err) {
       if ((err as { name?: string })?.name === 'AbortError') throw err;
-      // Graceful per-item fallback so one noisy paragraph never aborts a whole chapter
       for (const b of batch) {
         const singleRes = await requestGtxSingleChunk(b.text, src, tgt, signal).catch(() => ({
           translated: b.text,
         }));
-        outputs[b.idx] = singleRes.translated || b.text;
+        assignSlots(b.slots, singleRes.translated || b.text);
       }
     }
-  }
+  });
 
   return { outputs, detected };
 }
@@ -542,7 +680,8 @@ async function translateViaGeminiDirect(
   src: SourceLang,
   tgt: TargetLang,
   geminiKey: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onChunkDone?: (startOffset: number, chunkOutputs: string[]) => void
 ): Promise<string[]> {
   const langNames: Record<TargetLang, string> = {
     ja: 'Japanese',
@@ -550,49 +689,64 @@ async function translateViaGeminiDirect(
     en: 'English',
   };
   const srcLabel = src === 'auto' ? 'any detected source language' : langNames[src];
-  const items = paragraphs.map((text, idx) => ({ id: idx + 1, text }));
   const sysPrompt =
-    `You translate from ${srcLabel} into natural, accurate ${langNames[tgt]} without summarizing. ` +
+    `You are a literary and technical translator producing fluent, natural, accurate ${langNames[tgt]} without summarizing. ` +
+    `Translate from ${srcLabel} into idiomatic ${langNames[tgt]} with natural dialogue rhythm and consistent pronouns. ` +
     `Ensure 100% of every output item is written in ${langNames[tgt]}. ` +
     `Keep any text that is already in ${langNames[tgt]} intact in ${langNames[tgt]} and NEVER translate it into another language. ` +
-    `Keep placeholders like [[E1]] verbatim. Preserve line breaks. ` +
+    `Keep placeholders like [[E1]] verbatim in their natural grammatical position. Preserve line breaks. ` +
     `Return strict JSON: {"translations":[{"id":1,"text":"..."}]}`;
 
-  const resp = await fetch(
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': geminiKey,
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: sysPrompt }] },
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: `Input:\n${JSON.stringify(items)}` }],
-          },
-        ],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.2,
+  const chunkSize = 40;
+  const chunks: Array<{ start: number; slice: string[] }> = [];
+  for (let i = 0; i < paragraphs.length; i += chunkSize) {
+    chunks.push({ start: i, slice: paragraphs.slice(i, i + chunkSize) });
+  }
+
+  const allOut = new Array<string>(paragraphs.length);
+  await runConcurrentPool(chunks, 2, async ({ start, slice }) => {
+    const items = slice.map((text, idx) => ({ id: idx + 1, text }));
+    const resp = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': geminiKey,
         },
-      }),
-      signal,
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: sysPrompt }] },
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: `Input:\n${JSON.stringify(items)}` }],
+            },
+          ],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            temperature: 0.2,
+          },
+        }),
+        signal,
+      }
+    );
+    if (!resp.ok) {
+      throw new Error(`Gemini HTTP ${resp.status}`);
     }
-  );
-  if (!resp.ok) {
-    throw new Error(`Gemini HTTP ${resp.status}`);
-  }
-  const raw = await resp.json();
-  const textPart = raw?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  const parsed = JSON.parse(textPart);
-  const map = new Map<number, string>();
-  for (const row of parsed.translations || []) {
-    map.set(Number(row.id), String(row.text || ''));
-  }
-  return paragraphs.map((orig, idx) => map.get(idx + 1) || orig);
+    const raw = await resp.json();
+    const textPart = raw?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    const parsed = JSON.parse(textPart);
+    const map = new Map<number, string>();
+    for (const row of parsed.translations || []) {
+      map.set(Number(row.id), String(row.text || ''));
+    }
+    const chunkOut = slice.map((orig, idx) => map.get(idx + 1) || orig);
+    chunkOut.forEach((txt, idx) => {
+      allOut[start + idx] = txt;
+    });
+    onChunkDone?.(start, chunkOut);
+  });
+  return allOut;
 }
 
 async function translateMixedCjkLineToTarget(
@@ -646,6 +800,7 @@ export async function translateParagraphsDirect(params: {
   mode: ModePair;
   titleId?: string;
   signal?: AbortSignal;
+  onProgress?: (partialOutputs: string[], doneCount: number, totalCount: number) => void;
 }): Promise<{
   outputs: string[];
   detectedSource: TargetLang;
@@ -653,13 +808,19 @@ export async function translateParagraphsDirect(params: {
   matchedChips: NameChipItem[];
 }> {
   const { src, tgt } = parseModePair(params.mode);
+  const totalCount = params.paragraphs.length;
   const combinedSample = params.paragraphs.slice(0, 8).join('\n');
   let detectedSource: TargetLang =
     src === 'auto'
       ? detectLanguageLocal(combinedSample, tgt === 'ja' ? 'id' : 'ja')
       : src;
 
-  const glossary = await loadGlossaryEntriesOnce(params.titleId);
+  // Eliminate waterfall: fetch glossary & Gemini key concurrently
+  const [glossary, geminiKey] = await Promise.all([
+    loadGlossaryEntriesOnce(params.titleId),
+    getOwnerGeminiKey(),
+  ]);
+
   const matchedChips: NameChipItem[] = [];
   for (const entry of glossary) {
     if (
@@ -684,40 +845,6 @@ export async function translateParagraphsDirect(params: {
     }
   }
 
-  const outputs = new Array<string>(params.paragraphs.length);
-  const toTranslateIdx: number[] = [];
-  const paraClasses: ParagraphLangClass[] = params.paragraphs.map((p) =>
-    classifyParagraphLanguage(p)
-  );
-
-  // Strict target-language guarantee: paragraphs already purely in target language stay intact verbatim
-  params.paragraphs.forEach((rawPara, idx) => {
-    const trimmed = rawPara.trim();
-    const cls = paraClasses[idx];
-    if (!trimmed || !hasTranslatableLetters(trimmed)) {
-      outputs[idx] = rawPara;
-      return;
-    }
-    if (
-      (tgt === 'id' && cls === 'id') ||
-      (tgt === 'en' && cls === 'en') ||
-      (tgt === 'ja' && cls === 'ja')
-    ) {
-      outputs[idx] = rawPara;
-      return;
-    }
-    toTranslateIdx.push(idx);
-  });
-
-  if (toTranslateIdx.length === 0) {
-    return {
-      outputs,
-      detectedSource: tgt,
-      model: 'identity',
-      matchedChips,
-    };
-  }
-
   const allGlossaryPairs = [
     ...buildGlossaryPairs(glossary, 'ja', tgt),
     ...buildGlossaryPairs(glossary, 'id', tgt),
@@ -730,26 +857,99 @@ export async function translateParagraphsDirect(params: {
   const combinedGlossaryPairs = Array.from(dedupPairMap.entries()).sort(
     (a, b) => b[0].length - a[0].length
   );
+  // Compact signature of active glossary + engine so cache invalidates automatically on glossary/key change
+  const glossarySig = `${geminiKey ? 'g' : 'x'}${combinedGlossaryPairs.length}:${combinedGlossaryPairs
+    .slice(0, 12)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(',')
+    .slice(0, 120)}`;
+
+  const outputs = new Array<string>(totalCount).fill('');
+  const doneFlags = new Uint8Array(totalCount);
+  let doneCount = 0;
+  let lastProgressEmit = 0;
+
+  const markDone = (idx: number, val: string, forceEmit = false) => {
+    outputs[idx] = val;
+    if (!doneFlags[idx]) {
+      doneFlags[idx] = 1;
+      doneCount += 1;
+    }
+    if (params.onProgress) {
+      const now = performance.now();
+      if (forceEmit || doneCount === totalCount || now - lastProgressEmit >= 120) {
+        lastProgressEmit = now;
+        params.onProgress(outputs.slice(), doneCount, totalCount);
+      }
+    }
+  };
+
+  const toTranslateIdx: number[] = [];
+  const paraClasses: ParagraphLangClass[] = params.paragraphs.map((p) =>
+    classifyParagraphLanguage(p)
+  );
+
+  // Strict target-language guarantee + L1/L2 persistent paragraph cache lookup
+  params.paragraphs.forEach((rawPara, idx) => {
+    const trimmed = rawPara.trim();
+    const cls = paraClasses[idx];
+    if (!trimmed || !hasTranslatableLetters(trimmed)) {
+      markDone(idx, rawPara);
+      return;
+    }
+    if (
+      (tgt === 'id' && cls === 'id') ||
+      (tgt === 'en' && cls === 'en') ||
+      (tgt === 'ja' && cls === 'ja')
+    ) {
+      markDone(idx, rawPara);
+      return;
+    }
+    const cacheKey = makeParaCacheKey(src, tgt, glossarySig, trimmed);
+    const cached = getCachedParaTranslation(cacheKey);
+    if (cached !== undefined) {
+      markDone(idx, cached);
+      return;
+    }
+    toTranslateIdx.push(idx);
+  });
+
+  if (toTranslateIdx.length === 0) {
+    params.onProgress?.(outputs.slice(), totalCount, totalCount);
+    return {
+      outputs,
+      detectedSource: doneCount > 0 && paraClasses.every((c) => c === tgt || c === 'unknown') ? tgt : detectedSource,
+      model: 'cache',
+      matchedChips,
+    };
+  }
 
   const maskedEntries = toTranslateIdx.map((origIdx) => ({
     origIdx,
     cls: paraClasses[origIdx],
+    cacheKey: makeParaCacheKey(src, tgt, glossarySig, params.paragraphs[origIdx].trim()),
     ...maskWithGlossary(params.paragraphs[origIdx], combinedGlossaryPairs),
   }));
 
-  const geminiKey = await getOwnerGeminiKey();
   if (geminiKey) {
     try {
-      const rawOut = await translateViaGeminiDirect(
+      await translateViaGeminiDirect(
         maskedEntries.map((m) => m.masked),
         src,
         tgt,
         geminiKey,
-        params.signal
+        params.signal,
+        (startOffset, chunkOut) => {
+          chunkOut.forEach((txt, offset) => {
+            const m = maskedEntries[startOffset + offset];
+            if (!m) return;
+            const finalTxt = polishTranslatedProse(unmaskWithGlossary(txt || m.masked, m.map), tgt);
+            setCachedParaTranslation(m.cacheKey, finalTxt);
+            markDone(m.origIdx, finalTxt, offset === chunkOut.length - 1);
+          });
+        }
       );
-      maskedEntries.forEach((m, k) => {
-        outputs[m.origIdx] = unmaskWithGlossary(rawOut[k] || m.masked, m.map);
-      });
+      params.onProgress?.(outputs.slice(), totalCount, totalCount);
       return {
         outputs,
         detectedSource,
@@ -786,32 +986,58 @@ export async function translateParagraphsDirect(params: {
     }
   }
 
-  for (const [bucketSrc, items] of Object.entries(buckets) as Array<
-    [SourceLang, typeof maskedEntries]
-  >) {
-    if (items.length === 0) continue;
-    const batchedRes = await translateBatchViaGoogleGtx(
-      items.map((m) => m.masked),
-      bucketSrc,
-      tgt,
-      params.signal
-    );
-    if (bucketSrc !== 'auto') {
-      detectedSource = bucketSrc;
-    } else {
-      detectedSource = batchedRes.detected;
-    }
-    items.forEach((item, k) => {
-      outputs[item.origIdx] = unmaskWithGlossary(batchedRes.outputs[k] || item.masked, item.map);
+  // Run non-empty language buckets in parallel!
+  const activeBuckets = (Object.entries(buckets) as Array<[SourceLang, typeof maskedEntries]>).filter(
+    ([, items]) => items.length > 0
+  );
+
+  await Promise.all(
+    activeBuckets.map(async ([bucketSrc, items]) => {
+      const batchedRes = await translateBatchViaGoogleGtx(
+        items.map((m) => m.masked),
+        bucketSrc,
+        tgt,
+        params.signal,
+        (slotIdx, translatedRaw) => {
+          const item = items[slotIdx];
+          if (!item) return;
+          const finalTxt = polishTranslatedProse(
+            unmaskWithGlossary(translatedRaw || item.masked, item.map),
+            tgt
+          );
+          setCachedParaTranslation(item.cacheKey, finalTxt);
+          markDone(item.origIdx, finalTxt);
+        }
+      );
+      if (bucketSrc !== 'auto') {
+        detectedSource = bucketSrc;
+      } else {
+        detectedSource = batchedRes.detected;
+      }
+      items.forEach((item, k) => {
+        if (!doneFlags[item.origIdx]) {
+          const finalTxt = polishTranslatedProse(
+            unmaskWithGlossary(batchedRes.outputs[k] || item.masked, item.map),
+            tgt
+          );
+          setCachedParaTranslation(item.cacheKey, finalTxt);
+          markDone(item.origIdx, finalTxt);
+        }
+      });
+    })
+  );
+
+  if (mixedJaItems.length > 0) {
+    await runConcurrentPool(mixedJaItems, 3, async (item) => {
+      const tr = await translateMixedCjkLineToTarget(item.masked, tgt, params.signal);
+      const finalTxt = polishTranslatedProse(unmaskWithGlossary(tr, item.map), tgt);
+      setCachedParaTranslation(item.cacheKey, finalTxt);
+      markDone(item.origIdx, finalTxt);
+      if (tgt !== 'ja') detectedSource = 'ja';
     });
   }
 
-  for (const item of mixedJaItems) {
-    const tr = await translateMixedCjkLineToTarget(item.masked, tgt, params.signal);
-    outputs[item.origIdx] = unmaskWithGlossary(tr, item.map);
-    if (tgt !== 'ja') detectedSource = 'ja';
-  }
-
+  params.onProgress?.(outputs.slice(), totalCount, totalCount);
   return {
     outputs,
     detectedSource,
@@ -833,13 +1059,68 @@ interface CachedWebEntry {
 }
 
 const webArticleCache = new Map<string, CachedWebEntry>();
+const inFlightArticleFetches = new Map<string, Promise<CachedWebEntry>>();
 const translatedWebCache = new Map<string, { heading: string; paras: string[] }>();
+const inFlightPreTranslations = new Set<string>();
 const translatedSiteHtmlCache = new Map<string, string>();
 const seriesTocCache = new Map<
   string,
   { seriesTitle?: string; tocUrl: string; chapters: NovelChapterLink[] }
 >();
 const translatedChapterTitlesCache = new Map<string, Record<string, string>>();
+
+const READING_PROGRESS_STORAGE_KEY = 'tranx_reading_progress_v1';
+const READING_PROGRESS_MAX = 60;
+
+export interface ReadingProgressEntry {
+  url: string;
+  chapterLabel?: string;
+  titleDst?: string;
+  updatedAt: number;
+}
+
+function readReadingProgressStore(): Record<string, ReadingProgressEntry> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = window.localStorage.getItem(READING_PROGRESS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, ReadingProgressEntry>) : {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveReadingProgress(seriesKey: string, entry: ReadingProgressEntry): void {
+  if (typeof window === 'undefined' || !seriesKey || !entry.url) return;
+  try {
+    const store = readReadingProgressStore();
+    store[seriesKey] = {
+      url: entry.url,
+      ...(entry.chapterLabel ? { chapterLabel: entry.chapterLabel } : {}),
+      ...(entry.titleDst ? { titleDst: entry.titleDst.slice(0, 120) } : {}),
+      updatedAt: entry.updatedAt || Date.now(),
+    };
+    const keys = Object.keys(store);
+    if (keys.length > READING_PROGRESS_MAX) {
+      keys
+        .sort((a, b) => (store[a]?.updatedAt || 0) - (store[b]?.updatedAt || 0))
+        .slice(0, keys.length - READING_PROGRESS_MAX)
+        .forEach((k) => {
+          delete store[k];
+        });
+    }
+    window.localStorage.setItem(READING_PROGRESS_STORAGE_KEY, JSON.stringify(store));
+  } catch {
+    // Ignore private-mode or quota errors
+  }
+}
+
+export function getReadingProgress(seriesKey?: string | null): ReadingProgressEntry | null {
+  if (!seriesKey) return null;
+  const store = readReadingProgressStore();
+  return store[seriesKey] || null;
+}
 
 /**
  * Automatically generates a Google Translate live-translated website URL
@@ -1872,6 +2153,24 @@ async function fetchWebArticleDirect(
     return cached;
   }
 
+  const inflightKey = `${cleanUrl}::${Boolean(options?.needRawHtml)}`;
+  const existingInflight = inFlightArticleFetches.get(inflightKey);
+  if (existingInflight) {
+    return existingInflight;
+  }
+
+  const work = fetchWebArticleDirectInner(cleanUrl, cached, options).finally(() => {
+    inFlightArticleFetches.delete(inflightKey);
+  });
+  inFlightArticleFetches.set(inflightKey, work);
+  return work;
+}
+
+async function fetchWebArticleDirectInner(
+  cleanUrl: string,
+  cached: CachedWebEntry | undefined,
+  options?: { needRawHtml?: boolean }
+): Promise<CachedWebEntry> {
   const host = new URL(cleanUrl).hostname;
   const ctrl = new AbortController();
   const timer = window.setTimeout(() => ctrl.abort(), 24000);
@@ -2019,6 +2318,62 @@ export function prefetchWebArticleDirect(rawUrl?: string | null): void {
   fetchWebArticleDirect(safe).catch(() => {});
 }
 
+/**
+ * Fetches and pre-translates the upcoming chapter in idle background time so
+ * clicking "Next chapter" opens instantaneously from memory + L2 cache.
+ */
+export function prefetchNextChapterTranslatedDirect(
+  rawUrl?: string | null,
+  mode: ModePair = 'auto-id',
+  titleId?: string
+): void {
+  if (!rawUrl) return;
+  const safe = toSafeHttpUrl(rawUrl);
+  if (!safe) return;
+  const cacheKey = `${safe}::${mode}`;
+  if (translatedWebCache.has(cacheKey) || inFlightPreTranslations.has(cacheKey)) return;
+
+  inFlightPreTranslations.add(cacheKey);
+  const runTask = () => {
+    (async () => {
+      try {
+        const article = await fetchWebArticleDirect(safe);
+        const articleCacheKey = `${article.url}::${mode}`;
+        if (translatedWebCache.has(articleCacheKey)) return;
+        const tid = titleId || article.titleId;
+        const cappedSrc = article.srcParas.slice(0, 180);
+        const batch = [article.titleSrc, ...cappedSrc];
+        const { outputs } = await translateParagraphsDirect({
+          paragraphs: batch,
+          mode,
+          titleId: tid,
+        });
+        const heading = outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
+        const paras = outputs.slice(1).map((s) => s.replace(/^#{1,6}\s+/, ''));
+        translatedWebCache.set(articleCacheKey, { heading, paras });
+        translatedWebCache.set(cacheKey, { heading, paras });
+      } catch {
+        // Silent background optimization
+      } finally {
+        inFlightPreTranslations.delete(cacheKey);
+      }
+    })();
+  };
+
+  if (typeof window !== 'undefined') {
+    const idleCb = (
+      window as unknown as {
+        requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      }
+    ).requestIdleCallback;
+    if (typeof idleCb === 'function') {
+      idleCb(runTask, { timeout: 1400 });
+    } else {
+      window.setTimeout(runTask, 300);
+    }
+  }
+}
+
 export async function directPreviewLink(params: {
   cid: string;
   url: string;
@@ -2078,29 +2433,39 @@ export async function directPreviewLink(params: {
     novelNav: article.novelNav,
   };
 
-  await upsertConversationMeta(params.cid, {
-    title: titleDst,
-    titleId: tid,
-    mode: params.mode,
-    detectedSource,
-    activeTab: 'link',
-    preview: excerptDst || titleDst,
-  });
-  await saveTurnMessageDirect(params.cid, mid, {
-    role: 'assistant',
-    kind: 'link',
-    mode: params.mode,
-    detectedSource,
-    titleId: tid,
-    srcText: article.url,
-    text: fullTranslatedText,
-    sentences,
-    linkPreview: preview,
-    state: 'done',
-  });
+  await Promise.all([
+    upsertConversationMeta(params.cid, {
+      title: titleDst,
+      titleId: tid,
+      mode: params.mode,
+      detectedSource,
+      activeTab: 'link',
+      preview: excerptDst || titleDst,
+    }),
+    saveTurnMessageDirect(params.cid, mid, {
+      role: 'assistant',
+      kind: 'link',
+      mode: params.mode,
+      detectedSource,
+      titleId: tid,
+      srcText: article.url,
+      text: fullTranslatedText,
+      sentences,
+      linkPreview: preview,
+      state: 'done',
+    }),
+  ]);
 
+  if (article.novelNav.isNovel && !article.novelNav.isTocPage) {
+    saveReadingProgress(article.novelNav.tocUrl || tid, {
+      url: article.url,
+      chapterLabel: article.novelNav.chapterLabel,
+      titleDst,
+      updatedAt: Date.now(),
+    });
+  }
   if (article.novelNav.nextUrl) {
-    prefetchWebArticleDirect(article.novelNav.nextUrl);
+    prefetchNextChapterTranslatedDirect(article.novelNav.nextUrl, params.mode, tid);
   }
 
   return preview;
@@ -2397,6 +2762,7 @@ export async function directFetchWebReaderBundle(params: {
   mode: ModePair;
   titleId?: string;
   view: 'reader' | 'site' | 'original';
+  onProgress?: (partialBundle: WebReaderBundle, doneCount: number, totalCount: number) => void;
 }): Promise<WebReaderBundle> {
   const article = await fetchWebArticleDirect(params.url, {
     needRawHtml: params.view === 'site',
@@ -2416,14 +2782,57 @@ export async function directFetchWebReaderBundle(params: {
       translatedParas = preTranslated.paras;
     } else {
       const batch = [article.titleSrc, ...cappedSrc];
+      let lastStreamedPrefixLen = 0;
       const { outputs } = await translateParagraphsDirect({
         paragraphs: batch,
         mode: params.mode,
         titleId: tid,
+        onProgress:
+          params.onProgress && params.view === 'reader'
+            ? (partialOutputs, doneCount, totalCount) => {
+                // Emit longest contiguous translated prefix starting at index 0 so the reader streams cleanly top-to-bottom without untranslated flicker
+                let prefixLen = 0;
+                for (let idx = 0; idx < cappedSrc.length; idx += 1) {
+                  if (partialOutputs[idx + 1]) {
+                    prefixLen = idx + 1;
+                  } else {
+                    break;
+                  }
+                }
+                if (prefixLen === 0 || (prefixLen === lastStreamedPrefixLen && doneCount < totalCount)) {
+                  return;
+                }
+                lastStreamedPrefixLen = prefixLen;
+                const partialTitle =
+                  partialOutputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
+                const partialSentences: SentencePair[] = cappedSrc
+                  .slice(0, prefixLen)
+                  .map((srcLine, idx) => ({
+                    i: idx,
+                    src: srcLine.replace(/^#{1,6}\s+/, ''),
+                    dst: (partialOutputs[idx + 1] || srcLine).replace(/^#{1,6}\s+/, ''),
+                  }));
+                params.onProgress?.(
+                  {
+                    url: article.url,
+                    host: article.host,
+                    titleId: tid,
+                    detectedSource: article.detectedSource,
+                    titleSrc: article.titleSrc,
+                    titleDst: partialTitle,
+                    sentences: partialSentences,
+                    novelNav: article.novelNav,
+                  },
+                  Math.max(prefixLen, doneCount - 1),
+                  cappedSrc.length
+                );
+              }
+            : undefined,
       });
       titleDst = outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
       translatedParas = outputs.slice(1).map((s) => s.replace(/^#{1,6}\s+/, ''));
       translatedWebCache.set(cacheKey1, { heading: titleDst, paras: translatedParas });
+      translatedWebCache.set(cacheKey2, { heading: titleDst, paras: translatedParas });
     }
   }
 
@@ -2444,8 +2853,16 @@ export async function directFetchWebReaderBundle(params: {
     });
   }
 
+  if (article.novelNav.isNovel && !article.novelNav.isTocPage) {
+    saveReadingProgress(article.novelNav.tocUrl || tid, {
+      url: article.url,
+      chapterLabel: article.novelNav.chapterLabel,
+      titleDst,
+      updatedAt: Date.now(),
+    });
+  }
   if (article.novelNav.nextUrl) {
-    prefetchWebArticleDirect(article.novelNav.nextUrl);
+    prefetchNextChapterTranslatedDirect(article.novelNav.nextUrl, params.mode, tid);
   }
 
   return {
@@ -3073,17 +3490,75 @@ async function extractPdfUnitsNative(buffer: ArrayBuffer): Promise<ParsedDocUnit
   return units;
 }
 
+interface WarmTesseractSlot {
+  workerPromise: Promise<import('tesseract.js').Worker>;
+  queue: Promise<unknown>;
+  idleTimer: number | null;
+}
+
+const warmTesseractWorkers = new Map<string, WarmTesseractSlot>();
+const TESSERACT_IDLE_TTL_MS = 120_000;
+
+async function getWarmTesseractSlot(langs: string[]): Promise<WarmTesseractSlot> {
+  const key = langs.join('+');
+  const existing = warmTesseractWorkers.get(key);
+  if (existing) {
+    if (existing.idleTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(existing.idleTimer);
+      existing.idleTimer = null;
+    }
+    return existing;
+  }
+
+  const workerPromise = (async () => {
+    const [{ createWorker }, workerUrlMod] = await Promise.all([
+      import('tesseract.js'),
+      import('tesseract.js/dist/worker.min.js?url'),
+    ]);
+    const resolvedWorkerUrl =
+      typeof window !== 'undefined'
+        ? new URL(workerUrlMod.default, window.location.origin).href
+        : workerUrlMod.default;
+    return createWorker(langs, 1, {
+      workerPath: resolvedWorkerUrl,
+      workerBlobURL: false,
+      logger: () => {},
+    });
+  })();
+
+  const slot: WarmTesseractSlot = {
+    workerPromise,
+    queue: Promise.resolve(),
+    idleTimer: null,
+  };
+  warmTesseractWorkers.set(key, slot);
+
+  workerPromise.catch(() => {
+    if (warmTesseractWorkers.get(key) === slot) {
+      warmTesseractWorkers.delete(key);
+    }
+  });
+  return slot;
+}
+
+function scheduleTesseractIdleCleanup(key: string, slot: WarmTesseractSlot): void {
+  if (typeof window === 'undefined') return;
+  if (slot.idleTimer !== null) window.clearTimeout(slot.idleTimer);
+  slot.idleTimer = window.setTimeout(() => {
+    if (warmTesseractWorkers.get(key) !== slot) return;
+    warmTesseractWorkers.delete(key);
+    slot.workerPromise
+      .then((w) => w.terminate())
+      .catch(() => {});
+  }, TESSERACT_IDLE_TTL_MS);
+}
+
 async function runTesseractOcrBoxes(
   imageSource: string | HTMLCanvasElement,
   imgW: number,
   imgH: number,
   srcLang: SourceLang
 ): Promise<Array<{ id: number; box_2d: number[]; text: string }>> {
-  const [{ createWorker }, workerUrlMod] = await Promise.all([
-    import('tesseract.js'),
-    import('tesseract.js/dist/worker.min.js?url'),
-  ]);
-
   const langs =
     srcLang === 'ja'
       ? ['jpn', 'eng']
@@ -3092,60 +3567,69 @@ async function runTesseractOcrBoxes(
         : srcLang === 'en'
           ? ['eng']
           : ['jpn', 'eng'];
+  const key = langs.join('+');
+  const slot = await getWarmTesseractSlot(langs);
 
-  const resolvedWorkerUrl =
-    typeof window !== 'undefined'
-      ? new URL(workerUrlMod.default, window.location.origin).href
-      : workerUrlMod.default;
+  const runRecognize = async () => {
+    if (slot.idleTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(slot.idleTimer);
+      slot.idleTimer = null;
+    }
+    try {
+      const worker = await slot.workerPromise;
+      const { data } = await worker.recognize(
+        imageSource,
+        {},
+        { text: true, blocks: true }
+      );
+      const out: Array<{ id: number; box_2d: number[]; text: string }> = [];
+      const blocks = Array.isArray(data?.blocks) ? data.blocks : [];
 
-  const worker = await createWorker(langs, 1, {
-    workerPath: resolvedWorkerUrl,
-    workerBlobURL: false,
-    logger: () => {},
-  });
-
-  try {
-    const { data } = await worker.recognize(
-      imageSource,
-      {},
-      { text: true, blocks: true }
-    );
-    const out: Array<{ id: number; box_2d: number[]; text: string }> = [];
-    const blocks = Array.isArray(data?.blocks) ? data.blocks : [];
-
-    for (const blk of blocks) {
-      const paras = Array.isArray(blk.paragraphs) ? blk.paragraphs : [];
-      for (const para of paras) {
-        const cleaned = cleanCjkSpacing((para.text || '').replace(/\s+/g, ' ').trim());
-        if (!cleaned || !hasTranslatableLetters(cleaned)) continue;
-        const bb = para.bbox || blk.bbox;
-        if (bb) {
-          const ymin = Math.max(0, Math.min(1000, Math.round((bb.y0 / imgH) * 1000)));
-          const xmin = Math.max(0, Math.min(1000, Math.round((bb.x0 / imgW) * 1000)));
-          const ymax = Math.max(0, Math.min(1000, Math.round((bb.y1 / imgH) * 1000)));
-          const xmax = Math.max(0, Math.min(1000, Math.round((bb.x1 / imgW) * 1000)));
-          out.push({ id: out.length + 1, box_2d: [ymin, xmin, ymax, xmax], text: cleaned });
+      for (const blk of blocks) {
+        const paras = Array.isArray(blk.paragraphs) ? blk.paragraphs : [];
+        for (const para of paras) {
+          const cleaned = cleanCjkSpacing((para.text || '').replace(/\s+/g, ' ').trim());
+          if (!cleaned || !hasTranslatableLetters(cleaned)) continue;
+          const bb = para.bbox || blk.bbox;
+          if (bb) {
+            const ymin = Math.max(0, Math.min(1000, Math.round((bb.y0 / imgH) * 1000)));
+            const xmin = Math.max(0, Math.min(1000, Math.round((bb.x0 / imgW) * 1000)));
+            const ymax = Math.max(0, Math.min(1000, Math.round((bb.y1 / imgH) * 1000)));
+            const xmax = Math.max(0, Math.min(1000, Math.round((bb.x1 / imgW) * 1000)));
+            out.push({ id: out.length + 1, box_2d: [ymin, xmin, ymax, xmax], text: cleaned });
+          }
         }
       }
-    }
 
-    if (out.length === 0 && data?.text) {
-      const fallbackLines = data.text
-        .split(/\r?\n/)
-        .map((l) => cleanCjkSpacing(l.trim()))
-        .filter((l) => l.length > 0 && hasTranslatableLetters(l));
-      const count = Math.max(fallbackLines.length, 1);
-      fallbackLines.forEach((line, idx) => {
-        const ymin = Math.round(((idx + 0.3) / (count + 0.6)) * 1000);
-        const ymax = Math.min(1000, ymin + Math.round(700 / count));
-        out.push({ id: idx + 1, box_2d: [ymin, 50, ymax, 950], text: line });
-      });
-    }
+      if (out.length === 0 && data?.text) {
+        const fallbackLines = data.text
+          .split(/\r?\n/)
+          .map((l) => cleanCjkSpacing(l.trim()))
+          .filter((l) => l.length > 0 && hasTranslatableLetters(l));
+        const count = Math.max(fallbackLines.length, 1);
+        fallbackLines.forEach((line, idx) => {
+          const ymin = Math.round(((idx + 0.3) / (count + 0.6)) * 1000);
+          const ymax = Math.min(1000, ymin + Math.round(700 / count));
+          out.push({ id: idx + 1, box_2d: [ymin, 50, ymax, 950], text: line });
+        });
+      }
 
-    return out;
-  } finally {
-    await worker.terminate().catch(() => {});
-  }
+      scheduleTesseractIdleCleanup(key, slot);
+      return out;
+    } catch (err) {
+      if (warmTesseractWorkers.get(key) === slot) {
+        warmTesseractWorkers.delete(key);
+        slot.workerPromise
+          .then((w) => w.terminate())
+          .catch(() => {});
+      }
+      throw err;
+    }
+  };
+
+  const resultPromise = slot.queue.then(runRecognize, runRecognize);
+  slot.queue = resultPromise.catch(() => {});
+  return resultPromise;
 }
 
 async function extractPdfUnitsWithPdfJs(
@@ -3577,64 +4061,60 @@ export async function directTranslateDocumentFile(params: {
   }
 
   const cappedUnits = units.slice(0, 200);
-  await upsertConversationMeta(params.cid, {
-    title: params.file.name,
-    titleId: params.titleId || '',
-    mode: params.mode,
-    activeTab: 'dokumen',
-    preview: params.file.name,
-  });
-
-  await saveDirectJobRecord({
-    id: jobId,
-    cid: params.cid,
-    mid: params.mid,
-    titleId: params.titleId,
-    fileName: params.file.name,
-    fileSize: params.file.size,
-    fmt,
-    state: 'running',
-    doneParas: 0,
-    totalParas: cappedUnits.length,
-    updatedAt: Date.now(),
-  });
-
-  await saveTurnMessageDirect(params.cid, params.mid, {
-    role: 'assistant',
-    kind: 'document',
-    mode: params.mode,
-    titleId: params.titleId,
-    fileName: params.file.name,
-    fmt,
-    jobId,
-    done: 0,
-    total: cappedUnits.length,
-    text: '',
-    state: 'running',
-  });
-
-  const translatedRows: Array<{ prefix?: string; src: string; dst: string }> = [];
-  const batchSize = 10;
-  let detected: TargetLang = 'ja';
-
-  for (let i = 0; i < cappedUnits.length; i += batchSize) {
-    const slice = cappedUnits.slice(i, i + batchSize);
-    const { outputs, detectedSource } = await translateParagraphsDirect({
-      paragraphs: slice.map((u) => u.text),
+  await Promise.all([
+    upsertConversationMeta(params.cid, {
+      title: params.file.name,
+      titleId: params.titleId || '',
+      mode: params.mode,
+      activeTab: 'dokumen',
+      preview: params.file.name,
+    }),
+    saveDirectJobRecord({
+      id: jobId,
+      cid: params.cid,
+      mid: params.mid,
+      titleId: params.titleId,
+      fileName: params.file.name,
+      fileSize: params.file.size,
+      fmt,
+      state: 'running',
+      doneParas: 0,
+      totalParas: cappedUnits.length,
+      updatedAt: Date.now(),
+    }),
+    saveTurnMessageDirect(params.cid, params.mid, {
+      role: 'assistant',
+      kind: 'document',
       mode: params.mode,
       titleId: params.titleId,
-    });
-    if (i === 0) detected = detectedSource;
-    slice.forEach((u, idx) => {
-      translatedRows.push({
-        prefix: u.prefix,
-        src: u.text,
-        dst: outputs[idx] || u.text,
-      });
-    });
-    const pct = Math.round((translatedRows.length / cappedUnits.length) * 100);
-    params.onProgress?.(pct);
-  }
+      fileName: params.file.name,
+      fmt,
+      jobId,
+      done: 0,
+      total: cappedUnits.length,
+      text: '',
+      state: 'running',
+    }),
+  ]);
+
+  const { outputs, detectedSource } = await translateParagraphsDirect({
+    paragraphs: cappedUnits.map((u) => u.text),
+    mode: params.mode,
+    titleId: params.titleId,
+    onProgress: (_, done, total) => {
+      const pct = Math.min(98, Math.max(8, Math.round((done / Math.max(1, total)) * 100)));
+      params.onProgress?.(pct);
+    },
+  });
+
+  const translatedRows: Array<{ prefix?: string; src: string; dst: string }> = cappedUnits.map(
+    (u, idx) => ({
+      prefix: u.prefix,
+      src: u.text,
+      dst: outputs[idx] || u.text,
+    })
+  );
+  const detected: TargetLang = detectedSource;
 
   directExportCache.set(`${params.cid}:${params.mid}`, {
     fileName: params.file.name,
@@ -3650,44 +4130,45 @@ export async function directTranslateDocumentFile(params: {
   }));
   const fullDst = translatedRows.map((r) => r.dst).join('\n\n');
 
-  await saveDirectJobRecord({
-    id: jobId,
-    cid: params.cid,
-    mid: params.mid,
-    titleId: params.titleId,
-    fileName: params.file.name,
-    fileSize: params.file.size,
-    fmt,
-    state: 'done',
-    doneParas: translatedRows.length,
-    totalParas: cappedUnits.length,
-    updatedAt: Date.now(),
-  });
-
-  await saveTurnMessageDirect(params.cid, params.mid, {
-    role: 'assistant',
-    kind: 'document',
-    mode: params.mode,
-    detectedSource: detected,
-    titleId: params.titleId,
-    fileName: params.file.name,
-    fmt,
-    jobId,
-    done: translatedRows.length,
-    total: cappedUnits.length,
-    text: fullDst,
-    sentences,
-    state: 'done',
-  });
-
-  await upsertConversationMeta(params.cid, {
-    title: params.file.name,
-    titleId: params.titleId || '',
-    mode: params.mode,
-    detectedSource: detected,
-    activeTab: 'dokumen',
-    preview: fullDst.slice(0, 180),
-  });
+  await Promise.all([
+    saveDirectJobRecord({
+      id: jobId,
+      cid: params.cid,
+      mid: params.mid,
+      titleId: params.titleId,
+      fileName: params.file.name,
+      fileSize: params.file.size,
+      fmt,
+      state: 'done',
+      doneParas: translatedRows.length,
+      totalParas: cappedUnits.length,
+      updatedAt: Date.now(),
+    }),
+    saveTurnMessageDirect(params.cid, params.mid, {
+      role: 'assistant',
+      kind: 'document',
+      mode: params.mode,
+      detectedSource: detected,
+      titleId: params.titleId,
+      fileName: params.file.name,
+      fmt,
+      jobId,
+      done: translatedRows.length,
+      total: cappedUnits.length,
+      text: fullDst,
+      sentences,
+      state: 'done',
+    }),
+    upsertConversationMeta(params.cid, {
+      title: params.file.name,
+      titleId: params.titleId || '',
+      mode: params.mode,
+      detectedSource: detected,
+      activeTab: 'dokumen',
+      preview: fullDst.slice(0, 180),
+    }),
+  ]);
+  params.onProgress?.(100);
 
   return jobId;
 }
@@ -4025,26 +4506,28 @@ export async function directTranslateImage(params: {
     dataUrl: params.imageDataUrl,
   };
 
-  await upsertConversationMeta(params.cid, {
-    title: params.fileName,
-    titleId: tid,
-    mode: params.mode,
-    detectedSource,
-    activeTab: 'gambar',
-    preview: res.fullDst.slice(0, 180) || params.fileName,
-  });
-  await saveTurnMessageDirect(params.cid, mid, {
-    role: 'assistant',
-    kind: 'image',
-    mode: params.mode,
-    detectedSource,
-    titleId: tid,
-    fileName: params.fileName,
-    text: res.fullDst,
-    imageResult: res,
-    state: 'done',
-    model: usedModel,
-  });
+  await Promise.all([
+    upsertConversationMeta(params.cid, {
+      title: params.fileName,
+      titleId: tid,
+      mode: params.mode,
+      detectedSource,
+      activeTab: 'gambar',
+      preview: res.fullDst.slice(0, 180) || params.fileName,
+    }),
+    saveTurnMessageDirect(params.cid, mid, {
+      role: 'assistant',
+      kind: 'image',
+      mode: params.mode,
+      detectedSource,
+      titleId: tid,
+      fileName: params.fileName,
+      text: res.fullDst,
+      imageResult: res,
+      state: 'done',
+      model: usedModel,
+    }),
+  ]);
 
   return { cid: params.cid, mid, titleId: tid, ...res };
 }
