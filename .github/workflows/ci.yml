@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integrity-and-backend:
+    name: Integrity & Backend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: functions/requirements.txt
+
+      - name: Verify translator integrity, vendor SHA-256, and 32 selftests
+        run: python3 -B tools/verify_integrity.py
+
+      - name: Install backend dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r functions/requirements.txt pytest
+
+      - name: Run backend test suite
+        run: python3 -B -m pytest functions/tests -v
+
+  web-build-and-pwa:
+    name: Web Typecheck, Build & PWA Manifest Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci --prefix web
+
+      - name: Typecheck and build production PWA bundle
+        run: npm run build --prefix web
+
+      - name: Validate PWA build artifacts
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const manifest = JSON.parse(fs.readFileSync('web/dist/manifest.webmanifest', 'utf8'));
+            if (manifest.display !== 'standalone') throw new Error('Expected standalone display');
+            if (manifest.id !== '/') throw new Error('Expected manifest id /');
+            if (manifest.share_target?.enctype !== 'application/x-www-form-urlencoded') {
+              throw new Error('Missing share_target.enctype');
+            }
+            for (const f of ['web/dist/sw.js', 'web/dist/pwa-capture.js', 'web/dist/registerSW.js']) {
+              if (!fs.existsSync(f)) throw new Error('Missing build artifact: ' + f);
+            }
+            console.log('PWA artifacts verified:', manifest.name, manifest.display);
+          "
+
+  security-and-hygiene:
+    name: Secret & Path Hygiene Guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan tracked files for leaked secrets and local paths
+        run: |
+          python3 -B -c "
+          import re, subprocess, sys
+          tracked = subprocess.check_output(['git', 'ls-files']).decode().splitlines()
+          secret_patterns = [
+              ('google_api_key', re.compile('AIza' + r'[0-9A-Za-z_-]{35}')),
+              ('github_token', re.compile(r'(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}')),
+              ('openai_key', re.compile('sk-' + r'[A-Za-z0-9]{20,}')),
+              ('private_key', re.compile('-----BEGIN [A-Z ]*' + 'PRIVATE KEY-----')),
+              ('aws_key', re.compile('AKIA' + r'[0-9A-Z]{16}')),
+          ]
+          local_path = re.compile(r'/Users/[A-Za-z0-9_.-]+/')
+          failures = []
+          for rel in tracked:
+              if rel in ('translator.py', 'web/package-lock.json', '.github/workflows/ci.yml', 'tools/verify_integrity.py'):
+                  continue
+              text = open(rel, 'r', encoding='utf-8', errors='ignore').read()
+              for label, rx in secret_patterns:
+                  if rx.search(text):
+                      failures.append(f'{rel}: matched {label}')
+              if local_path.search(text):
+                  failures.append(f'{rel}: hardcoded local macOS path')
+          if failures:
+              print('\n'.join(failures))
+              sys.exit(1)
+          print(f'SECURITY HYGIENE OK: scanned {len(tracked)} tracked files')
+          "
