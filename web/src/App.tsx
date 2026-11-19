@@ -60,7 +60,6 @@ import {
   translateImageRequest,
 } from './lib/api';
 import {
-  buildAutoTranslatedSiteUrl,
   buildModePair,
   detectLanguageLocal,
   isSingleStandaloneUrl,
@@ -2757,16 +2756,21 @@ export function App() {
                           )}
                           {turn.srcText &&
                             isSingleStandaloneUrl(turn.srcText) &&
-                            buildAutoTranslatedSiteUrl(turn.srcText, turn.mode) && (
-                              <a
-                                href={buildAutoTranslatedSiteUrl(turn.srcText, turn.mode)!}
-                                target="_blank"
-                                rel="noopener noreferrer"
+                            toSafeHttpUrl(turn.srcText) && (
+                              <button
+                                type="button"
                                 className="btn-secondary pressable"
+                                onClick={() =>
+                                  navigate(
+                                    `/web?url=${encodeURIComponent(
+                                      toSafeHttpUrl(turn.srcText!)!
+                                    )}&mode=${encodeURIComponent(turn.mode)}&view=site`
+                                  )
+                                }
                               >
                                 <IconGlobe size={16} />
                                 {strings.openAutoTranslatedTab}
-                              </a>
+                              </button>
                             )}
                         </div>
                       </div>

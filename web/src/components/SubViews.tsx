@@ -838,6 +838,7 @@ export function TranslatedWebViewer({
     targetView: 'reader' | 'site' = view === 'site' ? 'site' : 'reader'
   ) => {
     setChaptersOpen(false);
+    setView(targetView);
     const qs = new URLSearchParams({
       url: targetUrl,
       mode,
@@ -978,17 +979,14 @@ export function TranslatedWebViewer({
             </button>
           )}
           {safeExternalUrl && (
-            <a
-              href={`/web?url=${encodeURIComponent(safeExternalUrl)}&mode=${encodeURIComponent(mode)}&view=site${
-                effectiveTitleId ? `&titleId=${encodeURIComponent(effectiveTitleId)}` : ''
-              }`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="btn-secondary pressable"
+            <button
+              type="button"
+              className={view === 'site' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+              onClick={() => openChapterUrl(safeExternalUrl, 'site')}
             >
               <IconLink size={15} />
               {strings.openAutoTranslatedTab}
-            </a>
+            </button>
           )}
         </div>
         {view === 'reader' && !loading && !errorMsg && (
@@ -1040,17 +1038,25 @@ export function TranslatedWebViewer({
               <div>{errorMsg}</div>
               {safeExternalUrl && (
                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                  {autoTranslatedSiteUrl && (
+                  {view !== 'site' ? (
+                    <button
+                      type="button"
+                      className="btn-primary pressable"
+                      onClick={() => openChapterUrl(safeExternalUrl, 'site')}
+                    >
+                      <IconGlobe size={16} />
+                      {strings.openAutoTranslatedTab}
+                    </button>
+                  ) : autoTranslatedSiteUrl ? (
                     <a
                       href={autoTranslatedSiteUrl}
-                      target="_blank"
                       rel="noopener noreferrer"
                       className="btn-primary pressable"
                     >
                       <IconGlobe size={16} />
                       {strings.openAutoTranslatedTab}
                     </a>
-                  )}
+                  ) : null}
                   <a
                     href={safeExternalUrl}
                     target="_blank"

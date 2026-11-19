@@ -260,8 +260,11 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.getByRole('dialog')).toBeVisible();
     await page.getByRole('dialog').getByRole('button', { name: /Bab 1: Hujan di Rashomon/ }).click();
     await expect(page.getByRole('heading', { name: 'Bab 1: Hujan di Rashomon' })).toBeVisible();
-    // Switch to Situs Terjemahan (extension-less full translated website inside sandboxed iframe)
-    await page.getByRole('button', { name: 'Situs Terjemahan' }).click();
+    // Switch to Situs Terjemahan via "Buka web terjemahan otomatis" -> stays strictly inside the SAME app tab (0 new tabs!)
+    const pagesBeforeAutoSite = page.context().pages().length;
+    await page.getByRole('button', { name: 'Buka web terjemahan otomatis' }).click();
+    await expect(page).toHaveURL(/view=site/);
+    expect(page.context().pages().length).toBe(pagesBeforeAutoSite);
     await expect(page.locator('iframe[title="Pembaca Halaman Terjemahan"]')).toBeVisible();
     await expect(page.getByRole('button', { name: /Alat Web & HP|Web & Mobile tools/i })).toHaveCount(0);
     await expect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
