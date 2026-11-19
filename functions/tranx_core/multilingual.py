@@ -41,22 +41,64 @@ LANG_ENGLISH_NAMES = {
 
 _ID_STOPWORDS = frozenset(
     {
-        "yang", "dan", "di", "ke", "dari", "ini", "itu", "untuk", "dengan",
-        "tidak", "bisa", "ada", "saya", "aku", "kamu", "kami", "mereka",
-        "dalam", "pada", "adalah", "sudah", "akan", "atau", "karena",
-        "seperti", "juga", "oleh", "tentang", "lebih", "sangat", "hanya",
-        "telah", "dapat", "bagaimana", "mengapa", "kapan", "selamat", "pagi",
+        "yang", "dan", "di", "ke", "dari", "ini", "itu", "untuk", "dengan", "tidak", "tak",
+        "bisa", "ada", "saya", "aku", "kamu", "kau", "dia", "ia", "kami", "kita", "mereka",
+        "dalam", "pada", "adalah", "sudah", "akan", "atau", "karena", "seperti", "juga",
+        "oleh", "tentang", "lebih", "sangat", "hanya", "saja", "telah", "dapat", "bagaimana",
+        "mengapa", "kenapa", "kapan", "selamat", "pagi", "malam", "siang", "sore", "terima",
+        "kasih", "tetap", "bukan", "belum", "masih", "lagi", "baru", "semua", "setiap",
+        "ketika", "saat", "waktu", "hari", "orang", "cerita", "bab", "halaman", "buku",
+        "baca", "pergi", "datang", "tetapi", "tapi", "namun", "jika", "kalau", "agar",
+        "mau", "ingin", "harus", "boleh", "perlu", "jadi", "sesuai", "berubah", "halo",
     }
 )
 _EN_STOPWORDS = frozenset(
     {
-        "the", "and", "to", "of", "in", "is", "it", "you", "that", "for",
-        "with", "on", "are", "this", "have", "from", "not", "but", "what",
-        "all", "were", "when", "we", "your", "can", "their", "would", "there",
-        "been", "has", "more", "who", "will", "about", "into", "than", "morning",
+        "the", "and", "to", "of", "in", "is", "it", "you", "that", "for", "with", "on",
+        "are", "this", "have", "from", "not", "but", "what", "all", "were", "when", "we",
+        "your", "can", "their", "would", "there", "been", "has", "more", "who", "will",
+        "about", "into", "than", "morning", "hello", "good", "chapter", "next", "previous",
+        "page", "story", "read", "book", "novel", "was", "she", "he", "they", "while",
     }
 )
 _WORD_RE = re.compile(r"[A-Za-zÀ-ÿ']+")
+
+
+def classify_paragraph_language(text: str) -> str:
+    """Classify a single paragraph as 'ja', 'id', 'en', 'mixed-ja', 'mixed-latin', or 'unknown'."""
+    sample = (text or "").strip()
+    if not sample:
+        return "unknown"
+    has_cjk = contains_japanese(sample)
+    tokens = [w.lower() for w in _WORD_RE.findall(sample[:4000])]
+    if has_cjk:
+        latin_multi = sum(1 for t in tokens if len(t) >= 2)
+        return "mixed-ja" if latin_multi >= 2 else "ja"
+    if not tokens:
+        return "unknown"
+
+    id_score = sum(1.2 for t in tokens if t in _ID_STOPWORDS)
+    en_score = sum(1.2 for t in tokens if t in _EN_STOPWORDS)
+    for t in tokens:
+        if len(t) >= 5 and (
+            t.endswith(("nya", "kan", "lah", "kah"))
+            or t.startswith(("meny", "meng", "memb", "mend", "ber", "ter"))
+        ):
+            id_score += 0.7
+        if len(t) >= 5 and t.endswith(("tion", "ment", "ing", "ness")):
+            en_score += 0.7
+
+    if id_score > 0 and en_score == 0:
+        return "id"
+    if en_score > 0 and id_score == 0:
+        return "en"
+    if id_score > 0 and en_score > 0:
+        if id_score >= en_score * 1.8:
+            return "id"
+        if en_score >= id_score * 1.8:
+            return "en"
+        return "mixed-latin"
+    return "unknown"
 
 
 def detect_source_language(text: str, fallback: str = "ja") -> str:
@@ -71,19 +113,22 @@ def detect_source_language(text: str, fallback: str = "ja") -> str:
     if not tokens:
         return fallback if fallback in ALL_TARGET_LANGS else "id"
 
-    id_score = sum(1 for t in tokens if t in _ID_STOPWORDS)
-    en_score = sum(1 for t in tokens if t in _EN_STOPWORDS)
-
-    # Morphological Indonesian affixes (me-, ber-, ke-...-an, -nya, -kan)
+    id_score = sum(1.2 for t in tokens if t in _ID_STOPWORDS)
+    en_score = sum(1.2 for t in tokens if t in _EN_STOPWORDS)
     for t in tokens:
-        if len(t) >= 5 and (t.endswith(("nya", "kan")) or t.startswith(("meny", "meng", "ber", "ter"))):
-            id_score += 0.6
+        if len(t) >= 5 and (
+            t.endswith(("nya", "kan", "lah", "kah"))
+            or t.startswith(("meny", "meng", "memb", "mend", "ber", "ter"))
+        ):
+            id_score += 0.7
+        if len(t) >= 5 and t.endswith(("tion", "ment", "ing", "ness")):
+            en_score += 0.7
 
     if id_score > en_score:
         return "id"
     if en_score > id_score:
         return "en"
-    return "en" if fallback == "id" else "id"
+    return fallback if fallback in ALL_TARGET_LANGS else "id"
 
 
 def parse_mode_pair(
@@ -204,11 +249,31 @@ def translate_multilingual_paragraphs(
         ]
         return same_out, "identity"
 
+    # Strict target-language guarantee: paragraphs already purely in tgt_lang stay verbatim
+    already_target: dict[int, str] = {}
+    work_indices: list[int] = []
+    for idx, p in enumerate(paragraphs):
+        cls = classify_paragraph_language(p.text)
+        if cls == tgt_lang:
+            already_target[idx] = p.text
+        else:
+            work_indices.append(idx)
+
+    if not work_indices:
+        same_out = [
+            TranslatedParagraph(
+                source=p,
+                sentences=[SentencePair(source=p.text, target=p.text, status="ok", engine="identity")],
+            )
+            for p in paragraphs
+        ]
+        return same_out, "identity"
+
     pairs = _build_glossary_replacements(glossary_entries, src_lang, tgt_lang)
     masked_items: list[str] = []
     maps: list[dict[str, str]] = []
-    for p in paragraphs:
-        m_txt, t_map = _mask_with_glossary(p.text, pairs)
+    for idx in work_indices:
+        m_txt, t_map = _mask_with_glossary(paragraphs[idx].text, pairs)
         masked_items.append(m_txt)
         maps.append(t_map)
 
@@ -219,13 +284,16 @@ def translate_multilingual_paragraphs(
     if clean_key or llm_transport is not None:
         model = settings.llm_models[0]
         used_engine = f"tranx_llm:{model}"
+        src_label = LANG_ENGLISH_NAMES.get(src_lang, "the detected source language")
+        tgt_label = LANG_ENGLISH_NAMES.get(tgt_lang, "Indonesian")
         sys_prompt = (
-            f"You are an expert literary and technical translator from {LANG_ENGLISH_NAMES[src_lang]} "
-            f"to {LANG_ENGLISH_NAMES[tgt_lang]}. Translate naturally, accurately, and faithfully without summarizing.\n"
+            f"You are an expert literary and technical translator into natural, accurate {tgt_label}. "
+            f"Translate from {src_label} or any detected language into {tgt_label} without summarizing.\n"
             "Rules:\n"
-            "1. Keep placeholders such as [[E1]] or [[E2]] verbatim in their grammatically natural position.\n"
-            "2. Preserve line breaks within each item.\n"
-            '3. Reply ONLY with a JSON object: {"translations": [{"id": 1, "text": "..."}]} matching input ids.'
+            f"1. Ensure 100% of every output item is written in {tgt_label}. Keep any portion already in {tgt_label} intact and never translate it into another language.\n"
+            "2. Keep placeholders such as [[E1]] or [[E2]] verbatim in their grammatically natural position.\n"
+            "3. Preserve line breaks within each item.\n"
+            '4. Reply ONLY with a JSON object: {"translations": [{"id": 1, "text": "..."}]} matching input ids.'
         )
         req_items = [{"id": idx + 1, "text": txt} for idx, txt in enumerate(masked_items)]
         payload: dict[str, Any] = {
@@ -272,9 +340,14 @@ def translate_multilingual_paragraphs(
         g_eng = GoogleEngine(g_cfg)
         raw_outputs = g_eng.translate(masked_items, src_lang, tgt_lang)
 
+    translated_by_idx: dict[int, str] = dict(already_target)
+    for work_pos, orig_idx in enumerate(work_indices):
+        translated_by_idx[orig_idx] = _unmask_tokens(raw_outputs[work_pos], maps[work_pos])
+
     result_paras: list[TranslatedParagraph] = []
-    for p, raw_dst, tok_map in zip(paragraphs, raw_outputs, maps):
-        final_dst = _unmask_tokens(raw_dst, tok_map)
+    for idx, p in enumerate(paragraphs):
+        final_dst = translated_by_idx.get(idx, p.text)
+        eng_label = "identity" if idx in already_target else used_engine
         result_paras.append(
             TranslatedParagraph(
                 source=p,
@@ -283,7 +356,7 @@ def translate_multilingual_paragraphs(
                         source=p.text,
                         target=final_dst,
                         status="ok",
-                        engine=used_engine,
+                        engine=eng_label,
                     )
                 ],
             )

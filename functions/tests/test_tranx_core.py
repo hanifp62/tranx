@@ -481,3 +481,74 @@ def test_speech_stt_validation_and_daily_cap_brake() -> None:
             char_cap=1000,
             call_cap=10,
         )
+
+
+def test_multilingual_strict_target_preserves_target_language_paragraphs() -> None:
+    """Auto-detect to Indonesian/Japanese keeps already-in-target paragraphs verbatim while translating foreign ones."""
+    from tranx_core.multilingual import classify_paragraph_language, translate_multilingual_paragraphs
+
+    assert classify_paragraph_language("Ini kalimat bahasa Indonesia yang harus tetap bahasa Indonesia.") == "id"
+    assert classify_paragraph_language("The rainy gate of Kyoto stood quietly in the mist.") == "en"
+    assert classify_paragraph_language("千早は小さく笑った。") == "ja"
+    assert classify_paragraph_language("千早 adalah tokoh utama dalam cerita ini.") == "mixed-ja"
+
+    class StubMultilingualTransport:
+        def __init__(self) -> None:
+            self.seen_inputs: list[str] = []
+
+        def __call__(self, payload: dict[str, Any]) -> dict[str, Any]:
+            user_content = payload["messages"][1]["content"]
+            raw_json = user_content.split("Input:\n", 1)[1]
+            items = json.loads(raw_json)
+            translations: list[dict[str, Any]] = []
+            for item in items:
+                p = item["text"]
+                self.seen_inputs.append(p)
+                if "おはようございます" in p:
+                    dst = "Selamat pagi."
+                elif "The rainy gate" in p:
+                    dst = "Gerbang hujan di Kyoto berdiri tenang di tengah kabut."
+                elif "Selamat pagi teman" in p:
+                    dst = "おはよう、友達。"
+                else:
+                    dst = p
+                translations.append({"id": item["id"], "text": dst})
+            return {"choices": [{"message": {"content": json.dumps({"translations": translations})}}]}
+
+    stub = StubMultilingualTransport()
+    settings = AppSettings()
+
+    id_keep = "Ini kalimat bahasa Indonesia yang harus tetap bahasa Indonesia."
+    en_line = "The rainy gate of Kyoto stood quietly in the mist."
+    ja_line = "おはようございます。"
+
+    res_id, _ = translate_multilingual_paragraphs(
+        paragraphs=read_text(f"{id_keep}\n\n{en_line}\n\n{ja_line}", "mixed").paragraphs,
+        src_lang="auto",
+        tgt_lang="id",
+        settings=settings,
+        cache=LayeredTranslationCache(),
+        api_key="test-key",
+        llm_transport=stub,
+    )
+    assert res_id[0].sentences[0].target == id_keep
+    assert res_id[0].sentences[0].engine == "identity"
+    assert res_id[1].sentences[0].target == "Gerbang hujan di Kyoto berdiri tenang di tengah kabut."
+    assert res_id[2].sentences[0].target == "Selamat pagi."
+    assert id_keep not in stub.seen_inputs
+
+    # Verify auto -> ja keeps pure Japanese untouched while translating Indonesian to Japanese
+    stub_ja = StubMultilingualTransport()
+    res_ja, _ = translate_multilingual_paragraphs(
+        paragraphs=read_text("千早は小さく笑った。\n\nSelamat pagi teman.", "mixed-ja").paragraphs,
+        src_lang="auto",
+        tgt_lang="ja",
+        settings=settings,
+        cache=LayeredTranslationCache(),
+        api_key="test-key",
+        llm_transport=stub_ja,
+    )
+    assert res_ja[0].sentences[0].target == "千早は小さく笑った。"
+    assert res_ja[0].sentences[0].engine == "identity"
+    assert res_ja[1].sentences[0].target == "おはよう、友達。"
+    assert "千早は小さく笑った。" not in stub_ja.seen_inputs

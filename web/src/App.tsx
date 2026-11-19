@@ -107,6 +107,7 @@ import {
   RenameDialog,
   SettingsModal,
   ShortcutsModal,
+  WebToolsModal,
 } from './components/Modals';
 import {
   GlossaryView,
@@ -208,6 +209,10 @@ export function App() {
   const [logoutOpen, setLogoutOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<ConversationDoc | null>(null);
   const [infoModalKind, setInfoModalKind] = useState<'help' | 'about' | null>(null);
+  const [webToolsOpen, setWebToolsOpen] = useState(false);
+  const [inlineChaptersNav, setInlineChaptersNav] = useState<
+    import('./types').NovelNavigation | null
+  >(null);
 
   /* Source bubble expand & inline edit */
   const [expandedBubbles, setExpandedBubbles] = useState<Record<string, boolean>>({});
@@ -255,7 +260,12 @@ export function App() {
   const parsedUrl = useMemo(() => new URL(routePath, window.location.origin), [routePath]);
   const pathname = parsedUrl.pathname;
   const lastNonWebPathRef = useRef<string>('/');
-  if (pathname !== '/web') {
+  if (
+    pathname !== '/web' &&
+    pathname !== '/share' &&
+    !pathname.startsWith('/r/') &&
+    !pathname.startsWith('/masuk')
+  ) {
     lastNonWebPathRef.current = routePath;
   }
   const activeCid = useMemo(() => {
@@ -364,19 +374,61 @@ export function App() {
     if (qTab && ['teks', 'gambar', 'dokumen', 'link'].includes(qTab)) {
       setActiveTab(qTab as WorkTab);
     }
-    if (pathname === '/share') {
-      const sharedUrl = parsedUrl.searchParams.get('url') || '';
-      const sharedText = parsedUrl.searchParams.get('text') || '';
-      if (sharedUrl) {
-        setActiveTab('link');
-        setLinkUrlInput(sharedUrl);
-      } else if (sharedText) {
-        setActiveTab('teks');
-        setComposerText(sharedText);
+
+    // Preserve deep-link / bookmarklet / share route ONLY when genuinely unauthenticated
+    if (!authReady) return;
+    if (!user) {
+      if (pathname === '/web' || pathname === '/share' || pathname.startsWith('/r/')) {
+        window.sessionStorage.setItem('tranx_post_login_path', routePath);
       }
-      navigate('/');
+      return;
     }
-  }, [pathname, parsedUrl, navigate]);
+
+    const pendingPostLogin = window.sessionStorage.getItem('tranx_post_login_path');
+    if (pendingPostLogin) {
+      window.sessionStorage.removeItem('tranx_post_login_path');
+      if ((pathname === '/' || pathname === '/masuk') && pendingPostLogin !== routePath) {
+        navigate(pendingPostLogin);
+        return;
+      }
+    }
+
+    // Instant URL prefix shortcut: /r/https://kakuyomu.jp/... or /r/kakuyomu.jp/...
+    if (pathname.startsWith('/r/') && pathname.length > 3) {
+      const rawTail = decodeURIComponent(pathname.slice(3)) + parsedUrl.search;
+      const safeUrl = toSafeHttpUrl(rawTail);
+      if (safeUrl) {
+        navigate(
+          `/web?url=${encodeURIComponent(safeUrl)}&mode=${encodeURIComponent(activeMode)}&view=reader`
+        );
+      } else {
+        setActiveTab('link');
+        setLinkUrlInput(rawTail);
+        navigate('/?tab=link');
+      }
+      return;
+    }
+
+    // Mobile PWA Share Target: auto-translate shared URLs in 1 tap (handles Android Chrome sending URL in text!)
+    if (pathname === '/share') {
+      const rawSharedUrl = (parsedUrl.searchParams.get('url') || '').trim();
+      const rawSharedText = (parsedUrl.searchParams.get('text') || '').trim();
+      const extractedUrl =
+        toSafeHttpUrl(rawSharedUrl) ||
+        toSafeHttpUrl((rawSharedText.match(/https?:\/\/[^\s]+/i) || [''])[0]);
+      if (extractedUrl) {
+        navigate(
+          `/web?url=${encodeURIComponent(extractedUrl)}&mode=${encodeURIComponent(activeMode)}&view=reader`
+        );
+      } else if (rawSharedText) {
+        setActiveTab('teks');
+        setComposerText(rawSharedText);
+        navigate('/');
+      } else {
+        navigate('/');
+      }
+    }
+  }, [pathname, parsedUrl, routePath, authReady, user, activeMode, navigate]);
 
   useEffect(() => {
     if (window.launchQueue) {
@@ -1100,16 +1152,40 @@ export function App() {
     const targetUrl = parsedUrl.searchParams.get('url') || '';
     const qMode = normalizeModePair(parsedUrl.searchParams.get('mode'), activeMode);
     const qTid = parsedUrl.searchParams.get('titleId') || undefined;
+    const rawView = parsedUrl.searchParams.get('view');
+    const qView: 'reader' | 'site' | 'original' =
+      rawView === 'site' || rawView === 'original' ? rawView : 'reader';
     return (
-      <TranslatedWebViewer
-        user={user}
-        url={targetUrl}
-        initialMode={qMode}
-        titleId={qTid}
-        backPath={lastNonWebPathRef.current || '/'}
-        strings={strings}
-        onNavigate={navigate}
-      />
+      <>
+        <TranslatedWebViewer
+          user={user}
+          url={targetUrl}
+          initialMode={qMode}
+          initialView={qView}
+          titleId={qTid}
+          backPath={lastNonWebPathRef.current || '/'}
+          strings={strings}
+          onNavigate={navigate}
+          onOpenWebTools={() => setWebToolsOpen(true)}
+        />
+        {webToolsOpen && (
+          <WebToolsModal
+            mode={qMode}
+            strings={strings}
+            onClose={() => setWebToolsOpen(false)}
+            onNotify={(m) => pushToast(m)}
+          />
+        )}
+        {toasts.length > 0 && (
+          <div className="toast-container" role="status" aria-live="polite">
+            {toasts.map((t) => (
+              <div key={t.id} className="toast-bar">
+                <span>{t.message}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </>
     );
   }
 
@@ -1150,15 +1226,6 @@ export function App() {
       : labelForLang(currentSrcLang, strings);
 
   const targetPillLabel = labelForLang(currentTgtLang, strings);
-
-  /* Quick helper when Deteksi bahasa detects the same language as current target */
-  const autoSameLangSuggestions: TargetLang[] =
-    currentSrcLang === 'auto' &&
-    liveDetectedLang &&
-    liveDetectedLang === currentTgtLang &&
-    composerText.trim().length >= 4
-      ? (['id', 'en', 'ja'] as const).filter((l) => l !== liveDetectedLang)
-      : [];
 
   const renderStagedAttachmentList = (modeKind: 'gambar' | 'dokumen') => (
     <div className="attachment-list">
@@ -1434,26 +1501,36 @@ export function App() {
                 flexWrap: 'wrap',
               }}
             >
-              <button
-                type="button"
-                className="btn-secondary pressable"
-                disabled={isFetchingLink}
-                onClick={async () => {
-                  try {
-                    const clip = (await navigator.clipboard.readText()).trim();
-                    if (clip) {
-                      setLinkUrlInput(clip);
-                    } else {
-                      pushToast('Papan klip masih kosong.');
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn-secondary pressable"
+                  disabled={isFetchingLink}
+                  onClick={async () => {
+                    try {
+                      const clip = (await navigator.clipboard.readText()).trim();
+                      if (clip) {
+                        setLinkUrlInput(clip);
+                      } else {
+                        pushToast('Papan klip masih kosong.');
+                      }
+                    } catch {
+                      pushToast('Tempel URL dengan Cmd/Ctrl+V.');
                     }
-                  } catch {
-                    pushToast('Tempel URL dengan Cmd/Ctrl+V.');
-                  }
-                }}
-              >
-                <IconCopy size={16} />
-                {strings.pasteUrlBtn}
-              </button>
+                  }}
+                >
+                  <IconCopy size={16} />
+                  {strings.pasteUrlBtn}
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary pressable"
+                  onClick={() => setWebToolsOpen(true)}
+                >
+                  <IconGlobe size={16} />
+                  {strings.webToolsBtn}
+                </button>
+              </div>
               <button
                 type="submit"
                 className="btn-primary pressable"
@@ -1493,34 +1570,6 @@ export function App() {
                 </button>
               </div>
             ) : null}
-
-            {autoSameLangSuggestions.length > 0 && (
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                  flexWrap: 'wrap',
-                  fontSize: '12px',
-                  color: 'var(--text-muted)',
-                }}
-              >
-                <span>
-                  {strings.detectedPrefix} {labelForLang(liveDetectedLang as TargetLang, strings)}
-                  {' \u2192 '}
-                </span>
-                {autoSameLangSuggestions.map((sug) => (
-                  <button
-                    key={sug}
-                    type="button"
-                    className="name-chip pressable"
-                    onClick={() => handleSelectTargetLang(sug)}
-                  >
-                    {labelForLang(sug, strings)}
-                  </button>
-                ))}
-              </div>
-            )}
 
             <textarea
               className="composer-textarea"
@@ -2186,15 +2235,33 @@ export function App() {
 
                 if (turn.kind === 'link' && turn.linkPreview) {
                   const lp = turn.linkPreview;
+                  const nav = lp.novelNav;
                   const fullArticleText = turn.text || lp.excerptDst;
                   return (
                     <div key={turn.id} className="turn-assistant-wrap">
                       <div className="result-card">
-                        <div style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
-                          {lp.host} · {lp.paragraphCount} {strings.paragraphsUnit}
-                          {lp.lockedNames > 0
-                            ? ` · ${lp.lockedNames} ${strings.lockedNamesUnit}`
-                            : ''}
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            flexWrap: 'wrap',
+                            fontSize: '12px',
+                            color: 'var(--text-subtle)',
+                          }}
+                        >
+                          <span>
+                            {lp.host} · {lp.paragraphCount} {strings.paragraphsUnit}
+                            {lp.lockedNames > 0
+                              ? ` · ${lp.lockedNames} ${strings.lockedNamesUnit}`
+                              : ''}
+                          </span>
+                          {nav?.isNovel && (
+                            <span className="status-badge done">
+                              {strings.novelDetectedBadge}
+                              {nav.chapterLabel ? ` · ${nav.chapterLabel}` : ''}
+                            </span>
+                          )}
                         </div>
                         <div style={{ fontWeight: 700, fontSize: '20px', lineHeight: '28px' }}>
                           {lp.titleDst}
@@ -2206,24 +2273,25 @@ export function App() {
                             className="btn-primary pressable"
                             onClick={() =>
                               navigate(
-                                `/web?url=${encodeURIComponent(lp.url)}&mode=${turn.mode}&titleId=${encodeURIComponent(lp.titleId)}`
+                                `/web?url=${encodeURIComponent(lp.url)}&mode=${turn.mode}&view=reader&titleId=${encodeURIComponent(lp.titleId)}`
+                              )
+                            }
+                          >
+                            <IconBook size={17} />
+                            {strings.openFullTranslatedPage}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-secondary pressable"
+                            onClick={() =>
+                              navigate(
+                                `/web?url=${encodeURIComponent(lp.url)}&mode=${turn.mode}&view=site&titleId=${encodeURIComponent(lp.titleId)}`
                               )
                             }
                           >
                             <IconGlobe size={17} />
-                            {strings.openFullTranslatedPage}
+                            {strings.openTranslatedSite}
                           </button>
-                          {toSafeHttpUrl(lp.url) && (
-                            <a
-                              href={toSafeHttpUrl(lp.url)!}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="btn-secondary pressable"
-                            >
-                              <IconLink size={17} />
-                              {strings.openOriginalSite}
-                            </a>
-                          )}
                           <button
                             type="button"
                             className="btn-secondary pressable"
@@ -2236,6 +2304,13 @@ export function App() {
                           >
                             <IconCopy size={16} />
                             {strings.copyTranslation}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-secondary pressable"
+                            onClick={() => setWebToolsOpen(true)}
+                          >
+                            {strings.webToolsBtn}
                           </button>
                         </div>
 
@@ -2251,6 +2326,55 @@ export function App() {
                         >
                           {fullArticleText}
                         </div>
+
+                        {nav && (nav.prevUrl || nav.nextUrl || nav.chapters?.length) && (
+                          <div className="novel-inline-nav">
+                            <button
+                              type="button"
+                              className="btn-secondary pressable"
+                              disabled={!nav.prevUrl || isFetchingLink}
+                              onClick={() =>
+                                nav.prevUrl && handleSubmitLink(undefined, nav.prevUrl)
+                              }
+                            >
+                              {'\u2190'} {strings.prevChapter}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn-secondary pressable"
+                              onClick={() => setInlineChaptersNav(nav)}
+                            >
+                              <IconBook size={16} />
+                              {strings.chapterListBtn}
+                              {nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn-primary pressable"
+                              disabled={!nav.nextUrl || isFetchingLink}
+                              onClick={() =>
+                                nav.nextUrl && handleSubmitLink(undefined, nav.nextUrl)
+                              }
+                            >
+                              {isFetchingLink ? strings.loadingNextChapter : strings.nextChapter}{' '}
+                              {'\u2192'}
+                            </button>
+                          </div>
+                        )}
+
+                        {toSafeHttpUrl(lp.url) && (
+                          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                            <a
+                              href={toSafeHttpUrl(lp.url)!}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="action-chip-btn"
+                            >
+                              <IconLink size={15} />
+                              {strings.openOriginalUntranslated}
+                            </a>
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -3185,6 +3309,65 @@ export function App() {
           strings={strings}
           onClose={() => setInfoModalKind(null)}
         />
+      )}
+
+      {webToolsOpen && (
+        <WebToolsModal
+          mode={activeMode}
+          strings={strings}
+          onClose={() => setWebToolsOpen(false)}
+          onNotify={(m) => pushToast(m)}
+        />
+      )}
+
+      {inlineChaptersNav && (
+        <div className="scrim-backdrop" onClick={() => setInlineChaptersNav(null)}>
+          <div
+            className="modal-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="inline-chapters-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <h2 id="inline-chapters-title" className="modal-title">
+                {inlineChaptersNav.seriesTitle || strings.chapterListBtn}
+              </h2>
+              <button
+                type="button"
+                className="icon-square-btn"
+                aria-label={strings.closeLabel}
+                onClick={() => setInlineChaptersNav(null)}
+              >
+                <IconX size={18} />
+              </button>
+            </div>
+            <div className="modal-body">
+              {inlineChaptersNav.chapters && inlineChaptersNav.chapters.length > 0 ? (
+                <div className="chapter-list-grid">
+                  {inlineChaptersNav.chapters.map((ch, idx) => (
+                    <button
+                      key={`${ch.url}_${idx}`}
+                      type="button"
+                      className={`chapter-list-item pressable ${ch.current ? 'is-current' : ''}`}
+                      onClick={() => {
+                        setInlineChaptersNav(null);
+                        handleSubmitLink(undefined, ch.url);
+                      }}
+                    >
+                      <span>{ch.title}</span>
+                      {ch.current && <span className="status-badge done">Aktif</span>}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
+                  {strings.noChaptersFound}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {toasts.length > 0 && (

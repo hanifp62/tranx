@@ -14,8 +14,11 @@ import {
 } from './firebase';
 import {
   buildDirectExportBlob,
+  classifyParagraphLanguage,
+  deriveSeriesTitleId,
   detectLanguageLocal,
   directFetchTranslatedWebHtml,
+  directFetchWebReaderBundle,
   directPreviewLink,
   directTranslateDocumentFile,
   directTranslateImage,
@@ -30,6 +33,7 @@ import type {
   NameChipItem,
   SentencePair,
   TargetLang,
+  WebReaderBundle,
 } from '../types';
 
 export function getApiBaseUrl(): string {
@@ -193,12 +197,15 @@ export async function streamChatTurn(params: {
       src === 'auto'
         ? detectLanguageLocal(params.text, tgt === 'ja' ? 'id' : 'ja')
         : src;
+    const paraCls = classifyParagraphLanguage(params.text);
     const dst =
-      tgt === 'ja'
-        ? '千早は軒下で静かに微笑んだ。'
-        : tgt === 'en'
-          ? 'Chihaya smiled quietly beneath the eaves.'
-          : 'Chihaya tersenyum tenang di bawah atap.';
+      paraCls === tgt
+        ? params.text
+        : tgt === 'ja'
+          ? '千早は軒下で静かに微笑んだ。'
+          : tgt === 'en'
+            ? 'Chihaya smiled quietly beneath the eaves.'
+            : 'Chihaya tersenyum tenang di bawah atap.';
     const now = Date.now();
     const bucket = store.messages.get(params.cid) ?? new Map();
     bucket.set(params.clientMsgId, {
@@ -630,23 +637,46 @@ export async function previewLinkRequest(params: {
     const mid = `lnk_${Date.now().toString(36)}`;
     const host = new URL(cleanUrl).hostname;
     const { tgt } = parseModePair(params.mode);
+    const isEp2 = cleanUrl.includes('/2') || cleanUrl.includes('episodes/2');
+    const mockChapters = [
+      {
+        title: tgt === 'en' ? 'Chapter 1: Rain at Rashomon' : 'Bab 1: Hujan di Rashomon',
+        url: 'https://www.aozora.gr.jp/cards/1.html',
+        current: !isEp2,
+      },
+      {
+        title: tgt === 'en' ? 'Chapter 2: Lanterns of Kyoto' : 'Bab 2: Lentera di Kyoto',
+        url: 'https://www.aozora.gr.jp/cards/2.html',
+        current: isEp2,
+      },
+    ];
     const preview: LinkPreviewPayload = {
       mid,
       cid: params.cid,
-      titleId: 't_rashomon',
+      titleId: deriveSeriesTitleId(cleanUrl) || 't_rashomon',
       url: cleanUrl,
       host,
       isAozora: host.includes('aozora'),
-      titleSrc: '第一章 雨の羅生門',
-      titleDst:
-        tgt === 'ja'
+      titleSrc: isEp2 ? '第二章 京都の提灯' : '第一章 雨の羅生門',
+      titleDst: isEp2
+        ? tgt === 'ja'
+          ? '第二章 京都の提灯'
+          : tgt === 'en'
+            ? 'Chapter 2: Lanterns of Kyoto'
+            : 'Bab 2: Lentera di Kyoto'
+        : tgt === 'ja'
           ? '第一章 雨の羅生門'
           : tgt === 'en'
             ? 'Chapter 1: Rain at Rashomon'
             : 'Bab 1: Hujan di Rashomon',
-      excerptSrc: '千早は小さく笑った。',
-      excerptDst:
-        tgt === 'ja'
+      excerptSrc: isEp2 ? '提灯の明かりが雨に揺れた。' : '千早は小さく笑った。',
+      excerptDst: isEp2
+        ? tgt === 'ja'
+          ? '提灯の明かりが雨に揺れた。'
+          : tgt === 'en'
+            ? 'Lantern light swayed softly in the rain.'
+            : 'Cahaya lentera bergoyang pelan di tengah hujan.'
+        : tgt === 'ja'
           ? '千早は門の下で静かに微笑んだ。'
           : tgt === 'en'
             ? 'Chihaya smiled quietly under the gate.'
@@ -654,6 +684,15 @@ export async function previewLinkRequest(params: {
       paragraphCount: 12,
       lockedNames: 1,
       readerSupported: true,
+      novelNav: {
+        isNovel: true,
+        seriesTitle: 'Rashomon',
+        chapterLabel: isEp2 ? '2 / 2' : '1 / 2',
+        prevUrl: isEp2 ? 'https://www.aozora.gr.jp/cards/1.html' : null,
+        nextUrl: isEp2 ? null : 'https://www.aozora.gr.jp/cards/2.html',
+        tocUrl: 'https://www.aozora.gr.jp/cards/1.html',
+        chapters: mockChapters,
+      },
     };
     const bucket = store.messages.get(params.cid) ?? new Map();
     bucket.set(mid, {
@@ -719,12 +758,116 @@ export async function previewLinkRequest(params: {
   }
 }
 
+export async function fetchWebReaderBundle(params: {
+  user: AuthSessionUser;
+  url: string;
+  mode: ModePair;
+  titleId?: string;
+  view: 'reader' | 'site' | 'original';
+}): Promise<WebReaderBundle> {
+  const cleanUrl = normalizeWebUrl(params.url);
+
+  if (isLocalE2EMode() && !isDirectE2ETest()) {
+    const { tgt } = parseModePair(params.mode);
+    const host = new URL(cleanUrl).hostname;
+    const isEp2 = cleanUrl.includes('/2') || cleanUrl.includes('episodes/2');
+    const titleSrc = isEp2 ? '第二章 京都の提灯' : '第一章 雨の羅生門';
+    const titleDst = isEp2
+      ? tgt === 'ja'
+        ? '第二章 京都の提灯'
+        : tgt === 'en'
+          ? 'Chapter 2: Lanterns of Kyoto'
+          : 'Bab 2: Lentera di Kyoto'
+      : tgt === 'ja'
+        ? '第一章 雨の羅生門'
+        : tgt === 'en'
+          ? 'Chapter 1: Rain at Rashomon'
+          : 'Bab 1: Hujan di Rashomon';
+    const sentences: SentencePair[] = isEp2
+      ? [
+          {
+            i: 0,
+            src: '提灯の明かりが雨に揺れた。',
+            dst:
+              tgt === 'ja'
+                ? '提灯の明かりが雨に揺れた。'
+                : tgt === 'en'
+                  ? 'Lantern light swayed softly in the rain.'
+                  : 'Cahaya lentera bergoyang pelan di tengah hujan.',
+          },
+        ]
+      : [
+          {
+            i: 0,
+            src: '千早は小さく笑った。',
+            dst:
+              tgt === 'ja'
+                ? '千早は静かに微笑んだ。'
+                : tgt === 'en'
+                  ? 'Chihaya smiled quietly.'
+                  : 'Chihaya tersenyum kecil.',
+          },
+        ];
+    const nextUrl = isEp2 ? null : 'https://www.aozora.gr.jp/cards/2.html';
+    const prevUrl = isEp2 ? 'https://www.aozora.gr.jp/cards/1.html' : null;
+    const origin = window.location.origin;
+    const nextHref = nextUrl
+      ? `${origin}/web?url=${encodeURIComponent(nextUrl)}&mode=${params.mode}&view=site`
+      : '';
+    const siteHtml =
+      params.view === 'site'
+        ? `<!doctype html><html lang="${tgt}"><head><meta charset="utf-8"><style>body{font-family:Charter,Georgia,serif;max-width:680px;margin:32px auto;padding:0 20px;line-height:1.75;color:#141917;background:#FAFBFA}</style></head><body><h1>${titleDst}</h1><p>${sentences[0].dst}</p>${
+            nextHref
+              ? `<p><a href="${nextHref}" target="_top" rel="noopener noreferrer">Bab berikutnya</a></p>`
+              : ''
+          }</body></html>`
+        : undefined;
+    return {
+      url: cleanUrl,
+      host,
+      titleId: params.titleId || deriveSeriesTitleId(cleanUrl),
+      detectedSource: 'ja',
+      titleSrc,
+      titleDst,
+      sentences,
+      novelNav: {
+        isNovel: true,
+        seriesTitle: 'Rashomon',
+        chapterLabel: isEp2 ? '2 / 2' : '1 / 2',
+        prevUrl,
+        nextUrl,
+        tocUrl: 'https://www.aozora.gr.jp/cards/1.html',
+        chapters: [
+          {
+            title: tgt === 'en' ? 'Chapter 1: Rain at Rashomon' : 'Bab 1: Hujan di Rashomon',
+            url: 'https://www.aozora.gr.jp/cards/1.html',
+            current: !isEp2,
+          },
+          {
+            title: tgt === 'en' ? 'Chapter 2: Lanterns of Kyoto' : 'Bab 2: Lentera di Kyoto',
+            url: 'https://www.aozora.gr.jp/cards/2.html',
+            current: isEp2,
+          },
+        ],
+      },
+      siteHtml,
+    };
+  }
+
+  return directFetchWebReaderBundle({
+    url: cleanUrl,
+    mode: params.mode,
+    titleId: params.titleId,
+    view: params.view,
+  });
+}
+
 export async function fetchTranslatedWebHtml(params: {
   user: AuthSessionUser;
   url: string;
   mode: ModePair;
   titleId?: string;
-  view: 'translated' | 'original';
+  view: 'translated' | 'original' | 'site' | 'reader';
 }): Promise<string> {
   const cleanUrl = normalizeWebUrl(params.url);
 
@@ -746,7 +889,7 @@ export async function fetchTranslatedWebHtml(params: {
       const qs = new URLSearchParams({
         url: cleanUrl,
         mode: params.mode,
-        view: params.view,
+        view: params.view === 'original' ? 'original' : 'translated',
         ...(params.titleId ? { titleId: params.titleId } : {}),
       });
       const resp = await fetch(`${getApiBaseUrl()}/v1/web?${qs.toString()}`, {

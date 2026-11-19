@@ -132,6 +132,33 @@ export interface UiStrings {
   longLimitUnit: string;
   paragraphsUnit: string;
   lockedNamesUnit: string;
+  openTranslatedSite: string;
+  openOriginalUntranslated: string;
+  readerModeTab: string;
+  translatedSiteTab: string;
+  bilingualToggle: string;
+  novelDetectedBadge: string;
+  prevChapter: string;
+  nextChapter: string;
+  chapterListBtn: string;
+  loadingNextChapter: string;
+  webToolsBtn: string;
+  webToolsTitle: string;
+  webToolsSubtitle: string;
+  bookmarkletTitle: string;
+  bookmarkletHint: string;
+  copyBookmarklet: string;
+  bookmarkletCopied: string;
+  mobileShareTitle: string;
+  mobileShareHint: string;
+  urlPrefixTitle: string;
+  urlPrefixHint: string;
+  iosShortcutTitle: string;
+  iosShortcutHint: string;
+  copyTemplate: string;
+  noChaptersFound: string;
+  openTocSite: string;
+  closeLabel: string;
 }
 
 export const STRINGS: Record<UiLang, UiStrings> = {
@@ -267,6 +294,33 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     longLimitUnit: 'naskah panjang',
     paragraphsUnit: 'paragraf',
     lockedNamesUnit: 'nama terkunci',
+    openTranslatedSite: 'Buka situs terjemahan',
+    openOriginalUntranslated: 'Tab asli (tanpa terjemahan)',
+    readerModeTab: 'Mode Baca',
+    translatedSiteTab: 'Situs Terjemahan',
+    bilingualToggle: 'Berdampingan',
+    novelDetectedBadge: 'Novel terdeteksi',
+    prevChapter: 'Bab sebelumnya',
+    nextChapter: 'Bab berikutnya',
+    chapterListBtn: 'Daftar bab',
+    loadingNextChapter: 'Memuat bab berikutnya...',
+    webToolsBtn: 'Alat Web & HP',
+    webToolsTitle: 'Alat Terjemahan Otomatis (Desktop & HP)',
+    webToolsSubtitle: 'Terjemahkan situs web dan bab novel otomatis di desktop maupun HP tanpa memasang ekstensi.',
+    bookmarkletTitle: '1. Bookmarklet 1-Ketuk (Safari iOS, Chrome HP & Desktop)',
+    bookmarkletHint: 'Di desktop, tarik tombol di bawah ke bilah bookmark. Di HP (iPhone/Android), salin skrip lalu tempel pada kolom URL bookmark browser Anda; ketuk bookmark tersebut saat membuka situs novel.',
+    copyBookmarklet: 'Salin skrip bookmarklet',
+    bookmarkletCopied: 'Skrip bookmarklet disalin',
+    mobileShareTitle: '2. Bagikan Langsung dari Browser HP (PWA Share Target)',
+    mobileShareHint: 'Pasang tranX ke Layar Utama (Add to Home Screen). Saat membaca novel di Chrome HP, ketuk Bagikan lalu pilih tranX untuk langsung membuka terjemahan otomatis.',
+    urlPrefixTitle: '3. Awalan URL Cepat (/r/)',
+    urlPrefixHint: 'Tambahkan awalan berikut di depan alamat situs apa pun pada bilah alamat browser:',
+    iosShortcutTitle: '4. Templat iOS Shortcuts (Safari iPhone/iPad)',
+    iosShortcutHint: 'Buat Pintasan Safari dengan aksi Buka URL menggunakan templat ini agar tersedia di menu Share iOS:',
+    copyTemplate: 'Salin templat',
+    noChaptersFound: 'Daftar bab belum tersedia pada halaman ini. Gunakan tombol Bab sebelumnya / Bab berikutnya.',
+    openTocSite: 'Buka halaman daftar isi (terjemahan)',
+    closeLabel: 'Tutup',
   },
   en: {
     greeting: 'What would you like to read today?',
@@ -400,6 +454,33 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     longLimitUnit: 'long text',
     paragraphsUnit: 'paragraphs',
     lockedNamesUnit: 'locked names',
+    openTranslatedSite: 'Open translated site',
+    openOriginalUntranslated: 'Original tab (untranslated)',
+    readerModeTab: 'Reader',
+    translatedSiteTab: 'Translated Site',
+    bilingualToggle: 'Side by side',
+    novelDetectedBadge: 'Novel detected',
+    prevChapter: 'Previous chapter',
+    nextChapter: 'Next chapter',
+    chapterListBtn: 'Chapters',
+    loadingNextChapter: 'Loading next chapter...',
+    webToolsBtn: 'Web & Mobile tools',
+    webToolsTitle: 'Auto-Translate Tools (Desktop & Mobile)',
+    webToolsSubtitle: 'Auto-translate web pages and novel chapters on desktop and phone browsers without browser extensions.',
+    bookmarkletTitle: '1. One-Tap Bookmarklet (iOS Safari, Mobile Chrome & Desktop)',
+    bookmarkletHint: 'On desktop, drag the button below to your bookmarks bar. On mobile, copy the script and save it as a bookmark URL; open any novel page and tap this bookmark to translate immediately.',
+    copyBookmarklet: 'Copy bookmarklet script',
+    bookmarkletCopied: 'Bookmarklet script copied',
+    mobileShareTitle: '2. Share Directly from Phone Browser (PWA Share Target)',
+    mobileShareHint: 'Install tranX to your Home Screen. While reading a novel in mobile Chrome, tap Share and choose tranX to open the translated chapter automatically.',
+    urlPrefixTitle: '3. Instant URL Prefix (/r/)',
+    urlPrefixHint: 'Prepend this prefix before any webpage address in your browser bar:',
+    iosShortcutTitle: '4. iOS Shortcuts Template (iPhone / iPad Safari)',
+    iosShortcutHint: 'Create an Apple Shortcut with Open URLs using this template to launch auto-translation from the iOS Share Sheet:',
+    copyTemplate: 'Copy template',
+    noChaptersFound: 'Chapter list was not embedded on this page. Use Previous / Next chapter controls.',
+    openTocSite: 'Open translated table of contents',
+    closeLabel: 'Close',
   },
 };
 

@@ -232,16 +232,43 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.getByRole('button', { name: 'Kembali ke percakapan' })).toBeVisible();
     await page.getByRole('button', { name: 'Kembali ke percakapan' }).click();
 
-    // 10. Verify Mode Link switches directly to dedicated Link page + /web viewer
+    // 10. Verify Mode Link switches directly to dedicated Link page + Novel Reader + Bab berikutnya + Daftar bab + Situs Terjemahan + Alat Web & HP
     await page.getByRole('tab', { name: 'Link' }).click();
     await expect(page.locator('textarea.composer-textarea')).toHaveCount(0);
     await page.getByPlaceholder(/https:\/\//).fill('https://www.aozora.gr.jp/cards/1.html');
     await page.getByRole('button', { name: 'Terjemahkan halaman' }).click();
+    await expect(page.getByText(/Novel terdeteksi/)).toBeVisible();
     await expect(
       page.getByRole('button', { name: 'Buka halaman terjemahan penuh' })
     ).toBeVisible();
     await page.getByRole('button', { name: 'Buka halaman terjemahan penuh' }).click();
+    // Mode is currently auto-en from Step 7 -> heading renders in English first, then switch to auto-id inside /web
+    await expect(page.getByRole('heading', { name: 'Chapter 1: Rain at Rashomon' })).toBeVisible();
+    await page.getByLabel('Pasangan bahasa').selectOption('auto-id');
+    await expect(page.getByRole('heading', { name: 'Bab 1: Hujan di Rashomon' })).toBeVisible();
+    // Toggle Berdampingan (bilingual)
+    await page.getByRole('button', { name: 'Berdampingan' }).click();
+    await expect(page.getByText('千早は小さく笑った。')).toBeVisible();
+    // Click Bab berikutnya -> navigates directly to Chapter 2 without re-entering any URL
+    await page.getByRole('button', { name: /Bab berikutnya/ }).click();
+    await expect(page.getByRole('heading', { name: 'Bab 2: Lentera di Kyoto' })).toBeVisible();
+    // Open Daftar bab modal -> jump back to Bab 1
+    await page.getByRole('button', { name: /Daftar bab/ }).click();
+    await expect(page.getByRole('dialog')).toBeVisible();
+    await page.getByRole('dialog').getByRole('button', { name: /Bab 1: Hujan di Rashomon/ }).click();
+    await expect(page.getByRole('heading', { name: 'Bab 1: Hujan di Rashomon' })).toBeVisible();
+    // Switch to Situs Terjemahan (extension-less full translated website inside sandboxed iframe)
+    await page.getByRole('button', { name: 'Situs Terjemahan' }).click();
     await expect(page.locator('iframe[title="Pembaca Halaman Terjemahan"]')).toBeVisible();
+    // Open Alat Web & HP modal and verify zero javascript: <a href> in DOM
+    await page.getByRole('button', { name: 'Alat Web & HP' }).click();
+    await expect(
+      page
+        .getByRole('dialog')
+        .getByRole('heading', { name: 'Alat Terjemahan Otomatis (Desktop & HP)' })
+    ).toBeVisible();
+    await expect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
+    await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Kembali' }).click();
 
     // 11. Verify Lainnya -> Berkas saya & Daftar nama (14-field glossary)
@@ -317,20 +344,43 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       await route.fulfill({ status: 404, body: 'Not Found' });
     });
 
+    // CORS-enabled raw HTML proxy mock (tests real directEngine novel link detection, XSS stripping, and <a href> rewriting in Situs Terjemahan)
+    await page.route('https://api.allorigins.win/raw**', async (route) => {
+      const targetParam = new URL(route.request().url()).searchParams.get('url') || '';
+      const isCh2 = targetParam.includes('2.html');
+      const html = isCh2
+        ? `<!doctype html><html><head><title>Chapter 2: The Lanterns of Kyoto</title></head><body><h1>Chapter 2: The Lanterns of Kyoto</h1><p>Lantern light swayed quietly across the wet stone alley.</p><nav><a rel="prev" href="/cards/1.html">Previous Chapter</a></nav></body></html>`
+        : `<!doctype html><html><head><title>The Rainy Gate of Kyoto</title><script>window.__xss=91234;</script></head><body onload="window.__xss=91234"><h1>The Rainy Gate of Kyoto</h1><p>Chihaya stood quietly under the wooden gate while listening to the rain.</p><p>She opened her notebook and read the letter from Tokyo.</p><nav><a rel="next" href="/cards/2.html" onclick="window.__xss=91234">Next Chapter</a></nav></body></html>`;
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html; charset=utf-8',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: html,
+      });
+    });
+
     // CORS-enabled Jina Reader mock matching real r.jina.ai JSON schema (including pure-punctuation line)
     await page.route('https://r.jina.ai/**', async (route) => {
+      const isCh2 = route.request().url().includes('2.html');
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
         headers: { 'Access-Control-Allow-Origin': '*' },
         body: JSON.stringify({
           code: 200,
-          data: {
-            title: 'The Rainy Gate of Kyoto',
-            content:
-              'Chihaya stood quietly under the wooden gate while listening to the rain.\n\n「…………」\n\nShe opened her notebook and read the letter from Tokyo.',
-            url: 'https://www.aozora.gr.jp/cards/1.html',
-          },
+          data: isCh2
+            ? {
+                title: 'Chapter 2: The Lanterns of Kyoto',
+                content:
+                  'Lantern light swayed quietly across the wet stone alley.\n\n[Previous Chapter](https://www.aozora.gr.jp/cards/1.html)',
+                url: 'https://www.aozora.gr.jp/cards/2.html',
+              }
+            : {
+                title: 'The Rainy Gate of Kyoto',
+                content:
+                  'Chihaya stood quietly under the wooden gate while listening to the rain.\n\n「…………」\n\nShe opened her notebook and read the letter from Tokyo.\n\n[Next Chapter](https://www.aozora.gr.jp/cards/2.html)',
+                url: 'https://www.aozora.gr.jp/cards/1.html',
+              },
         }),
       });
     });
@@ -352,6 +402,14 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
           return line.replace(/Selamat pagi/gi, 'Good morning');
         }
         return line
+          .replace(/Chapter 2: The Lanterns of Kyoto/gi, 'Bab 2: Lentera di Kyoto')
+          .replace(
+            /Lantern light swayed quietly across the wet stone alley/gi,
+            'Cahaya lentera bergoyang tenang di sepanjang gang batu basah'
+          )
+          .replace(/Next Chapter/gi, 'Bab berikutnya')
+          .replace(/Previous Chapter/gi, 'Bab sebelumnya')
+          .replace(/おはようございます。?/g, 'Selamat pagi')
           .replace(/The Rainy Gate of Kyoto/gi, 'Gerbang Hujan di Kyoto')
           .replace(
             /stood quietly under the wooden gate while listening to the rain/gi,
@@ -377,18 +435,67 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto('/?e2e=1&direct=1');
 
-    // 1. Mode Link with bare URL (no https:// prefix) -> zero "Failed to fetch"
+    // 1. Mode Link with bare URL (no https:// prefix) -> zero "Failed to fetch", auto-detects Novel + Next Chapter
     await page.getByRole('tab', { name: 'Link' }).click();
     await page.getByPlaceholder(/https:\/\//).fill('www.aozora.gr.jp/cards/1.html');
     await page.getByRole('button', { name: 'Terjemahkan halaman' }).click();
 
     await expect(page.getByRole('main').getByText('Gerbang Hujan di Kyoto')).toBeVisible();
+    await expect(page.getByText(/Novel terdeteksi/)).toBeVisible();
     await expect(page.getByText(/Failed to fetch/i)).toHaveCount(0);
 
+    // Open full translated reader (/web Mode Baca) and jump to Bab berikutnya without re-entering any URL
     await page.getByRole('button', { name: 'Buka halaman terjemahan penuh' }).click();
+    await expect(page.getByRole('heading', { name: 'Gerbang Hujan di Kyoto' })).toBeVisible();
+
+    // Switch to Situs Terjemahan -> verify real HTML translated, <script> stripped, and <a href> rewritten to /web?url=...&view=site
+    await page.getByRole('button', { name: 'Situs Terjemahan' }).click();
     const readerFrame = page.frameLocator('iframe[title="Pembaca Halaman Terjemahan"]');
     await expect(readerFrame.locator('h1')).toContainText('Gerbang Hujan di Kyoto');
+    await expect(readerFrame.locator('script')).toHaveCount(0);
+    const rewrittenNextHref = await readerFrame.locator('a').first().getAttribute('href');
+    expect(rewrittenNextHref || '').toContain('/web?url=');
+    expect(rewrittenNextHref || '').toContain('view=site');
+    expect(
+      await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)
+    ).toBeUndefined();
+
+    // Click Bab berikutnya from Novel dock -> translates Chapter 2 automatically
+    await page.getByRole('button', { name: 'Mode Baca' }).click();
+    await page.getByRole('button', { name: /Bab berikutnya/ }).click();
+    await expect(page.getByRole('heading', { name: 'Bab 2: Lentera di Kyoto' })).toBeVisible();
     await page.getByRole('button', { name: 'Kembali' }).click();
+
+    // 1b. Extension-less URL shortcuts: /r/<url> and PWA /share?text=... auto-route straight into /web
+    await page.goto('/r/https://www.aozora.gr.jp/cards/1.html');
+    await expect(page).toHaveURL(/\/web\?url=/);
+    await expect(page.getByRole('heading', { name: 'Gerbang Hujan di Kyoto' })).toBeVisible();
+
+    await page.goto('/share?text=Baca%20novel%20https%3A%2F%2Fwww.aozora.gr.jp%2Fcards%2F1.html');
+    await expect(page).toHaveURL(/\/web\?url=/);
+    await expect(page.getByRole('heading', { name: 'Gerbang Hujan di Kyoto' })).toBeVisible();
+    await page.getByRole('button', { name: 'Kembali' }).click();
+
+    // 1c. Strict Target-Language Guarantee on Deteksi -> Indonesia (auto-id):
+    // Indonesian paragraphs stay verbatim Indonesian while English and Japanese in the SAME prompt become Indonesian!
+    await page.getByRole('button', { name: 'Baru' }).click();
+    await page.getByRole('tab', { name: 'Teks' }).click();
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Deteksi bahasa' }).click();
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Indonesia' }).click();
+    await page
+      .locator('textarea.composer-textarea')
+      .fill(
+        'Ini kalimat bahasa Indonesia yang tetap harus bahasa Indonesia.\n\nThe Rainy Gate of Kyoto\n\nおはようございます'
+      );
+    await page.locator('textarea.composer-textarea').press('Enter');
+    const mixedOut = page.locator('.assistant-prose').first();
+    await expect(mixedOut).toContainText(
+      'Ini kalimat bahasa Indonesia yang tetap harus bahasa Indonesia.'
+    );
+    await expect(mixedOut).toContainText('Gerbang Hujan di Kyoto');
+    await expect(mixedOut).toContainText('Selamat pagi');
 
     // 2. Standalone URL pasted directly inside Mode Teks -> auto-routed to Link reader cleanly
     await page.getByRole('button', { name: 'Baru' }).click();
@@ -614,12 +721,13 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.getByText(/Alamat jaringan internal atau privat ditolak/i)).toBeVisible();
     await expect(page.locator('a[href*="169.254.169.254"]')).toHaveCount(0);
 
-    // 3. Security: Valid /web viewer isolates iframe without allow-same-origin
-    await page.goto('/web?e2e=1&url=https%3A%2F%2Fwww.aozora.gr.jp%2Fcards%2F1.html');
+    // 3. Security: Valid /web Situs Terjemahan isolates iframe without allow-same-origin and has zero javascript: links
+    await page.goto('/web?e2e=1&url=https%3A%2F%2Fwww.aozora.gr.jp%2Fcards%2F1.html&view=site');
     const iframeSandbox = await page
       .locator('iframe[title="Pembaca Halaman Terjemahan"]')
       .getAttribute('sandbox');
     expect(iframeSandbox || '').not.toContain('allow-same-origin');
+    await expect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
     await page.getByRole('button', { name: 'Kembali' }).click();
 
     // 4. Security: Stored/DOM XSS canary in chat, Ganti nama, and Glossary surface stays inert text

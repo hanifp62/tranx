@@ -9,14 +9,15 @@ import type {
   TitleKind,
   TitleStyle,
   TurnMessage,
+  WebReaderBundle,
 } from '../types';
 import type { UiStrings } from '../i18n/strings';
 import {
   downloadExportedTurn,
-  fetchTranslatedWebHtml,
+  fetchWebReaderBundle,
   mergeTitleGlossaries,
 } from '../lib/api';
-import { toSafeHttpUrl } from '../lib/directEngine';
+import { parseModePair, toSafeHttpUrl } from '../lib/directEngine';
 import {
   DEFAULT_STYLE,
   removeGlossaryEntry,
@@ -30,9 +31,11 @@ import {
   IconBook,
   IconColumns,
   IconDownload,
+  IconGlobe,
   IconLink,
   IconPlus,
   IconTrash,
+  IconX,
 } from './Icons';
 
 /* /berkas: Berkas Saya */
@@ -645,40 +648,52 @@ export function GlossaryView({
   );
 }
 
-/* /web?url=...: Full-screen Translated Web Viewer with floating Liquid Glass bar */
+/* /web?url=...: Extension-less Auto-Translating Web Browser & Novel Reader */
 export function TranslatedWebViewer({
   user,
   url,
   initialMode,
+  initialView = 'reader',
   titleId,
   backPath = '/',
   strings,
   onNavigate,
+  onOpenWebTools,
 }: {
   user: AuthSessionUser;
   url: string;
   initialMode: ModePair;
+  initialView?: 'reader' | 'site' | 'original';
   titleId?: string;
   backPath?: string;
   strings: UiStrings;
   onNavigate: (path: string) => void;
+  onOpenWebTools?: () => void;
 }) {
   const [mode, setMode] = useState<ModePair>(initialMode);
-  const [view, setView] = useState<'translated' | 'original'>('translated');
-  const [htmlDoc, setHtmlDoc] = useState<string>('');
+  const [view, setView] = useState<'reader' | 'site' | 'original'>(initialView);
+  const [bilingual, setBilingual] = useState(false);
+  const [chaptersOpen, setChaptersOpen] = useState(false);
+  const [bundle, setBundle] = useState<WebReaderBundle | null>(null);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const safeExternalUrl = toSafeHttpUrl(url);
 
   useEffect(() => {
+    setView(initialView);
+  }, [initialView, url]);
+
+  useEffect(() => {
     let active = true;
     setLoading(true);
     setErrorMsg(null);
-    fetchTranslatedWebHtml({ user, url, mode, titleId, view })
-      .then((html) => {
+    setChaptersOpen(false);
+    fetchWebReaderBundle({ user, url, mode, titleId, view })
+      .then((res) => {
         if (active) {
-          setHtmlDoc(html);
+          setBundle(res);
           setLoading(false);
+          window.scrollTo({ top: 0, behavior: 'smooth' });
         }
       })
       .catch((err) => {
@@ -694,6 +709,42 @@ export function TranslatedWebViewer({
     };
   }, [user, url, mode, titleId, view]);
 
+  const effectiveTitleId = titleId || bundle?.titleId;
+  const nav = bundle?.novelNav;
+  const { tgt } = parseModePair(mode);
+  const isJpOut = view === 'original' ? bundle?.detectedSource === 'ja' : tgt === 'ja';
+
+  const openChapterUrl = (targetUrl: string, targetView: 'reader' | 'site' = view === 'site' ? 'site' : 'reader') => {
+    setChaptersOpen(false);
+    const qs = new URLSearchParams({
+      url: targetUrl,
+      mode,
+      view: targetView,
+      ...(effectiveTitleId ? { titleId: effectiveTitleId } : {}),
+    });
+    onNavigate(`/web?${qs.toString()}`);
+  };
+
+  useEffect(() => {
+    if (!nav?.isNovel) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      ) {
+        return;
+      }
+      if (e.key === 'ArrowRight' && nav.nextUrl && !loading) {
+        openChapterUrl(nav.nextUrl);
+      } else if (e.key === 'ArrowLeft' && nav.prevUrl && !loading) {
+        openChapterUrl(nav.prevUrl);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [nav, loading, mode, view, effectiveTitleId]);
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100dvh' }}>
       <header className="web-viewer-topbar">
@@ -705,26 +756,41 @@ export function TranslatedWebViewer({
           >
             {strings.backBtn}
           </button>
-          <div style={{ display: 'inline-flex', gap: '4px' }}>
+          <div style={{ display: 'inline-flex', gap: '4px', flexWrap: 'wrap' }}>
             <button
               type="button"
-              className={
-                view === 'translated' ? 'btn-primary pressable' : 'btn-secondary pressable'
-              }
-              onClick={() => setView('translated')}
+              className={view === 'reader' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+              onClick={() => setView('reader')}
             >
-              {strings.translatedViewTab}
+              {strings.readerModeTab}
             </button>
             <button
               type="button"
-              className={
-                view === 'original' ? 'btn-primary pressable' : 'btn-secondary pressable'
-              }
+              className={view === 'site' ? 'btn-primary pressable' : 'btn-secondary pressable'}
+              onClick={() => setView('site')}
+            >
+              <IconGlobe size={15} />
+              {strings.translatedSiteTab}
+            </button>
+            <button
+              type="button"
+              className={view === 'original' ? 'btn-primary pressable' : 'btn-secondary pressable'}
               onClick={() => setView('original')}
             >
               {strings.originalViewTab}
             </button>
           </div>
+          {view === 'reader' && (
+            <button
+              type="button"
+              className={bilingual ? 'btn-primary pressable' : 'btn-secondary pressable'}
+              aria-pressed={bilingual}
+              onClick={() => setBilingual((v) => !v)}
+            >
+              <IconColumns size={15} />
+              {strings.bilingualToggle}
+            </button>
+          )}
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
@@ -745,11 +811,20 @@ export function TranslatedWebViewer({
             <option value="en-id">{strings.langEn} {'\u2192'} {strings.langId}</option>
             <option value="en-ja">{strings.langEn} {'\u2192'} {strings.langJa}</option>
           </select>
-          {titleId && (
+          {onOpenWebTools && (
             <button
               type="button"
               className="btn-secondary pressable"
-              onClick={() => onNavigate(`/kamus/${titleId}`)}
+              onClick={onOpenWebTools}
+            >
+              {strings.webToolsBtn}
+            </button>
+          )}
+          {effectiveTitleId && (
+            <button
+              type="button"
+              className="btn-secondary pressable"
+              onClick={() => onNavigate(`/kamus/${effectiveTitleId}`)}
             >
               {strings.glossary}
             </button>
@@ -759,51 +834,200 @@ export function TranslatedWebViewer({
               href={safeExternalUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="btn-secondary pressable"
+              className="action-chip-btn"
+              title={strings.openOriginalUntranslated}
             >
-              <IconLink size={16} />
-              {strings.openOriginalSite}
+              <IconLink size={15} />
+              {strings.openOriginalUntranslated}
             </a>
           )}
         </div>
       </header>
 
-      {loading ? (
-        <div className="subpage-container">
-          <div className="result-card">{strings.loadingWebPage}</div>
-        </div>
-      ) : errorMsg ? (
-        <div className="subpage-container">
-          <div className="result-card">
-            <span className="status-badge error">{strings.cannotTranslateWeb}</span>
-            <div>{errorMsg}</div>
-            {safeExternalUrl && (
-              <div>
-                <a
-                  href={safeExternalUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="btn-primary pressable"
-                >
-                  {strings.openOriginalSite}
-                </a>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        {loading ? (
+          <div className="subpage-container">
+            <div className="result-card">{strings.loadingWebPage}</div>
+          </div>
+        ) : errorMsg ? (
+          <div className="subpage-container">
+            <div className="result-card">
+              <span className="status-badge error">{strings.cannotTranslateWeb}</span>
+              <div>{errorMsg}</div>
+              {safeExternalUrl && (
+                <div>
+                  <a
+                    href={safeExternalUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="btn-primary pressable"
+                  >
+                    {strings.openOriginalUntranslated}
+                  </a>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : view === 'site' && bundle?.siteHtml ? (
+          <iframe
+            title="Pembaca Halaman Terjemahan"
+            sandbox="allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
+            srcDoc={bundle.siteHtml}
+            style={{
+              flex: 1,
+              width: '100%',
+              minHeight: 'calc(100dvh - 124px)',
+              border: 'none',
+              background: 'var(--bg)',
+            }}
+          />
+        ) : bundle ? (
+          <article className="novel-reader-wrap">
+            <div className="novel-reader-header">
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  flexWrap: 'wrap',
+                  fontSize: '12px',
+                  color: 'var(--text-subtle)',
+                }}
+              >
+                <span>{bundle.host}</span>
+                {nav?.isNovel && (
+                  <span className="status-badge done">
+                    {strings.novelDetectedBadge}
+                    {nav.chapterLabel ? ` · ${nav.chapterLabel}` : ''}
+                  </span>
+                )}
+                {nav?.seriesTitle && <span>{nav.seriesTitle}</span>}
               </div>
-            )}
+              <h1 className="novel-reader-title">
+                {view === 'original' ? bundle.titleSrc : bundle.titleDst}
+              </h1>
+            </div>
+
+            <div
+              className={`novel-reader-body assistant-prose ${isJpOut ? 'is-jp' : ''}`}
+              lang={view === 'original' ? bundle.detectedSource : tgt}
+            >
+              {bundle.sentences.map((pair) =>
+                bilingual && view === 'reader' ? (
+                  <div key={pair.i} className="bilingual-pair-card">
+                    <div
+                      className="bilingual-pair-src"
+                      style={{
+                        fontFamily:
+                          bundle.detectedSource === 'ja' ? 'var(--font-jp)' : 'var(--font-ui)',
+                      }}
+                    >
+                      {pair.src}
+                    </div>
+                    <p className="novel-reader-para">{pair.dst}</p>
+                  </div>
+                ) : (
+                  <p key={pair.i} className="novel-reader-para">
+                    {view === 'original' ? pair.src : pair.dst}
+                  </p>
+                )
+              )}
+            </div>
+          </article>
+        ) : null}
+      </div>
+
+      {!loading && !errorMsg && nav && (nav.prevUrl || nav.nextUrl || nav.chapters?.length || nav.tocUrl) && (
+        <nav className="novel-chapter-dock" aria-label={strings.chapterListBtn}>
+          <div className="novel-chapter-dock-inner">
+            <button
+              type="button"
+              className="btn-secondary pressable"
+              disabled={!nav.prevUrl}
+              onClick={() => nav.prevUrl && openChapterUrl(nav.prevUrl)}
+            >
+              {'\u2190'} {strings.prevChapter}
+            </button>
+
+            <button
+              type="button"
+              className="btn-secondary pressable"
+              onClick={() => setChaptersOpen(true)}
+            >
+              <IconBook size={16} />
+              {strings.chapterListBtn}
+              {nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}
+            </button>
+
+            <button
+              type="button"
+              className="btn-primary pressable"
+              disabled={!nav.nextUrl}
+              onClick={() => nav.nextUrl && openChapterUrl(nav.nextUrl)}
+            >
+              {strings.nextChapter} {'\u2192'}
+            </button>
+          </div>
+        </nav>
+      )}
+
+      {chaptersOpen && nav && (
+        <div className="scrim-backdrop" onClick={() => setChaptersOpen(false)}>
+          <div
+            className="modal-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="chapter-list-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <h2 id="chapter-list-title" className="modal-title">
+                {nav.seriesTitle || strings.chapterListBtn}
+              </h2>
+              <button
+                type="button"
+                className="icon-square-btn"
+                aria-label={strings.closeLabel}
+                onClick={() => setChaptersOpen(false)}
+              >
+                <IconX size={18} />
+              </button>
+            </div>
+            <div className="modal-body">
+              {nav.tocUrl && (
+                <div>
+                  <button
+                    type="button"
+                    className="btn-secondary pressable"
+                    onClick={() => openChapterUrl(nav.tocUrl!, 'site')}
+                  >
+                    <IconGlobe size={16} />
+                    {strings.openTocSite}
+                  </button>
+                </div>
+              )}
+              {nav.chapters && nav.chapters.length > 0 ? (
+                <div className="chapter-list-grid">
+                  {nav.chapters.map((ch, idx) => (
+                    <button
+                      key={`${ch.url}_${idx}`}
+                      type="button"
+                      className={`chapter-list-item pressable ${ch.current ? 'is-current' : ''}`}
+                      onClick={() => openChapterUrl(ch.url)}
+                    >
+                      <span>{ch.title}</span>
+                      {ch.current && <span className="status-badge done">Aktif</span>}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
+                  {strings.noChaptersFound}
+                </div>
+              )}
+            </div>
           </div>
         </div>
-      ) : (
-        <iframe
-          title="Pembaca Halaman Terjemahan"
-          sandbox="allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
-          srcDoc={htmlDoc}
-          style={{
-            flex: 1,
-            width: '100%',
-            minHeight: 'calc(100dvh - 64px)',
-            border: 'none',
-            background: 'var(--bg)',
-          }}
-        />
       )}
     </div>
   );

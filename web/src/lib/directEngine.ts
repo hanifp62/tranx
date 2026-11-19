@@ -4,10 +4,13 @@ import type {
   LinkPreviewPayload,
   ModePair,
   NameChipItem,
+  NovelChapterLink,
+  NovelNavigation,
   SentencePair,
   SourceLang,
   TargetLang,
   VisionBlock,
+  WebReaderBundle,
 } from '../types';
 import {
   getOwnerGeminiKey,
@@ -18,22 +21,107 @@ import {
 } from './firebase';
 
 const CJK_RE = /[\u3040-\u309f\u30a0-\u30ff\u3400-\u9fff]/;
+const CJK_SPAN_RE = /[\u3000-\u30ff\u3400-\u9fff\uff01-\uff60]+/g;
 const WORD_RE = /[A-Za-zÀ-ÿ']+/g;
 
 const ID_WORDS = new Set([
-  'yang', 'dan', 'di', 'ke', 'dari', 'ini', 'itu', 'untuk', 'dengan', 'tidak',
-  'bisa', 'ada', 'saya', 'aku', 'kamu', 'kami', 'mereka', 'dalam', 'pada',
-  'adalah', 'sudah', 'akan', 'atau', 'karena', 'seperti', 'juga', 'oleh',
-  'tentang', 'lebih', 'sangat', 'hanya', 'telah', 'dapat', 'selamat', 'pagi',
-  'malam', 'siang', 'terima', 'kasih', 'bagaimana', 'mengapa', 'kapan', 'dimana',
+  'yang', 'dan', 'di', 'ke', 'dari', 'ini', 'itu', 'untuk', 'dengan', 'tidak', 'tak',
+  'bisa', 'dapat', 'ada', 'saya', 'aku', 'kamu', 'kau', 'dia', 'ia', 'kami', 'kita',
+  'mereka', 'dalam', 'pada', 'adalah', 'ialah', 'sudah', 'telah', 'akan', 'sedang',
+  'atau', 'karena', 'sebab', 'seperti', 'juga', 'oleh', 'tentang', 'lebih', 'sangat',
+  'hanya', 'saja', 'cuma', 'selamat', 'pagi', 'malam', 'siang', 'sore', 'terima',
+  'kasih', 'bagaimana', 'mengapa', 'kenapa', 'kapan', 'dimana', 'apa', 'siapa', 'berapa',
+  'tetap', 'bukan', 'belum', 'masih', 'lagi', 'baru', 'lama', 'semua', 'seluruh',
+  'setiap', 'ketika', 'saat', 'waktu', 'hari', 'orang', 'rumah', 'jalan', 'cerita',
+  'bab', 'halaman', 'buku', 'baca', 'membaca', 'tulis', 'menulis', 'pergi', 'datang',
+  'lihat', 'melihat', 'kata', 'berkata', 'bilang', 'sambil', 'lalu', 'kemudian',
+  'setelah', 'sebelum', 'sampai', 'hingga', 'sejak', 'selama', 'tanpa', 'antara',
+  'tetapi', 'tapi', 'namun', 'jika', 'kalau', 'bila', 'agar', 'supaya', 'buat',
+  'mau', 'ingin', 'harus', 'boleh', 'perlu', 'pernah', 'pun', 'jadi', 'menjadi',
+  'sesuai', 'berubah', 'kakek', 'nenek', 'anak', 'ibu', 'ayah', 'teman', 'besar',
+  'kecil', 'baik', 'buruk', 'cantik', 'indah', 'tenang', 'pelan', 'cepat', 'halo',
+  'tolong', 'maaf', 'ya', 'iya', 'tidaklah', 'disini', 'disana', 'sini', 'sana',
 ]);
 
 const EN_WORDS = new Set([
-  'the', 'and', 'to', 'of', 'in', 'is', 'it', 'you', 'that', 'for', 'with',
-  'on', 'are', 'this', 'have', 'from', 'not', 'but', 'what', 'all', 'were',
-  'when', 'we', 'your', 'can', 'their', 'would', 'there', 'been', 'has',
-  'more', 'who', 'will', 'about', 'into', 'than', 'hello', 'good', 'morning',
+  'the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i', 'it', 'for', 'not',
+  'on', 'with', 'he', 'as', 'you', 'do', 'at', 'this', 'but', 'his', 'by', 'from',
+  'they', 'we', 'say', 'her', 'she', 'or', 'an', 'will', 'my', 'one', 'all', 'would',
+  'there', 'their', 'what', 'so', 'up', 'out', 'if', 'about', 'who', 'get', 'which',
+  'go', 'me', 'when', 'make', 'can', 'like', 'time', 'no', 'just', 'him', 'know',
+  'take', 'into', 'year', 'your', 'good', 'some', 'could', 'them', 'see', 'other',
+  'than', 'then', 'now', 'look', 'only', 'come', 'its', 'over', 'think', 'also',
+  'back', 'after', 'use', 'two', 'how', 'our', 'work', 'first', 'well', 'way', 'even',
+  'new', 'want', 'because', 'any', 'these', 'give', 'day', 'most', 'us', 'is', 'are',
+  'was', 'were', 'been', 'has', 'had', 'does', 'did', 'more', 'very', 'much', 'still',
+  'hello', 'morning', 'evening', 'night', 'please', 'thank', 'thanks', 'chapter',
+  'episode', 'next', 'previous', 'story', 'page', 'read', 'reading', 'book', 'novel',
+  'while', 'under', 'opened', 'stood', 'quietly', 'listening', 'rain', 'letter',
 ]);
+
+export type ParagraphLangClass =
+  | 'ja'
+  | 'id'
+  | 'en'
+  | 'mixed-ja'
+  | 'mixed-latin'
+  | 'unknown';
+
+function scoreLatinWords(sample: string): { idScore: number; enScore: number; wordCount: number } {
+  const words = (sample.slice(0, 4000).match(WORD_RE) || []).map((w) => w.toLowerCase());
+  let idScore = 0;
+  let enScore = 0;
+  for (const w of words) {
+    if (ID_WORDS.has(w)) idScore += 1.2;
+    if (EN_WORDS.has(w)) enScore += 1.2;
+    if (
+      w.length >= 5 &&
+      (w.endsWith('nya') ||
+        w.endsWith('kan') ||
+        w.endsWith('lah') ||
+        w.endsWith('kah') ||
+        w.startsWith('meny') ||
+        w.startsWith('meng') ||
+        w.startsWith('memb') ||
+        w.startsWith('mend') ||
+        w.startsWith('ber') ||
+        w.startsWith('ter'))
+    ) {
+      idScore += 0.7;
+    }
+    if (
+      (w.length >= 5 && (w.endsWith('tion') || w.endsWith('ment') || w.endsWith('ing') || w.endsWith('ness'))) ||
+      /^(don't|can't|won't|isn't|aren't|it's|i'm|you're|we're|they're|didn't|wasn't|couldn't|wouldn't)$/.test(w)
+    ) {
+      enScore += 0.7;
+    }
+  }
+  return { idScore, enScore, wordCount: words.length };
+}
+
+export function classifyParagraphLanguage(text: string): ParagraphLangClass {
+  const sample = (text || '').trim();
+  if (!sample) return 'unknown';
+
+  const hasCjk = CJK_RE.test(sample);
+  const { idScore, enScore, wordCount } = scoreLatinWords(sample);
+
+  if (hasCjk) {
+    // Only treat as mixed-ja if there are real multi-char Latin words alongside CJK
+    const latinWords = (sample.match(/[A-Za-zÀ-ÿ]{2,}/g) || []).length;
+    return latinWords >= 2 ? 'mixed-ja' : 'ja';
+  }
+  if (wordCount === 0) return 'unknown';
+
+  if (idScore > 0 && enScore === 0) return 'id';
+  if (enScore > 0 && idScore === 0) return 'en';
+  if (idScore > 0 && enScore > 0) {
+    if (idScore >= enScore * 1.8) return 'id';
+    if (enScore >= idScore * 1.8) return 'en';
+    return 'mixed-latin';
+  }
+  return 'unknown';
+}
 
 export function parseModePair(mode: ModePair): { src: SourceLang; tgt: TargetLang } {
   const [rawSrc, rawTgt] = mode.split('-') as [SourceLang, TargetLang];
@@ -89,28 +177,11 @@ export function detectLanguageLocal(text: string, fallback: TargetLang = 'ja'): 
   if (!sample) return fallback;
   if (CJK_RE.test(sample)) return 'ja';
 
-  const words = (sample.slice(0, 4000).match(WORD_RE) || []).map((w) => w.toLowerCase());
-  if (words.length === 0) return fallback;
-
-  let idScore = 0;
-  let enScore = 0;
-  for (const w of words) {
-    if (ID_WORDS.has(w)) idScore += 1;
-    if (EN_WORDS.has(w)) enScore += 1;
-    if (
-      w.length >= 5 &&
-      (w.endsWith('nya') ||
-        w.endsWith('kan') ||
-        w.startsWith('meny') ||
-        w.startsWith('meng') ||
-        w.startsWith('ber'))
-    ) {
-      idScore += 0.6;
-    }
-  }
+  const { idScore, enScore, wordCount } = scoreLatinWords(sample);
+  if (wordCount === 0) return fallback;
   if (idScore > enScore) return 'id';
   if (enScore > idScore) return 'en';
-  return fallback === 'id' ? 'en' : 'id';
+  return fallback;
 }
 
 export function isSingleStandaloneUrl(raw: string): boolean {
@@ -468,7 +539,7 @@ async function translateBatchViaGoogleGtx(
 
 async function translateViaGeminiDirect(
   paragraphs: string[],
-  src: TargetLang,
+  src: SourceLang,
   tgt: TargetLang,
   geminiKey: string,
   signal?: AbortSignal
@@ -478,9 +549,12 @@ async function translateViaGeminiDirect(
     id: 'Indonesian',
     en: 'English',
   };
+  const srcLabel = src === 'auto' ? 'any detected source language' : langNames[src];
   const items = paragraphs.map((text, idx) => ({ id: idx + 1, text }));
   const sysPrompt =
-    `You translate from ${langNames[src]} to ${langNames[tgt]} naturally, accurately, and faithfully without summarizing. ` +
+    `You translate from ${srcLabel} into natural, accurate ${langNames[tgt]} without summarizing. ` +
+    `Ensure 100% of every output item is written in ${langNames[tgt]}. ` +
+    `Keep any text that is already in ${langNames[tgt]} intact in ${langNames[tgt]} and NEVER translate it into another language. ` +
     `Keep placeholders like [[E1]] verbatim. Preserve line breaks. ` +
     `Return strict JSON: {"translations":[{"id":1,"text":"..."}]}`;
 
@@ -521,6 +595,52 @@ async function translateViaGeminiDirect(
   return paragraphs.map((orig, idx) => map.get(idx + 1) || orig);
 }
 
+async function translateMixedCjkLineToTarget(
+  line: string,
+  tgt: TargetLang,
+  signal?: AbortSignal
+): Promise<string> {
+  if (tgt === 'ja') {
+    const { idScore, enScore } = scoreLatinWords(line);
+    const latinSrc: SourceLang = idScore > enScore ? 'id' : enScore > idScore ? 'en' : 'auto';
+    const r = await requestGtxSingleChunk(line, latinSrc, 'ja', signal).catch(() => ({
+      translated: line,
+    }));
+    return r.translated || line;
+  }
+
+  // Replace every Japanese/CJK span inside the line with its target translation first
+  const spans: string[] = [];
+  const tokenLine = line.replace(CJK_SPAN_RE, (match) => {
+    if (!hasTranslatableLetters(match)) return match;
+    const idx = spans.length;
+    spans.push(match);
+    return `[[C${idx}]]`;
+  });
+
+  let merged = tokenLine;
+  if (spans.length > 0) {
+    const { outputs } = await translateBatchViaGoogleGtx(spans, 'ja', tgt, signal);
+    outputs.forEach((tr, idx) => {
+      merged = merged.split(`[[C${idx}]]`).join(tr || spans[idx]);
+    });
+  }
+
+  // If the remaining Latin part is in a non-target language (e.g. English when tgt=id), translate it too
+  const restClass = classifyParagraphLanguage(merged);
+  if (
+    (tgt === 'id' && (restClass === 'en' || restClass === 'mixed-latin')) ||
+    (tgt === 'en' && (restClass === 'id' || restClass === 'mixed-latin'))
+  ) {
+    const secondSrc: SourceLang = restClass === 'en' ? 'en' : restClass === 'id' ? 'id' : 'auto';
+    const r2 = await requestGtxSingleChunk(merged, secondSrc, tgt, signal).catch(() => ({
+      translated: merged,
+    }));
+    return r2.translated || merged;
+  }
+  return merged;
+}
+
 export async function translateParagraphsDirect(params: {
   paragraphs: string[];
   mode: ModePair;
@@ -533,25 +653,13 @@ export async function translateParagraphsDirect(params: {
   matchedChips: NameChipItem[];
 }> {
   const { src, tgt } = parseModePair(params.mode);
-  const combinedSample = params.paragraphs.slice(0, 5).join('\n');
+  const combinedSample = params.paragraphs.slice(0, 8).join('\n');
   let detectedSource: TargetLang =
     src === 'auto'
       ? detectLanguageLocal(combinedSample, tgt === 'ja' ? 'id' : 'ja')
       : src;
 
-  if (detectedSource === tgt && src !== 'auto') {
-    return {
-      outputs: [...params.paragraphs],
-      detectedSource,
-      model: 'direct',
-      matchedChips: [],
-    };
-  }
-
   const glossary = await loadGlossaryEntriesOnce(params.titleId);
-  const pairs = buildGlossaryPairs(glossary, detectedSource, tgt);
-  const maskedList = params.paragraphs.map((p) => maskWithGlossary(p, pairs));
-
   const matchedChips: NameChipItem[] = [];
   for (const entry of glossary) {
     if (
@@ -563,7 +671,12 @@ export async function translateParagraphsDirect(params: {
         surface: entry.surface,
         reading: entry.reading,
         romaji: entry.romaji,
-        dst: tgt === 'ja' ? entry.surface : tgt === 'en' ? entry.render_en || entry.romaji : entry.render_id || entry.romaji,
+        dst:
+          tgt === 'ja'
+            ? entry.surface
+            : tgt === 'en'
+              ? entry.render_en || entry.romaji
+              : entry.render_id || entry.romaji,
         kind: entry.kind,
         confirmed: true,
         source: entry.source,
@@ -571,18 +684,74 @@ export async function translateParagraphsDirect(params: {
     }
   }
 
+  const outputs = new Array<string>(params.paragraphs.length);
+  const toTranslateIdx: number[] = [];
+  const paraClasses: ParagraphLangClass[] = params.paragraphs.map((p) =>
+    classifyParagraphLanguage(p)
+  );
+
+  // Strict target-language guarantee: paragraphs already purely in target language stay intact verbatim
+  params.paragraphs.forEach((rawPara, idx) => {
+    const trimmed = rawPara.trim();
+    const cls = paraClasses[idx];
+    if (!trimmed || !hasTranslatableLetters(trimmed)) {
+      outputs[idx] = rawPara;
+      return;
+    }
+    if (
+      (tgt === 'id' && cls === 'id') ||
+      (tgt === 'en' && cls === 'en') ||
+      (tgt === 'ja' && cls === 'ja')
+    ) {
+      outputs[idx] = rawPara;
+      return;
+    }
+    toTranslateIdx.push(idx);
+  });
+
+  if (toTranslateIdx.length === 0) {
+    return {
+      outputs,
+      detectedSource: tgt,
+      model: 'identity',
+      matchedChips,
+    };
+  }
+
+  const allGlossaryPairs = [
+    ...buildGlossaryPairs(glossary, 'ja', tgt),
+    ...buildGlossaryPairs(glossary, 'id', tgt),
+    ...buildGlossaryPairs(glossary, 'en', tgt),
+  ];
+  const dedupPairMap = new Map<string, string>();
+  for (const [k, v] of allGlossaryPairs) {
+    if (!dedupPairMap.has(k)) dedupPairMap.set(k, v);
+  }
+  const combinedGlossaryPairs = Array.from(dedupPairMap.entries()).sort(
+    (a, b) => b[0].length - a[0].length
+  );
+
+  const maskedEntries = toTranslateIdx.map((origIdx) => ({
+    origIdx,
+    cls: paraClasses[origIdx],
+    ...maskWithGlossary(params.paragraphs[origIdx], combinedGlossaryPairs),
+  }));
+
   const geminiKey = await getOwnerGeminiKey();
-  if (geminiKey && detectedSource !== tgt) {
+  if (geminiKey) {
     try {
       const rawOut = await translateViaGeminiDirect(
-        maskedList.map((m) => m.masked),
-        detectedSource,
+        maskedEntries.map((m) => m.masked),
+        src,
         tgt,
         geminiKey,
         params.signal
       );
+      maskedEntries.forEach((m, k) => {
+        outputs[m.origIdx] = unmaskWithGlossary(rawOut[k] || m.masked, m.map);
+      });
       return {
-        outputs: rawOut.map((r, i) => unmaskWithGlossary(r, maskedList[i].map)),
+        outputs,
         detectedSource,
         model: 'gemini-2.5-flash-lite',
         matchedChips,
@@ -592,16 +761,56 @@ export async function translateParagraphsDirect(params: {
     }
   }
 
-  const batchedRes = await translateBatchViaGoogleGtx(
-    maskedList.map((m) => m.masked),
-    src,
-    tgt,
-    params.signal
-  );
-  detectedSource = batchedRes.detected;
-  const outputs = batchedRes.outputs.map((raw, i) =>
-    unmaskWithGlossary(raw, maskedList[i].map)
-  );
+  // Group non-target paragraphs by exact source language so mixed-language docs never confuse Google GTX
+  const buckets: Record<SourceLang, typeof maskedEntries> = {
+    ja: [],
+    en: [],
+    id: [],
+    auto: [],
+  };
+  const mixedJaItems: typeof maskedEntries = [];
+
+  for (const item of maskedEntries) {
+    if (item.cls === 'mixed-ja') {
+      mixedJaItems.push(item);
+    } else if (item.cls === 'ja' && tgt !== 'ja') {
+      buckets.ja.push(item);
+    } else if (item.cls === 'en' && tgt !== 'en') {
+      buckets.en.push(item);
+    } else if (item.cls === 'id' && tgt !== 'id') {
+      buckets.id.push(item);
+    } else if (src !== 'auto' && src !== tgt) {
+      buckets[src].push(item);
+    } else {
+      buckets.auto.push(item);
+    }
+  }
+
+  for (const [bucketSrc, items] of Object.entries(buckets) as Array<
+    [SourceLang, typeof maskedEntries]
+  >) {
+    if (items.length === 0) continue;
+    const batchedRes = await translateBatchViaGoogleGtx(
+      items.map((m) => m.masked),
+      bucketSrc,
+      tgt,
+      params.signal
+    );
+    if (bucketSrc !== 'auto') {
+      detectedSource = bucketSrc;
+    } else {
+      detectedSource = batchedRes.detected;
+    }
+    items.forEach((item, k) => {
+      outputs[item.origIdx] = unmaskWithGlossary(batchedRes.outputs[k] || item.masked, item.map);
+    });
+  }
+
+  for (const item of mixedJaItems) {
+    const tr = await translateMixedCjkLineToTarget(item.masked, tgt, params.signal);
+    outputs[item.origIdx] = unmaskWithGlossary(tr, item.map);
+    if (tgt !== 'ja') detectedSource = 'ja';
+  }
 
   return {
     outputs,
@@ -614,13 +823,469 @@ export async function translateParagraphsDirect(params: {
 interface CachedWebEntry {
   url: string;
   host: string;
+  titleId: string;
   titleSrc: string;
   srcParas: string[];
   detectedSource: TargetLang;
+  novelNav: NovelNavigation;
+  rawHtml?: string;
+  rawMarkdown?: string;
 }
 
 const webArticleCache = new Map<string, CachedWebEntry>();
 const translatedWebCache = new Map<string, { heading: string; paras: string[] }>();
+const translatedSiteHtmlCache = new Map<string, string>();
+
+const NOVEL_HOST_RE =
+  /(kakuyomu\.jp|syosetu\.com|syosetu\.org|alphapolis\.co\.jp|aozora\.gr\.jp|royalroad\.com|scribblehub\.com|webnovel\.com|wuxiaworld\.|novelbin\.|novelfull\.|wattpad\.com|lightnovel|webnovel)/i;
+
+const NEXT_LINK_RE =
+  /(次のエピソード|次の話|次のページ|次へ|次話|次の章|next\s*(chapter|episode|ep|page|part)?|bab\s*(berikutnya|selanjutnya)|halaman\s*(berikutnya|selanjutnya)|selanjutnya|berikutnya|lanjutan|^next$|^»$|^→$)/i;
+const PREV_LINK_RE =
+  /(前のエピソード|前の話|前のページ|前へ|前話|前の章|prev(ious)?\s*(chapter|episode|ep|page|part)?|bab\s*sebelumnya|halaman\s*sebelumnya|sebelumnya|^prev$|^«$|^←$)/i;
+const TOC_LINK_RE =
+  /(目次|エピソード一覧|作品トップ|table\s*of\s*contents|chapter\s*list|all\s*chapters|daftar\s*(isi|bab)|^toc$)/i;
+
+export function deriveSeriesTitleId(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname;
+    const kakuyomu = path.match(/^\/works\/(\d+)/);
+    if (host.includes('kakuyomu.jp') && kakuyomu) {
+      return `t_novel_kakuyomu_${kakuyomu[1]}`;
+    }
+    const syosetu = path.match(/^\/(n[a-z0-9]+)/i);
+    if (host.includes('syosetu.com') && syosetu) {
+      return `t_novel_syosetu_${syosetu[1].toLowerCase()}`;
+    }
+    const hameln = path.match(/^\/novel\/(\d+)/);
+    if (host.includes('syosetu.org') && hameln) {
+      return `t_novel_hameln_${hameln[1]}`;
+    }
+    const alpha = path.match(/^\/novel\/(\d+\/\d+)/);
+    if (host.includes('alphapolis.co.jp') && alpha) {
+      return `t_novel_alpha_${alpha[1].replace(/\//g, '_')}`;
+    }
+    const aozora = path.match(/^\/cards\/(\d+)/);
+    if (host.includes('aozora.gr.jp') && aozora) {
+      return `t_novel_aozora_${aozora[1]}`;
+    }
+    const royal = path.match(/^\/fiction\/(\d+)/);
+    if (host.includes('royalroad.com') && royal) {
+      return `t_novel_rr_${royal[1]}`;
+    }
+    return `t_web_${host.replace(/[^a-z0-9]/gi, '_').slice(0, 24)}`;
+  } catch {
+    return 't_web_page';
+  }
+}
+
+function isKnownNovelUrl(rawUrl: string): boolean {
+  try {
+    const u = new URL(rawUrl);
+    if (NOVEL_HOST_RE.test(u.hostname)) return true;
+    return /\/(works\/\d+\/episodes\/\d+|episode[s]?\/\d+|chapter[-_/]?\d+|bab[-_/]?\d+|ch[-_/]?\d+|n[0-9a-z]{4,}\/\d+)/i.test(
+      u.pathname
+    );
+  } catch {
+    return false;
+  }
+}
+
+function resolveSafeSiblingUrl(href: string, baseUrl: string): string | null {
+  const cleanHref = (href || '').trim();
+  if (!cleanHref || cleanHref.startsWith('#')) return null;
+  try {
+    const abs = new URL(cleanHref, baseUrl).toString();
+    return toSafeHttpUrl(abs);
+  } catch {
+    return null;
+  }
+}
+
+function canonicalUrlKey(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    return `${u.origin}${u.pathname.replace(/\/+$/, '')}${u.search}`;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function extractKakuyomuFromNextData(
+  rawHtml: string,
+  workId: string,
+  currentEpId: string
+): NovelNavigation | null {
+  const match = rawHtml.match(
+    /<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i
+  );
+  if (!match) return null;
+  try {
+    const data = JSON.parse(match[1]);
+    const apollo = data?.props?.pageProps?.__APOLLO_STATE__;
+    if (!apollo || typeof apollo !== 'object') return null;
+
+    const workObj = apollo[`Work:${workId}`] as { title?: string } | undefined;
+    const seriesTitle = typeof workObj?.title === 'string' ? workObj.title.trim() : undefined;
+    const orderedIds: string[] = [];
+    const seen = new Set<string>();
+
+    const pushEpRef = (ref: unknown) => {
+      if (typeof ref === 'string' && ref.startsWith('Episode:')) {
+        const epId = ref.slice('Episode:'.length);
+        if (epId && !seen.has(epId)) {
+          seen.add(epId);
+          orderedIds.push(epId);
+        }
+      }
+    };
+
+    for (const [key, val] of Object.entries(apollo)) {
+      if (!val || typeof val !== 'object') continue;
+      if (key.startsWith('TableOfContentsChapter:')) {
+        const unions = (val as { episodeUnions?: Array<{ __ref?: string }> }).episodeUnions;
+        if (Array.isArray(unions)) {
+          for (const item of unions) pushEpRef(item?.__ref);
+        }
+      }
+    }
+
+    if (orderedIds.length === 0) {
+      for (const key of Object.keys(apollo)) {
+        if (key.startsWith('Episode:')) pushEpRef(key);
+      }
+    }
+
+    const chapters: NovelChapterLink[] = orderedIds.map((epId, idx) => {
+      const epObj = apollo[`Episode:${epId}`] as { title?: string } | undefined;
+      return {
+        title: (epObj?.title || `Episode ${idx + 1}`).trim(),
+        url: `https://kakuyomu.jp/works/${workId}/episodes/${epId}`,
+        current: epId === currentEpId,
+      };
+    });
+
+    const curIdx = chapters.findIndex((c) => c.current);
+    return {
+      isNovel: true,
+      seriesTitle,
+      chapterLabel: curIdx >= 0 ? `${curIdx + 1} / ${chapters.length}` : undefined,
+      prevUrl: curIdx > 0 ? chapters[curIdx - 1].url : null,
+      nextUrl: curIdx >= 0 && curIdx + 1 < chapters.length ? chapters[curIdx + 1].url : null,
+      tocUrl: `https://kakuyomu.jp/works/${workId}`,
+      chapters: chapters.slice(0, 200),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function deriveNumericChapterFallback(cleanUrl: string): Partial<NovelNavigation> {
+  try {
+    const u = new URL(cleanUrl);
+    const host = u.hostname.toLowerCase();
+
+    // Syosetu / Narou: https://ncode.syosetu.com/<ncode>/<num>/
+    const syosetu = u.pathname.match(/^\/(n[a-z0-9]+)\/(\d+)\/?$/i);
+    if (host.includes('syosetu.com') && syosetu) {
+      const ncode = syosetu[1];
+      const num = Number(syosetu[2]);
+      return {
+        isNovel: true,
+        chapterLabel: `Bab ${num}`,
+        prevUrl: num > 1 ? `${u.origin}/${ncode}/${num - 1}/` : null,
+        nextUrl: `${u.origin}/${ncode}/${num + 1}/`,
+        tocUrl: `${u.origin}/${ncode}/`,
+      };
+    }
+
+    // Hameln: https://syosetu.org/novel/<id>/<num>.html
+    const hameln = u.pathname.match(/^\/novel\/(\d+)\/(\d+)\.html$/i);
+    if (host.includes('syosetu.org') && hameln) {
+      const id = hameln[1];
+      const num = Number(hameln[2]);
+      return {
+        isNovel: true,
+        chapterLabel: `Bab ${num}`,
+        prevUrl: num > 1 ? `${u.origin}/novel/${id}/${num - 1}.html` : null,
+        nextUrl: `${u.origin}/novel/${id}/${num + 1}.html`,
+        tocUrl: `${u.origin}/novel/${id}/`,
+      };
+    }
+
+    // Generic explicit chapter slug: /chapter-12, /bab-5, /episode-3
+    const genericSlug = u.pathname.match(/^(.*\/(?:chapter|bab|episode|ep|ch)[-_/]?)(\d+)(\/?|\.html?)$/i);
+    if (genericSlug) {
+      const num = Number(genericSlug[2]);
+      if (num >= 1 && num < 50000) {
+        return {
+          isNovel: true,
+          chapterLabel: `Bab ${num}`,
+          prevUrl: num > 1 ? `${u.origin}${genericSlug[1]}${num - 1}${genericSlug[3]}` : null,
+          nextUrl: `${u.origin}${genericSlug[1]}${num + 1}${genericSlug[3]}`,
+        };
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+}
+
+function buildChaptersFromSiblingLinks(
+  links: Array<{ title: string; url: string }>,
+  cleanUrl: string
+): {
+  chapters: NovelChapterLink[];
+  prevUrl: string | null;
+  nextUrl: string | null;
+  chapterLabel?: string;
+} {
+  const curKey = canonicalUrlKey(cleanUrl);
+  let siblingRe: RegExp | null = null;
+  try {
+    const u = new URL(cleanUrl);
+    const kaku = u.pathname.match(/^\/works\/(\d+)\/episodes\/\d+/);
+    if (u.hostname.includes('kakuyomu.jp') && kaku) {
+      siblingRe = new RegExp(`^https?://[^/]*kakuyomu\\.jp/works/${kaku[1]}/episodes/\\d+`, 'i');
+    } else {
+      const syo = u.pathname.match(/^\/(n[a-z0-9]+)\/\d+/i);
+      if (u.hostname.includes('syosetu.com') && syo) {
+        siblingRe = new RegExp(`^https?://[^/]*syosetu\\.com/${syo[1]}/\\d+`, 'i');
+      } else {
+        const generic = u.pathname.match(/^(.*\/(?:chapter|bab|episode|episodes|ep|ch)[-_/?]?)\d+/i);
+        if (generic) {
+          const escapedOrigin = `${u.origin}${generic[1]}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          siblingRe = new RegExp(`^${escapedOrigin}\\d+`, 'i');
+        }
+      }
+    }
+  } catch {
+    siblingRe = null;
+  }
+
+  if (!siblingRe) {
+    return { chapters: [], prevUrl: null, nextUrl: null };
+  }
+
+  const seen = new Set<string>();
+  const chapters: NovelChapterLink[] = [];
+  for (const item of links) {
+    if (!siblingRe.test(item.url)) continue;
+    const key = canonicalUrlKey(item.url);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    chapters.push({
+      title: item.title.trim() || `Bab ${chapters.length + 1}`,
+      url: item.url,
+      current: key === curKey,
+    });
+  }
+
+  const curIdx = chapters.findIndex((c) => c.current);
+  return {
+    chapters: chapters.slice(0, 200),
+    prevUrl: curIdx > 0 ? chapters[curIdx - 1].url : null,
+    nextUrl: curIdx >= 0 && curIdx + 1 < chapters.length ? chapters[curIdx + 1].url : null,
+    chapterLabel: curIdx >= 0 ? `${curIdx + 1} / ${chapters.length}` : undefined,
+  };
+}
+
+function extractNovelNavigationFromHtml(
+  doc: Document,
+  rawHtml: string,
+  cleanUrl: string
+): NovelNavigation {
+  const curKey = canonicalUrlKey(cleanUrl);
+  const kakuMatch = cleanUrl.match(/kakuyomu\.jp\/works\/(\d+)\/episodes\/(\d+)/i);
+  const nextDataNav = kakuMatch
+    ? extractKakuyomuFromNextData(rawHtml, kakuMatch[1], kakuMatch[2])
+    : null;
+
+  let prevUrl: string | null = nextDataNav?.prevUrl || null;
+  let nextUrl: string | null = nextDataNav?.nextUrl || null;
+  let tocUrl: string | null =
+    nextDataNav?.tocUrl ||
+    (kakuMatch ? `https://kakuyomu.jp/works/${kakuMatch[1]}` : null);
+
+  // W3C standard <link rel="prev|next">
+  if (!prevUrl) {
+    const linkPrev = doc.querySelector('link[rel="prev"], a[rel="prev"]')?.getAttribute('href');
+    if (linkPrev) prevUrl = resolveSafeSiblingUrl(linkPrev, cleanUrl);
+  }
+  if (!nextUrl) {
+    const linkNext = doc.querySelector('link[rel="next"], a[rel="next"]')?.getAttribute('href');
+    if (linkNext) nextUrl = resolveSafeSiblingUrl(linkNext, cleanUrl);
+  }
+
+  // Site-specific IDs & classes (Kakuyomu, Syosetu, AlphaPolis)
+  if (!prevUrl) {
+    const el = doc.querySelector(
+      '#contentMain-readPreviousEpisode, a[data-test="previous-episode-link"], .c-pager__item--before, a.prev-episode'
+    );
+    if (el?.getAttribute('href')) prevUrl = resolveSafeSiblingUrl(el.getAttribute('href')!, cleanUrl);
+  }
+  if (!nextUrl) {
+    const el = doc.querySelector(
+      '#contentMain-readNextEpisode, a[data-test="next-episode-link"], .c-pager__item--next, a.next-episode'
+    );
+    if (el?.getAttribute('href')) nextUrl = resolveSafeSiblingUrl(el.getAttribute('href')!, cleanUrl);
+  }
+
+  const allAnchors: Array<{ title: string; url: string }> = [];
+  for (const a of Array.from(doc.querySelectorAll('a[href]'))) {
+    const abs = resolveSafeSiblingUrl(a.getAttribute('href') || '', cleanUrl);
+    if (!abs) continue;
+    const label = (
+      a.textContent ||
+      a.getAttribute('aria-label') ||
+      a.getAttribute('title') ||
+      ''
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+    const clsAndId = `${a.className || ''} ${a.id || ''}`;
+    allAnchors.push({ title: label, url: abs });
+
+    if (!nextUrl && canonicalUrlKey(abs) !== curKey) {
+      if (NEXT_LINK_RE.test(label) || /next[-_]?(ep|chap|page)|readNext/i.test(clsAndId)) {
+        nextUrl = abs;
+      }
+    }
+    if (!prevUrl && canonicalUrlKey(abs) !== curKey) {
+      if (PREV_LINK_RE.test(label) || /prev(ious)?[-_]?(ep|chap|page)|readPrevious/i.test(clsAndId)) {
+        prevUrl = abs;
+      }
+    }
+    if (!tocUrl && TOC_LINK_RE.test(label)) {
+      tocUrl = abs;
+    }
+  }
+
+  const siblingNav = buildChaptersFromSiblingLinks(allAnchors, cleanUrl);
+  const chapters =
+    nextDataNav?.chapters && nextDataNav.chapters.length > 0
+      ? nextDataNav.chapters
+      : siblingNav.chapters;
+  if (!prevUrl && siblingNav.prevUrl) prevUrl = siblingNav.prevUrl;
+  if (!nextUrl && siblingNav.nextUrl) nextUrl = siblingNav.nextUrl;
+
+  const fallback = deriveNumericChapterFallback(cleanUrl);
+  if (!prevUrl && fallback.prevUrl) prevUrl = fallback.prevUrl;
+  if (!nextUrl && fallback.nextUrl) nextUrl = fallback.nextUrl;
+  if (!tocUrl && fallback.tocUrl) tocUrl = fallback.tocUrl;
+
+  const isNovel =
+    Boolean(nextDataNav?.isNovel) ||
+    isKnownNovelUrl(cleanUrl) ||
+    Boolean(fallback.isNovel) ||
+    chapters.length >= 2 ||
+    Boolean(prevUrl || nextUrl);
+
+  return {
+    isNovel,
+    seriesTitle: nextDataNav?.seriesTitle,
+    chapterLabel: nextDataNav?.chapterLabel || siblingNav.chapterLabel || fallback.chapterLabel,
+    prevUrl,
+    nextUrl,
+    tocUrl,
+    chapters: chapters.length > 0 ? chapters : undefined,
+  };
+}
+
+function extractNovelNavigationFromMarkdown(md: string, cleanUrl: string): NovelNavigation {
+  const curKey = canonicalUrlKey(cleanUrl);
+  const mdLinks: Array<{ title: string; url: string }> = [];
+  const linkRe = /\[([^\]\n]{1,120})\]\((https?:\/\/[^)\s]+)\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = linkRe.exec(md)) !== null) {
+    const safe = toSafeHttpUrl(m[2]);
+    if (!safe) continue;
+    mdLinks.push({ title: m[1].replace(/\s+/g, ' ').trim(), url: safe });
+  }
+
+  let prevUrl: string | null = null;
+  let nextUrl: string | null = null;
+  let tocUrl: string | null = null;
+
+  for (const item of mdLinks) {
+    if (canonicalUrlKey(item.url) === curKey) continue;
+    if (!nextUrl && NEXT_LINK_RE.test(item.title)) nextUrl = item.url;
+    if (!prevUrl && PREV_LINK_RE.test(item.title)) prevUrl = item.url;
+    if (!tocUrl && TOC_LINK_RE.test(item.title)) tocUrl = item.url;
+  }
+
+  const kakuMatch = cleanUrl.match(/kakuyomu\.jp\/works\/(\d+)\/episodes\/(\d+)/i);
+  if (kakuMatch && !tocUrl) {
+    tocUrl = `https://kakuyomu.jp/works/${kakuMatch[1]}`;
+  }
+
+  const siblingNav = buildChaptersFromSiblingLinks(mdLinks, cleanUrl);
+  if (!prevUrl && siblingNav.prevUrl) prevUrl = siblingNav.prevUrl;
+  if (!nextUrl && siblingNav.nextUrl) nextUrl = siblingNav.nextUrl;
+
+  const fallback = deriveNumericChapterFallback(cleanUrl);
+  if (!prevUrl && fallback.prevUrl) prevUrl = fallback.prevUrl;
+  if (!nextUrl && fallback.nextUrl) nextUrl = fallback.nextUrl;
+  if (!tocUrl && fallback.tocUrl) tocUrl = fallback.tocUrl;
+
+  const isNovel =
+    isKnownNovelUrl(cleanUrl) ||
+    Boolean(fallback.isNovel) ||
+    siblingNav.chapters.length >= 2 ||
+    Boolean(prevUrl || nextUrl);
+
+  return {
+    isNovel,
+    chapterLabel: siblingNav.chapterLabel || fallback.chapterLabel,
+    prevUrl,
+    nextUrl,
+    tocUrl,
+    chapters: siblingNav.chapters.length > 0 ? siblingNav.chapters : undefined,
+  };
+}
+
+function mergeNovelNav(primary: NovelNavigation, secondary?: NovelNavigation | null): NovelNavigation {
+  if (!secondary) return primary;
+  const chapters =
+    (primary.chapters?.length || 0) >= (secondary.chapters?.length || 0)
+      ? primary.chapters
+      : secondary.chapters;
+  return {
+    isNovel: primary.isNovel || secondary.isNovel,
+    seriesTitle: primary.seriesTitle || secondary.seriesTitle,
+    chapterLabel: primary.chapterLabel || secondary.chapterLabel,
+    prevUrl: primary.prevUrl || secondary.prevUrl || null,
+    nextUrl: primary.nextUrl || secondary.nextUrl || null,
+    tocUrl: primary.tocUrl || secondary.tocUrl || null,
+    chapters,
+  };
+}
+
+async function fetchRawHtmlViaCorsProxy(
+  cleanUrl: string,
+  signal?: AbortSignal
+): Promise<string | null> {
+  const proxies = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`,
+  ];
+  for (const endpoint of proxies) {
+    try {
+      const resp = await fetch(endpoint, { method: 'GET', signal });
+      if (!resp.ok) continue;
+      const html = await resp.text();
+      if (html && html.length <= 5 * 1024 * 1024 && /<(html|body|article|div|p)\b/i.test(html)) {
+        return html;
+      }
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') throw err;
+    }
+  }
+  return null;
+}
 
 function cleanReaderMarkdownToParagraphs(md: string): string[] {
   const lines = md.split(/\r?\n/);
@@ -640,11 +1305,9 @@ function cleanReaderMarkdownToParagraphs(md: string): string[] {
       flush();
       continue;
     }
-    // Skip Jina metadata header lines and bare image markdown lines
     if (/^(Title|URL Source|Published Time|Markdown Content):/i.test(line)) continue;
     if (/^!\[[^\]]*\]\([^)]+\)$/.test(line)) continue;
 
-    // Strip markdown links [label](url) -> label while keeping clean headings
     const cleaned = line
       .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
       .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
@@ -662,98 +1325,145 @@ function cleanReaderMarkdownToParagraphs(md: string): string[] {
   return paras.slice(0, 140);
 }
 
-async function fetchWebArticleDirect(rawUrl: string): Promise<CachedWebEntry> {
+async function fetchWebArticleDirect(
+  rawUrl: string,
+  options?: { needRawHtml?: boolean }
+): Promise<CachedWebEntry> {
   const cleanUrl = normalizeWebUrl(rawUrl);
   const cached = webArticleCache.get(cleanUrl);
-  if (cached) return cached;
+  if (cached && (!options?.needRawHtml || cached.rawHtml)) {
+    return cached;
+  }
 
   const host = new URL(cleanUrl).hostname;
   const ctrl = new AbortController();
   const timer = window.setTimeout(() => ctrl.abort(), 24000);
 
   try {
-    let titleSrc = host;
-    let srcParas: string[] = [];
-    let finalUrl = cleanUrl;
+    let titleSrc = cached?.titleSrc || host;
+    let srcParas: string[] = cached?.srcParas || [];
+    let finalUrl = cached?.url || cleanUrl;
+    let rawMarkdown = cached?.rawMarkdown || '';
+    let rawHtml = cached?.rawHtml || '';
+    let navFromMd: NovelNavigation | null = null;
+    let navFromHtml: NovelNavigation | null = null;
 
-    try {
-      const resp = await fetch(`https://r.jina.ai/${cleanUrl}`, {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-        signal: ctrl.signal,
-      });
-      if (resp.ok) {
-        const ctype = resp.headers.get('content-type') || '';
-        let contentText = '';
-        if (ctype.includes('application/json')) {
-          const json = await resp.json();
-          const d = json?.data || {};
-          titleSrc = String(d.title || host).trim() || host;
-          contentText = String(d.content || d.description || '').trim();
-          if (typeof d.url === 'string' && d.url.startsWith('http')) {
-            finalUrl = d.url;
-          }
-        } else {
-          const rawTxt = await resp.text();
-          const titleMatch = rawTxt.match(/^Title:\s*(.+)$/m);
-          if (titleMatch) titleSrc = titleMatch[1].trim();
-          contentText = rawTxt;
-        }
-        srcParas = cleanReaderMarkdownToParagraphs(contentText);
-      }
-    } catch (err) {
-      if ((err as { name?: string })?.name === 'AbortError') throw err;
+    const shouldFetchHtmlNow = Boolean(options?.needRawHtml) || isKnownNovelUrl(cleanUrl);
+
+    const jinaPromise =
+      srcParas.length > 0
+        ? Promise.resolve()
+        : (async () => {
+            try {
+              const resp = await fetch(`https://r.jina.ai/${cleanUrl}`, {
+                method: 'GET',
+                headers: { Accept: 'application/json' },
+                signal: ctrl.signal,
+              });
+              if (resp.ok) {
+                const ctype = resp.headers.get('content-type') || '';
+                let contentText = '';
+                if (ctype.includes('application/json')) {
+                  const json = await resp.json();
+                  const d = json?.data || {};
+                  titleSrc = String(d.title || host).trim() || host;
+                  contentText = String(d.content || d.description || '').trim();
+                  if (typeof d.url === 'string' && d.url.startsWith('http')) {
+                    finalUrl = d.url;
+                  }
+                } else {
+                  const rawTxt = await resp.text();
+                  const titleMatch = rawTxt.match(/^Title:\s*(.+)$/m);
+                  if (titleMatch) titleSrc = titleMatch[1].trim();
+                  contentText = rawTxt;
+                }
+                rawMarkdown = contentText;
+                navFromMd = extractNovelNavigationFromMarkdown(contentText, finalUrl);
+                srcParas = cleanReaderMarkdownToParagraphs(contentText);
+              }
+            } catch (err) {
+              if ((err as { name?: string })?.name === 'AbortError') throw err;
+            }
+          })();
+
+    const htmlPromise =
+      rawHtml || !shouldFetchHtmlNow
+        ? Promise.resolve()
+        : (async () => {
+            // Bounded fast timeout so a slow CORS proxy never stalls Jina Reader
+            const htmlCtrl = new AbortController();
+            const htmlTimer = window.setTimeout(() => htmlCtrl.abort(), 8500);
+            try {
+              const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, htmlCtrl.signal);
+              if (fetched) rawHtml = fetched;
+            } catch {
+              // Ignore proxy timeout when Jina Reader succeeds
+            } finally {
+              window.clearTimeout(htmlTimer);
+            }
+          })();
+
+    await Promise.all([jinaPromise, htmlPromise]);
+
+    // If Jina returned nothing and we didn't fetch raw HTML yet, try raw HTML proxy now
+    if (srcParas.length === 0 && !rawHtml) {
+      const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, ctrl.signal);
+      if (fetched) rawHtml = fetched;
     }
 
-    // Fallback CORS HTML extractor if Jina Reader returned empty or blocked
-    if (srcParas.length === 0) {
-      const proxyResp = await fetch(
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`,
-        { method: 'GET', signal: ctrl.signal }
-      );
-      if (!proxyResp.ok) {
-        throw new Error(
-          `Halaman ${host} menolak pembacaan otomatis (HTTP ${proxyResp.status}). Gunakan tombol Buka situs asli.`
-        );
-      }
-      const rawHtml = await proxyResp.text();
+    if (rawHtml) {
       const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
-      doc
-        .querySelectorAll('script, style, noscript, nav, footer, header, aside, svg')
-        .forEach((el) => el.remove());
-      titleSrc = (doc.title || host).trim() || host;
-      const root =
-        doc.querySelector('article, main, .widget-episodeBody, #novel_honbun, .main_text') ||
-        doc.body;
-      const nodes = Array.from(root?.querySelectorAll('h1, h2, h3, p') || []);
-      srcParas = nodes
-        .map((n) => (n.textContent || '').replace(/\s+/g, ' ').trim())
-        .filter((s) => s.length >= 2)
-        .slice(0, 140);
-      if (srcParas.length === 0 && root?.textContent) {
-        srcParas = root.textContent
-          .split(/\n{2,}/)
-          .map((s) => s.replace(/\s+/g, ' ').trim())
+      navFromHtml = extractNovelNavigationFromHtml(doc, rawHtml, finalUrl);
+
+      if (srcParas.length === 0) {
+        const clone = doc.cloneNode(true) as Document;
+        clone
+          .querySelectorAll('script, style, noscript, nav, footer, header, aside, svg')
+          .forEach((el) => el.remove());
+        titleSrc = (clone.title || host).trim() || host;
+        const root =
+          clone.querySelector('article, main, .widget-episodeBody, #novel_honbun, .main_text') ||
+          clone.body;
+        const nodes = Array.from(root?.querySelectorAll('h1, h2, h3, p') || []);
+        srcParas = nodes
+          .map((n) => (n.textContent || '').replace(/\s+/g, ' ').trim())
           .filter((s) => s.length >= 2)
           .slice(0, 140);
+        if (srcParas.length === 0 && root?.textContent) {
+          srcParas = root.textContent
+            .split(/\n{2,}/)
+            .map((s) => s.replace(/\s+/g, ' ').trim())
+            .filter((s) => s.length >= 2)
+            .slice(0, 140);
+        }
       }
     }
 
     if (srcParas.length === 0) {
       throw new Error(
-        `Tidak ditemukan paragraf teks yang dapat dibaca pada ${host}. Halaman mungkin memerlukan login.`
+        `Tidak ditemukan paragraf teks yang dapat dibaca pada ${host}. Halaman mungkin memerlukan login atau tantangan anti-bot.`
       );
     }
+
     const detectedSource = detectLanguageLocal(
       `${titleSrc}\n${srcParas.slice(0, 6).join('\n')}`,
       'ja'
     );
+    const mergedNav = mergeNovelNav(
+      navFromHtml || { isNovel: isKnownNovelUrl(finalUrl) },
+      navFromMd || cached?.novelNav
+    );
+
     const entry: CachedWebEntry = {
       url: finalUrl,
       host,
+      titleId: deriveSeriesTitleId(finalUrl),
       titleSrc,
       srcParas,
       detectedSource,
+      novelNav: mergedNav,
+      rawHtml: rawHtml || undefined,
+      rawMarkdown: rawMarkdown || undefined,
     };
     webArticleCache.set(cleanUrl, entry);
     webArticleCache.set(finalUrl, entry);
@@ -768,6 +1478,13 @@ async function fetchWebArticleDirect(rawUrl: string): Promise<CachedWebEntry> {
   }
 }
 
+export function prefetchWebArticleDirect(rawUrl?: string | null): void {
+  if (!rawUrl) return;
+  const safe = toSafeHttpUrl(rawUrl);
+  if (!safe || webArticleCache.has(safe)) return;
+  fetchWebArticleDirect(safe).catch(() => {});
+}
+
 export async function directPreviewLink(params: {
   cid: string;
   url: string;
@@ -775,7 +1492,7 @@ export async function directPreviewLink(params: {
   titleId?: string;
 }): Promise<LinkPreviewPayload> {
   const article = await fetchWebArticleDirect(params.url);
-  const tid = params.titleId || `t_web_${article.host.replace(/[^a-z0-9]/gi, '_').slice(0, 24)}`;
+  const tid = params.titleId || article.titleId;
   const mid = `lnk_${Date.now().toString(36)}`;
 
   const cappedParas = article.srcParas.slice(0, 80);
@@ -824,6 +1541,7 @@ export async function directPreviewLink(params: {
     paragraphCount: cappedParas.length,
     lockedNames: matchedChips.length,
     readerSupported: true,
+    novelNav: article.novelNav,
   };
 
   await upsertConversationMeta(params.cid, {
@@ -847,6 +1565,10 @@ export async function directPreviewLink(params: {
     state: 'done',
   });
 
+  if (article.novelNav.nextUrl) {
+    prefetchWebArticleDirect(article.novelNav.nextUrl);
+  }
+
   return preview;
 }
 
@@ -858,52 +1580,362 @@ function escapeHtml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
-export async function directFetchTranslatedWebHtml(params: {
-  url: string;
+function buildTranxWebHref(
+  targetAbsUrl: string,
+  mode: ModePair,
+  view: 'reader' | 'site' | 'original',
+  fallbackTitleId?: string
+): string {
+  const origin =
+    typeof window !== 'undefined' && window.location.origin
+      ? window.location.origin
+      : 'https://tranx-hanif-id.web.app';
+  const tid = deriveSeriesTitleId(targetAbsUrl) || fallbackTitleId || '';
+  const qs = new URLSearchParams({
+    url: targetAbsUrl,
+    mode,
+    view,
+    ...(tid ? { titleId: tid } : {}),
+  });
+  return `${origin}/web?${qs.toString()}`;
+}
+
+async function buildTranslatedSiteHtmlDirect(params: {
+  article: CachedWebEntry;
   mode: ModePair;
   titleId?: string;
-  view: 'translated' | 'original';
+  translatedHeading: string;
+  translatedParas: string[];
 }): Promise<string> {
-  const article = await fetchWebArticleDirect(params.url);
-  const { tgt } = parseModePair(params.mode);
-  const isJpBody = params.view === 'original' ? article.detectedSource === 'ja' : tgt === 'ja';
+  const { article, mode, translatedHeading, translatedParas } = params;
+  const cacheKey = `${article.url}::${mode}::site`;
+  const cachedHtml = translatedSiteHtmlCache.get(cacheKey);
+  if (cachedHtml) return cachedHtml;
+
+  const { tgt } = parseModePair(mode);
+  const nav = article.novelNav;
+  const navButtonsHtml =
+    nav.prevUrl || nav.nextUrl || nav.tocUrl
+      ? `<div style="position:sticky;bottom:0;z-index:9999;background:#141917;color:#FAFBFA;padding:12px 16px;display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;border-top:1px solid #2B3230;font-family:Inter,-apple-system,sans-serif;font-size:14px;">
+          ${
+            nav.prevUrl
+              ? `<a href="${escapeHtml(buildTranxWebHref(nav.prevUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">&#8592; Bab sebelumnya</a>`
+              : ''
+          }
+          ${
+            nav.tocUrl
+              ? `<a href="${escapeHtml(buildTranxWebHref(nav.tocUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">Daftar bab</a>`
+              : ''
+          }
+          ${
+            nav.nextUrl
+              ? `<a href="${escapeHtml(buildTranxWebHref(nav.nextUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="background:#17695B;color:#FFFFFF;text-decoration:none;padding:8px 16px;border-radius:10px;font-weight:600;">Bab berikutnya &#8594;</a>`
+              : ''
+          }
+        </div>`
+      : '';
+
+  if (article.rawHtml) {
+    const doc = new DOMParser().parseFromString(article.rawHtml, 'text/html');
+
+    // Remove all executable/embedded/redirect tags strictly (zero JS in translated site iframe)
+    doc
+      .querySelectorAll(
+        'script, noscript, iframe, frame, frameset, object, embed, applet, base, meta[http-equiv="refresh"], meta[http-equiv="Content-Security-Policy"]'
+      )
+      .forEach((el) => el.remove());
+
+    // Sanitize attributes and rewrite every safe <a href> into tranX auto-translating /web links
+    const allElements = Array.from(doc.querySelectorAll('*'));
+    for (const el of allElements) {
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith('on') || name === 'srcdoc') {
+          el.removeAttribute(attr.name);
+          continue;
+        }
+        if (
+          name === 'href' ||
+          name === 'src' ||
+          name === 'action' ||
+          name === 'xlink:href' ||
+          name === 'poster'
+        ) {
+          const cleanedVal = attr.value.replace(/[\x00-\x20\x7f]+/g, '').toLowerCase();
+          if (
+            cleanedVal.startsWith('javascript:') ||
+            cleanedVal.startsWith('vbscript:') ||
+            cleanedVal.startsWith('data:text/html') ||
+            cleanedVal.startsWith('data:image/svg')
+          ) {
+            el.removeAttribute(attr.name);
+          }
+        }
+      }
+
+      if (el.tagName === 'A') {
+        const rawHref = el.getAttribute('href') || '';
+        const safeAbs = resolveSafeSiblingUrl(rawHref, article.url);
+        if (safeAbs) {
+          el.setAttribute('href', buildTranxWebHref(safeAbs, mode, 'site', params.titleId));
+          el.setAttribute('target', '_top');
+          el.setAttribute('rel', 'noopener noreferrer');
+        } else {
+          el.removeAttribute('href');
+        }
+      } else if (el.tagName === 'LINK') {
+        const rawHref = el.getAttribute('href') || '';
+        const safeAbs = resolveSafeSiblingUrl(rawHref, article.url);
+        if (safeAbs) {
+          el.setAttribute('href', safeAbs);
+        } else {
+          el.removeAttribute('href');
+        }
+      } else if (
+        el.tagName === 'IMG' ||
+        el.tagName === 'SOURCE' ||
+        el.tagName === 'VIDEO' ||
+        el.tagName === 'AUDIO'
+      ) {
+        const rawSrc = el.getAttribute('src') || el.getAttribute('data-src') || '';
+        if (rawSrc && !rawSrc.startsWith('data:')) {
+          const safeAbs = resolveSafeSiblingUrl(rawSrc, article.url);
+          if (safeAbs) el.setAttribute('src', safeAbs);
+        }
+        const rawPoster = el.getAttribute('poster') || '';
+        if (rawPoster) {
+          const safePoster = resolveSafeSiblingUrl(rawPoster, article.url);
+          if (safePoster) el.setAttribute('poster', safePoster);
+        }
+        const rawSrcset = el.getAttribute('srcset') || '';
+        if (rawSrcset) {
+          const resolvedSrcset = rawSrcset
+            .split(',')
+            .map((entry) => {
+              const parts = entry.trim().split(/\s+/);
+              if (!parts[0]) return '';
+              const safeAbs = resolveSafeSiblingUrl(parts[0], article.url);
+              if (!safeAbs) return '';
+              return parts.length > 1 ? `${safeAbs} ${parts.slice(1).join(' ')}` : safeAbs;
+            })
+            .filter(Boolean)
+            .join(', ');
+          if (resolvedSrcset) el.setAttribute('srcset', resolvedSrcset);
+          else el.removeAttribute('srcset');
+        }
+      } else if (el.tagName === 'FORM') {
+        el.removeAttribute('action');
+      }
+    }
+
+    // Collect visible text nodes for in-place DOM translation (preserving site layout)
+    const skipParentTags = new Set([
+      'SCRIPT',
+      'STYLE',
+      'NOSCRIPT',
+      'CODE',
+      'PRE',
+      'TEXTAREA',
+      'SVG',
+      'MATH',
+    ]);
+    const textNodes: Text[] = [];
+    const walker = doc.createTreeWalker(doc.body || doc.documentElement, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node && textNodes.length < 320) {
+      const parent = node.parentElement;
+      const val = (node.nodeValue || '').trim();
+      if (
+        val.length >= 2 &&
+        hasTranslatableLetters(val) &&
+        (!parent || !skipParentTags.has(parent.tagName))
+      ) {
+        textNodes.push(node as Text);
+      }
+      node = walker.nextNode();
+    }
+
+    if (textNodes.length > 0) {
+      const { outputs } = await translateParagraphsDirect({
+        paragraphs: textNodes.map((n) => (n.nodeValue || '').trim()),
+        mode,
+        titleId: params.titleId || article.titleId,
+      });
+      textNodes.forEach((tn, idx) => {
+        if (outputs[idx]) {
+          tn.nodeValue = outputs[idx];
+        }
+      });
+    }
+
+    if (doc.title) {
+      doc.title = translatedHeading;
+    }
+    if (navButtonsHtml && doc.body) {
+      const navWrap = doc.createElement('div');
+      navWrap.innerHTML = navButtonsHtml;
+      doc.body.appendChild(navWrap);
+    }
+
+    const serialized = `<!doctype html>\n${doc.documentElement.outerHTML}`;
+    translatedSiteHtmlCache.set(cacheKey, serialized);
+    return serialized;
+  }
+
+  // Clean semantic fallback when CORS HTML proxy was blocked: still rewrites chapter links into /web!
+  const isJpBody = tgt === 'ja';
   const fontStack = isJpBody
     ? '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif'
     : 'Charter, Georgia, Cambria, serif';
+  const renderedParas = translatedParas
+    .map((p) =>
+      /^#{1,3}\s+/.test(p)
+        ? `<h2>${escapeHtml(p.replace(/^#{1,6}\s+/, ''))}</h2>`
+        : `<p>${escapeHtml(p)}</p>`
+    )
+    .join('\n');
 
-  let headingText = article.titleSrc;
-  let bodyParas = article.srcParas;
+  const chaptersHtml =
+    nav.chapters && nav.chapters.length > 0
+      ? `<section style="margin-top:32px;padding-top:20px;border-top:1px solid #DEE3E0;">
+          <h2 style="font-family:Inter,-apple-system,sans-serif;font-size:16px;">Daftar Bab</h2>
+          <ul style="list-style:none;padding:0;margin:12px 0;display:flex;flex-direction:column;gap:8px;font-family:Inter,-apple-system,sans-serif;font-size:14px;">
+            ${nav.chapters
+              .slice(0, 40)
+              .map(
+                (ch) =>
+                  `<li><a href="${escapeHtml(buildTranxWebHref(ch.url, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#17695B;font-weight:${ch.current ? '700' : '500'};text-decoration:none;">${escapeHtml(ch.title)}</a></li>`
+              )
+              .join('')}
+          </ul>
+        </section>`
+      : '';
 
-  if (params.view === 'translated') {
+  const fallbackHtml = `<!doctype html>
+<html lang="${tgt}">
+<head>
+<meta charset="utf-8">
+<title>${escapeHtml(translatedHeading)}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 28px 20px 0; background: #FAFBFA; color: #141917; font-family: ${fontStack}; font-size: 18px; line-height: 1.78; }
+  @media (prefers-color-scheme: dark) { body { background: #171B1A; color: #E7ECEA; } header { border-bottom-color: #2B3230 !important; } .meta { color: #A5AEAA !important; } }
+  article { max-width: 700px; margin: 0 auto 40px; }
+  header { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #DEE3E0; }
+  h1 { font-size: 26px; line-height: 1.3; margin: 0 0 8px 0; }
+  p { margin: 0 0 16px 0; }
+  .meta { font-family: Inter, -apple-system, sans-serif; font-size: 13px; color: #4F5855; }
+</style>
+</head>
+<body>
+  <article>
+    <header>
+      <div class="meta">${escapeHtml(article.host)}</div>
+      <h1>${escapeHtml(translatedHeading.replace(/^#{1,6}\s+/, ''))}</h1>
+    </header>
+    ${renderedParas}
+    ${chaptersHtml}
+  </article>
+  ${navButtonsHtml}
+</body>
+</html>`;
+  translatedSiteHtmlCache.set(cacheKey, fallbackHtml);
+  return fallbackHtml;
+}
+
+export async function directFetchWebReaderBundle(params: {
+  url: string;
+  mode: ModePair;
+  titleId?: string;
+  view: 'reader' | 'site' | 'original';
+}): Promise<WebReaderBundle> {
+  const article = await fetchWebArticleDirect(params.url, {
+    needRawHtml: params.view === 'site',
+  });
+  const tid = params.titleId || article.titleId;
+  const cappedSrc = article.srcParas.slice(0, 80);
+
+  let titleDst = article.titleSrc;
+  let translatedParas = cappedSrc;
+
+  if (params.view !== 'original') {
     const cacheKey1 = `${article.url}::${params.mode}`;
     const cacheKey2 = `${normalizeWebUrl(params.url)}::${params.mode}`;
     const preTranslated = translatedWebCache.get(cacheKey1) || translatedWebCache.get(cacheKey2);
     if (preTranslated) {
-      headingText = preTranslated.heading;
-      bodyParas = preTranslated.paras;
+      titleDst = preTranslated.heading;
+      translatedParas = preTranslated.paras;
     } else {
-      const batch = [article.titleSrc, ...article.srcParas.slice(0, 80)];
+      const batch = [article.titleSrc, ...cappedSrc];
       const { outputs } = await translateParagraphsDirect({
         paragraphs: batch,
         mode: params.mode,
-        titleId: params.titleId,
+        titleId: tid,
       });
-      headingText = outputs[0] || article.titleSrc;
-      bodyParas = outputs.slice(1);
-      translatedWebCache.set(cacheKey1, { heading: headingText, paras: bodyParas });
+      titleDst = outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
+      translatedParas = outputs.slice(1).map((s) => s.replace(/^#{1,6}\s+/, ''));
+      translatedWebCache.set(cacheKey1, { heading: titleDst, paras: translatedParas });
     }
   }
 
-  const renderedParas = bodyParas
-    .map((p) => {
-      if (/^#{1,3}\s+/.test(p)) {
-        return `<h2>${escapeHtml(p.replace(/^#{1,6}\s+/, ''))}</h2>`;
-      }
-      if (/^#{4,6}\s+/.test(p)) {
-        return `<h3>${escapeHtml(p.replace(/^#{1,6}\s+/, ''))}</h3>`;
-      }
-      return `<p>${escapeHtml(p)}</p>`;
-    })
+  const sentences: SentencePair[] = cappedSrc.map((srcLine, idx) => ({
+    i: idx,
+    src: srcLine.replace(/^#{1,6}\s+/, ''),
+    dst: (translatedParas[idx] || srcLine).replace(/^#{1,6}\s+/, ''),
+  }));
+
+  let siteHtml: string | undefined;
+  if (params.view === 'site') {
+    siteHtml = await buildTranslatedSiteHtmlDirect({
+      article,
+      mode: params.mode,
+      titleId: tid,
+      translatedHeading: titleDst,
+      translatedParas,
+    });
+  }
+
+  if (article.novelNav.nextUrl) {
+    prefetchWebArticleDirect(article.novelNav.nextUrl);
+  }
+
+  return {
+    url: article.url,
+    host: article.host,
+    titleId: tid,
+    detectedSource: article.detectedSource,
+    titleSrc: article.titleSrc,
+    titleDst,
+    sentences,
+    novelNav: article.novelNav,
+    siteHtml,
+  };
+}
+
+export async function directFetchTranslatedWebHtml(params: {
+  url: string;
+  mode: ModePair;
+  titleId?: string;
+  view: 'translated' | 'original' | 'site' | 'reader';
+}): Promise<string> {
+  const normalizedView =
+    params.view === 'original' ? 'original' : params.view === 'site' ? 'site' : 'reader';
+  const bundle = await directFetchWebReaderBundle({
+    url: params.url,
+    mode: params.mode,
+    titleId: params.titleId,
+    view: normalizedView === 'site' ? 'site' : normalizedView,
+  });
+  if (bundle.siteHtml) return bundle.siteHtml;
+
+  const { tgt } = parseModePair(params.mode);
+  const isJpBody = normalizedView === 'original' ? bundle.detectedSource === 'ja' : tgt === 'ja';
+  const fontStack = isJpBody
+    ? '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif'
+    : 'Charter, Georgia, Cambria, serif';
+  const headingText = normalizedView === 'original' ? bundle.titleSrc : bundle.titleDst;
+  const renderedParas = bundle.sentences
+    .map((s) => `<p>${escapeHtml(normalizedView === 'original' ? s.src : s.dst)}</p>`)
     .join('\n');
 
   return `<!doctype html>
@@ -913,25 +1945,11 @@ export async function directFetchTranslatedWebHtml(params: {
 <title>${escapeHtml(headingText)}</title>
 <style>
   :root { color-scheme: light dark; }
-  body {
-    margin: 0;
-    padding: 28px 20px 72px;
-    background: #FAFBFA;
-    color: #141917;
-    font-family: ${fontStack};
-    font-size: 18px;
-    line-height: 1.75;
-  }
-  @media (prefers-color-scheme: dark) {
-    body { background: #171B1A; color: #E7ECEA; }
-    header { border-bottom-color: #2B3230 !important; }
-    .meta { color: #A5AEAA !important; }
-  }
+  body { margin: 0; padding: 28px 20px 72px; background: #FAFBFA; color: #141917; font-family: ${fontStack}; font-size: 18px; line-height: 1.75; }
+  @media (prefers-color-scheme: dark) { body { background: #171B1A; color: #E7ECEA; } header { border-bottom-color: #2B3230 !important; } .meta { color: #A5AEAA !important; } }
   article { max-width: 700px; margin: 0 auto; }
   header { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #DEE3E0; }
   h1 { font-size: 26px; line-height: 1.3; margin: 0 0 8px 0; }
-  h2 { font-size: 21px; line-height: 1.4; margin: 28px 0 10px 0; }
-  h3 { font-size: 18px; line-height: 1.45; margin: 22px 0 8px 0; }
   p { margin: 0 0 16px 0; }
   .meta { font-family: Inter, -apple-system, sans-serif; font-size: 13px; color: #4F5855; }
 </style>
@@ -939,8 +1957,8 @@ export async function directFetchTranslatedWebHtml(params: {
 <body>
   <article>
     <header>
-      <div class="meta">${escapeHtml(article.host)}</div>
-      <h1>${escapeHtml(headingText.replace(/^#{1,6}\s+/, ''))}</h1>
+      <div class="meta">${escapeHtml(bundle.host)}</div>
+      <h1>${escapeHtml(headingText)}</h1>
     </header>
     ${renderedParas}
   </article>

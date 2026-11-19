@@ -98,6 +98,22 @@ export interface ImageTranslationResult {
   dataUrl?: string;
 }
 
+export interface NovelChapterLink {
+  title: string;
+  url: string;
+  current?: boolean;
+}
+
+export interface NovelNavigation {
+  isNovel: boolean;
+  seriesTitle?: string;
+  chapterLabel?: string;
+  prevUrl?: string | null;
+  nextUrl?: string | null;
+  tocUrl?: string | null;
+  chapters?: NovelChapterLink[];
+}
+
 export interface LinkPreviewPayload {
   mid: string;
   cid: string;
@@ -112,6 +128,19 @@ export interface LinkPreviewPayload {
   paragraphCount: number;
   lockedNames: number;
   readerSupported: boolean;
+  novelNav?: NovelNavigation;
+}
+
+export interface WebReaderBundle {
+  url: string;
+  host: string;
+  titleId: string;
+  detectedSource: TargetLang;
+  titleSrc: string;
+  titleDst: string;
+  sentences: SentencePair[];
+  novelNav: NovelNavigation;
+  siteHtml?: string;
 }
 
 export type TurnState =
