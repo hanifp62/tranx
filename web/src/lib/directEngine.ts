@@ -19,7 +19,7 @@ import {
   saveTurnMessageDirect,
   upsertConversationMeta,
 } from './firebase';
-import { idbGet, idbLoadRecent, idbPut, idbPutMany } from './perfCache';
+import { idbDelete, idbGet, idbLoadRecent, idbPut, idbPutMany } from './perfCache';
 import {
   AdaptiveTokenBucket,
   BoundedLruCache,
@@ -112,11 +112,21 @@ function scoreLatinWords(sample: string): { idScore: number; enScore: number; wo
   const words = (sample.slice(0, 4000).match(WORD_RE) || []).map((w) => w.toLowerCase());
   let idScore = 0;
   let enScore = 0;
+  let idStopHits = 0;
+  let enStopHits = 0;
   for (const w of words) {
-    if (ID_WORDS.has(w)) idScore += 1.2;
-    if (EN_WORDS.has(w)) enScore += 1.2;
+    if (ID_WORDS.has(w)) {
+      idScore += 1.2;
+      idStopHits += 1;
+    }
+    if (EN_WORDS.has(w)) {
+      enScore += 1.2;
+      enStopHits += 1;
+    }
+    // Only apply Indonesian morphological heuristics when not an English word; avoid false positives like "terms", "terrible", "berlin"
     if (
-      w.length >= 5 &&
+      !EN_WORDS.has(w) &&
+      w.length >= 6 &&
       (w.endsWith('nya') ||
         w.endsWith('kan') ||
         w.endsWith('lah') ||
@@ -125,18 +135,26 @@ function scoreLatinWords(sample: string): { idScore: number; enScore: number; wo
         w.startsWith('meng') ||
         w.startsWith('memb') ||
         w.startsWith('mend') ||
-        w.startsWith('ber') ||
-        w.startsWith('ter'))
+        w.startsWith('berk') ||
+        w.startsWith('bert') ||
+        w.startsWith('terj') ||
+        w.startsWith('terk') ||
+        w.startsWith('terl') ||
+        w.startsWith('terd'))
     ) {
-      idScore += 0.7;
+      idScore += 0.65;
     }
     if (
-      (w.length >= 5 && (w.endsWith('tion') || w.endsWith('ment') || w.endsWith('ing') || w.endsWith('ness'))) ||
-      /^(don't|can't|won't|isn't|aren't|it's|i'm|you're|we're|they're|didn't|wasn't|couldn't|wouldn't)$/.test(w)
+      !ID_WORDS.has(w) &&
+      ((w.length >= 5 && (w.endsWith('tion') || w.endsWith('ment') || w.endsWith('ing') || w.endsWith('ness'))) ||
+        /^(don't|can't|won't|isn't|aren't|it's|i'm|you're|we're|they're|didn't|wasn't|couldn't|wouldn't)$/.test(w))
     ) {
       enScore += 0.7;
     }
   }
+  // Require at least 1 true stopword hit before affix-only score can claim a language
+  if (idStopHits === 0 && idScore < 1.5) idScore = 0;
+  if (enStopHits === 0 && enScore < 1.5) enScore = 0;
   return { idScore, enScore, wordCount: words.length };
 }
 
@@ -154,14 +172,32 @@ export function classifyParagraphLanguage(text: string): ParagraphLangClass {
   }
   if (wordCount === 0) return 'unknown';
 
-  if (idScore > 0 && enScore === 0) return 'id';
-  if (enScore > 0 && idScore === 0) return 'en';
+  // Require clear signal before declaring a short line strictly ID or EN so non-target titles are never skipped
+  if (idScore >= 1.2 && enScore === 0 && (wordCount <= 4 || idScore >= 2.0)) return 'id';
+  if (enScore >= 1.2 && idScore === 0 && (wordCount <= 4 || enScore >= 2.0)) return 'en';
   if (idScore > 0 && enScore > 0) {
-    if (idScore >= enScore * 1.8) return 'id';
-    if (enScore >= idScore * 1.8) return 'en';
+    if (idScore >= 2.4 && idScore >= enScore * 2.2) return 'id';
+    if (enScore >= 2.4 && enScore >= idScore * 2.2) return 'en';
     return 'mixed-latin';
   }
   return 'unknown';
+}
+
+function isStillUntranslatedForTarget(srcText: string, outText: string, tgt: TargetLang): boolean {
+  const cleanSrc = (srcText || '').trim();
+  const cleanOut = (outText || '').trim();
+  if (!cleanSrc) return false;
+  if (!cleanOut) return true;
+  if (tgt !== 'ja' && CJK_RE.test(cleanSrc)) {
+    const cjkChars = cleanOut.match(/[\u3040-\u309f\u30a0-\u30ff\u3400-\u9fff]/g) || [];
+    if (cjkChars.length >= 2) return true;
+    if (cjkChars.length >= 1 && cleanOut === cleanSrc) return true;
+  }
+  if (tgt === 'ja' && !CJK_RE.test(cleanSrc)) {
+    const latinWords = (cleanSrc.match(/[A-Za-zÀ-ÿ]{3,}/g) || []).length;
+    if (latinWords >= 2 && cleanOut === cleanSrc && !CJK_RE.test(cleanOut)) return true;
+  }
+  return false;
 }
 
 export function parseModePair(mode: ModePair): { src: SourceLang; tgt: TargetLang } {
@@ -747,16 +783,16 @@ async function translateBatchViaGoogleGtx(
     }
   };
 
-  // Pack optimal dense request batches (70% fewer upstream HTTP calls -> safe for 5-10 concurrent users!):
-  // Batch 0 is a priority micro-batch (<= 8 items, <= 950 chars) for ~250ms Time-To-First-Paragraph,
-  // followed by dense batches (<= 28 items, <= 3,200 chars) executed across hardware-adaptive 2-4 workers!
+  // Pack dense, truncation-safe request batches (65% fewer upstream HTTP calls -> safe for 5-10 concurrent users!):
+  // Batch 0 is a priority micro-batch (<= 8 items, <= 900 chars) for ~250ms Time-To-First-Paragraph,
+  // followed by dense batches (<= 18 items, <= 2,000 chars) that never exceed GTX/clients5 POST truncation limits!
   const profile = getDeviceRuntimeProfile();
   const batches: Array<Array<{ text: string; slots: number[] }>> = [];
   let cursor = 0;
   while (cursor < work.length) {
     const isFirstFastBatch = batches.length === 0 && work.length > 8;
-    const maxItems = isFirstFastBatch ? 8 : 28;
-    const maxChars = isFirstFastBatch ? 950 : 3200;
+    const maxItems = isFirstFastBatch ? 8 : 18;
+    const maxChars = isFirstFastBatch ? 900 : 2000;
     const batch: Array<{ text: string; slots: number[] }> = [];
     let charCount = 0;
     while (
@@ -775,15 +811,31 @@ async function translateBatchViaGoogleGtx(
     batches.push(batch);
   }
 
+  // Tolerant marker splitter handles ASCII/fullwidth mutations GTX occasionally emits ([[#0]], [#0], 【#0】, [[＃0]])
+  const MARKER_SPLIT_RE = /(?:\[\[|\[|【)\s*[#＃]\s*(\d+)\s*(?:\]\]|\]|】)/;
+  const parseBatchMarkers = (raw: string, size: number): string[] => {
+    const splitParts = raw.split(MARKER_SPLIT_RE);
+    const parsed = new Array<string>(size).fill('');
+    for (let p = 1; p + 1 < splitParts.length; p += 2) {
+      const slot = Number(splitParts[p]);
+      if (slot >= 0 && slot < size && !parsed[slot]) {
+        parsed[slot] = splitParts[p + 1].trim();
+      }
+    }
+    return parsed;
+  };
+
+  const retryItems: Array<{ text: string; slots: number[] }> = [];
+
   await runConcurrentPool(batches, profile.gtxConcurrency, async (batch) => {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-    if (batch.length === 1 && batch[0].text.length > 3200) {
+    if (batch.length === 1 && batch[0].text.length > 2000) {
       const parts = batch[0].text.split(/(?<=[。！？.!?\n])/);
       const subChunks: string[] = [];
       let acc = '';
       for (const part of parts) {
-        if ((acc + part).length > 1800 && acc) {
+        if ((acc + part).length > 1500 && acc) {
           subChunks.push(acc);
           acc = part;
         } else {
@@ -805,11 +857,15 @@ async function translateBatchViaGoogleGtx(
       try {
         const res = await requestGtxSingleChunk(batch[0].text, src, tgt, signal);
         if (res.detected) detected = res.detected;
-        assignSlots(batch[0].slots, res.translated || batch[0].text);
+        if (res.translated && !isStillUntranslatedForTarget(batch[0].text, res.translated, tgt)) {
+          assignSlots(batch[0].slots, res.translated);
+        } else {
+          retryItems.push(batch[0]);
+        }
       } catch (err) {
         if ((err as { name?: string })?.name === 'AbortError') throw err;
         if (work.length === 1) throw err;
-        assignSlots(batch[0].slots, batch[0].text);
+        retryItems.push(batch[0]);
       }
       return;
     }
@@ -818,34 +874,61 @@ async function translateBatchViaGoogleGtx(
     try {
       const res = await requestGtxSingleChunk(joined, src, tgt, signal);
       if (res.detected) detected = res.detected;
-      const splitParts = res.translated.split(/\[\[\s*#\s*(\d+)\s*\]\]/);
-      const batchOut = new Array<string>(batch.length).fill('');
-      for (let p = 1; p + 1 < splitParts.length; p += 2) {
-        const slot = Number(splitParts[p]);
-        if (batch[slot]) {
-          batchOut[slot] = splitParts[p + 1].trim();
-        }
-      }
+      const batchOut = parseBatchMarkers(res.translated, batch.length);
       for (let bIdx = 0; bIdx < batch.length; bIdx += 1) {
-        if (batchOut[bIdx]) {
-          assignSlots(batch[bIdx].slots, batchOut[bIdx]);
+        const candidate = batchOut[bIdx];
+        if (candidate && !isStillUntranslatedForTarget(batch[bIdx].text, candidate, tgt)) {
+          assignSlots(batch[bIdx].slots, candidate);
         } else {
-          const singleRes = await requestGtxSingleChunk(batch[bIdx].text, src, tgt, signal).catch(
-            () => ({ translated: batch[bIdx].text })
-          );
-          assignSlots(batch[bIdx].slots, singleRes.translated || batch[bIdx].text);
+          retryItems.push(batch[bIdx]);
         }
       }
     } catch (err) {
       if ((err as { name?: string })?.name === 'AbortError') throw err;
       for (const b of batch) {
-        const singleRes = await requestGtxSingleChunk(b.text, src, tgt, signal).catch(() => ({
-          translated: b.text,
-        }));
-        assignSlots(b.slots, singleRes.translated || b.text);
+        retryItems.push(b);
       }
     }
   });
+
+  // Self-healing retry pass for any dropped/mangled/rate-limited slots: compact 5-item mini-batches then single fallback
+  if (retryItems.length > 0 && !signal?.aborted) {
+    const miniBatches: Array<Array<{ text: string; slots: number[] }>> = [];
+    for (let i = 0; i < retryItems.length; i += 5) {
+      miniBatches.push(retryItems.slice(i, i + 5));
+    }
+    await runConcurrentPool(miniBatches, Math.min(2, profile.gtxConcurrency), async (mini) => {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const unresolved: Array<{ text: string; slots: number[] }> = [];
+      if (mini.length > 1) {
+        try {
+          const joined = mini.map((b, k) => `[[#${k}]] ${b.text}`).join('\n');
+          const res = await requestGtxSingleChunk(joined, src, tgt, signal);
+          if (res.detected) detected = res.detected;
+          const out = parseBatchMarkers(res.translated, mini.length);
+          mini.forEach((item, idx) => {
+            if (out[idx] && !isStillUntranslatedForTarget(item.text, out[idx], tgt)) {
+              assignSlots(item.slots, out[idx]);
+            } else {
+              unresolved.push(item);
+            }
+          });
+        } catch (err) {
+          if ((err as { name?: string })?.name === 'AbortError') throw err;
+          unresolved.push(...mini);
+        }
+      } else {
+        unresolved.push(...mini);
+      }
+      for (const item of unresolved) {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        const singleRes = await requestGtxSingleChunk(item.text, src, tgt, signal).catch(() => ({
+          translated: item.text,
+        }));
+        assignSlots(item.slots, singleRes.translated || item.text);
+      }
+    });
+  }
 
   return { outputs, detected };
 }
@@ -1101,7 +1184,7 @@ export async function translateParagraphsDirect(params: {
     }
     const cacheKey = makeParaCacheKey(src, tgt, glossarySig, trimmed);
     const cached = getCachedParaTranslation(cacheKey);
-    if (cached !== undefined) {
+    if (cached !== undefined && !isStillUntranslatedForTarget(trimmed, cached, tgt)) {
       markDone(idx, cached);
       return;
     }
@@ -1138,7 +1221,9 @@ export async function translateParagraphsDirect(params: {
             const m = maskedEntries[startOffset + offset];
             if (!m) return;
             const finalTxt = polishTranslatedProse(unmaskWithGlossary(txt || m.masked, m.map), tgt);
-            setCachedParaTranslation(m.cacheKey, finalTxt);
+            if (!isStillUntranslatedForTarget(params.paragraphs[m.origIdx], finalTxt, tgt)) {
+              setCachedParaTranslation(m.cacheKey, finalTxt);
+            }
             markDone(m.origIdx, finalTxt, offset === chunkOut.length - 1);
           });
         }
@@ -1199,7 +1284,9 @@ export async function translateParagraphsDirect(params: {
             unmaskWithGlossary(translatedRaw || item.masked, item.map),
             tgt
           );
-          setCachedParaTranslation(item.cacheKey, finalTxt);
+          if (!isStillUntranslatedForTarget(params.paragraphs[item.origIdx], finalTxt, tgt)) {
+            setCachedParaTranslation(item.cacheKey, finalTxt);
+          }
           markDone(item.origIdx, finalTxt);
         }
       );
@@ -1214,7 +1301,9 @@ export async function translateParagraphsDirect(params: {
             unmaskWithGlossary(batchedRes.outputs[k] || item.masked, item.map),
             tgt
           );
-          setCachedParaTranslation(item.cacheKey, finalTxt);
+          if (!isStillUntranslatedForTarget(params.paragraphs[item.origIdx], finalTxt, tgt)) {
+            setCachedParaTranslation(item.cacheKey, finalTxt);
+          }
           markDone(item.origIdx, finalTxt);
         }
       });
@@ -1225,7 +1314,9 @@ export async function translateParagraphsDirect(params: {
     await runConcurrentPool(mixedJaItems, getDeviceRuntimeProfile().gtxConcurrency, async (item) => {
       const tr = await translateMixedCjkLineToTarget(item.masked, tgt, params.signal);
       const finalTxt = polishTranslatedProse(unmaskWithGlossary(tr, item.map), tgt);
-      setCachedParaTranslation(item.cacheKey, finalTxt);
+      if (!isStillUntranslatedForTarget(params.paragraphs[item.origIdx], finalTxt, tgt)) {
+        setCachedParaTranslation(item.cacheKey, finalTxt);
+      }
       markDone(item.origIdx, finalTxt);
       if (tgt !== 'ja') detectedSource = 'ja';
     });
@@ -1268,7 +1359,7 @@ const translatedSiteHtmlCache = new BoundedLruCache<string, string>(
 );
 const seriesTocCache = new BoundedLruCache<
   string,
-  { seriesTitle?: string; tocUrl: string; chapters: NovelChapterLink[] }
+  { seriesTitle?: string; tocUrl: string; chapters: NovelChapterLink[]; authoritative?: boolean }
 >(24);
 const translatedChapterTitlesCache = new BoundedLruCache<string, Record<string, string>>(24);
 
@@ -1487,9 +1578,9 @@ function hasMojibake(text: string): boolean {
 }
 
 function isChallengeOrBlockedPayload(title: string, html: string, content: string): boolean {
-  const head = `${title}\n${content.slice(0, 1000)}\n${html.slice(0, 2800)}`;
+  const head = `${title}\n${content.slice(0, 1200)}\n${html.slice(0, 2800)}`;
   const hasChallengeMarker =
-    /just a moment\.\.\.|attention required!\s*\|\s*cloudflare|checking your browser|enable javascript and cookies to continue|cf-browser-verification|cf-challenge|challenge-platform|verify you are human|please complete the security check|ddos-guard|access denied\s*\|\s*cloudflare|generated by cloudfront|403\s+error\b|the request could not be satisfied|request blocked\.\s*we can['’]t connect to the server|cloudfront documentation|request unsuccessful\.\s*incapsula|access denied\b[\s\S]{0,220}reference\s*#|error\s+403\s+forbidden|<title>\s*(?:error:\s*the request could not be satisfied|403\s+(?:forbidden|error)|429\s+too many requests|503\s+service unavailable|access denied)\s*<\/title>/i.test(
+    /just a moment\.\.\.|attention required!\s*\|\s*cloudflare|checking your browser|enable javascript and cookies to continue|cf-browser-verification|cf-challenge|challenge-platform|verify you are human|please complete the security check|ddos-guard|access denied\s*\|\s*cloudflare|generated by cloudfront|403\s+(?:error|kesalahan|forbidden)\b|the request could not be satisfied|permintaan (?:itu )?tidak dapat dipenuhi|permintaan diblokir\.\s*kami tidak dapat terhubung|request blocked\.\s*we can['’]t connect to the server|cloudfront documentation|dokumentasi cloudfront|request unsuccessful\.\s*incapsula|access denied\b[\s\S]{0,220}reference\s*#|error\s+403\s+forbidden|^(?:error|kesalahan):\s*(?:the request could not be satisfied|permintaan (?:itu )?tidak dapat dipenuhi)|<title>\s*(?:error:\s*the request could not be satisfied|kesalahan:\s*permintaan (?:itu )?tidak dapat dipenuhi|403\s+(?:forbidden|error|kesalahan)|429\s+too many requests|503\s+service unavailable|access denied)\s*<\/title>/im.test(
       head
     );
   if (!hasChallengeMarker) return false;
@@ -1497,13 +1588,32 @@ function isChallengeOrBlockedPayload(title: string, html: string, content: strin
   if (content.length > 3500) return false;
   if (
     html.length > 30000 &&
-    !/just a moment\.\.\.|attention required|the request could not be satisfied|403\s+(?:forbidden|error)|access denied/i.test(
+    !/just a moment\.\.\.|attention required|the request could not be satisfied|permintaan (?:itu )?tidak dapat dipenuhi|403\s+(?:forbidden|error|kesalahan)|access denied/i.test(
       title
     )
   ) {
     return false;
   }
   return true;
+}
+
+function isBlockedArticleOrTranslation(
+  title: string,
+  paras: string[],
+  rawHtml = ''
+): boolean {
+  const joinedParas = (paras || []).slice(0, 8).join('\n');
+  if (isChallengeOrBlockedPayload(title || '', rawHtml || '', joinedParas)) return true;
+  const trimmedTitle = (title || '').trim();
+  if (
+    paras.length <= 6 &&
+    /^(?:error:\s*the request could not be satisfied|kesalahan:\s*permintaan (?:itu )?tidak dapat dipenuhi|403\s+(?:error|kesalahan|forbidden)|access denied)/i.test(
+      trimmedTitle
+    )
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function deriveKnownTocInfo(rawUrl: string): { tocUrl: string; isTocPage: boolean } | null {
@@ -1758,11 +1868,65 @@ function extractKakuyomuFromNextData(
           ? chapters[curIdx + 1].url
           : null,
       tocUrl: `https://kakuyomu.jp/works/${workId}`,
-      chapters: chapters.slice(0, 500),
+      chapters: chapters.slice(0, 1500),
     });
   } catch {
     return null;
   }
+}
+
+function extractKakuyomuEpisodeSidebar(
+  rawHtml: string,
+  workId: string,
+  currentEpId: string
+): NovelNavigation | null {
+  if (!rawHtml || !workId) return null;
+  const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+  const anchors = Array.from(doc.querySelectorAll(`a[href*="/works/${workId}/episodes/"]`));
+  if (anchors.length === 0) return null;
+  const seen = new Set<string>();
+  const chapters: NovelChapterLink[] = [];
+  for (const a of anchors) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(new RegExp(`/works/${workId}/episodes/(\\d+)`));
+    if (!m) continue;
+    const epId = m[1];
+    if (seen.has(epId)) continue;
+    seen.add(epId);
+    const clone = a.cloneNode(true) as Element;
+    clone.querySelectorAll('time, .widget-toc-episode-datePublished').forEach((el) => el.remove());
+    const label = decodeHtmlEntities((clone.textContent || '').replace(/\s+/g, ' ').trim())
+      .replace(/\s*\d{4}年\d{1,2}月\d{1,2}日.*$/, '')
+      .trim();
+    if (TOC_CTA_SKIP_RE.test(label)) continue;
+    chapters.push({
+      title: label || `Bab ${chapters.length + 1}`,
+      url: `https://kakuyomu.jp/works/${workId}/episodes/${epId}`,
+      ...(currentEpId && epId === currentEpId ? { current: true } : {}),
+    });
+  }
+  if (chapters.length === 0) return null;
+  const curIdx = currentEpId ? chapters.findIndex((c) => c.current) : -1;
+  const isTocPage = !currentEpId;
+  return sanitizeNovelNav({
+    isNovel: true,
+    isTocPage,
+    totalChapters: chapters.length,
+    ...(curIdx >= 0 ? { currentIndex: curIdx } : {}),
+    chapterLabel:
+      curIdx >= 0
+        ? `${curIdx + 1} / ${chapters.length}`
+        : `${chapters.length} bab`,
+    firstUrl: chapters[0]?.url || null,
+    prevUrl: curIdx > 0 ? chapters[curIdx - 1].url : null,
+    nextUrl: isTocPage
+      ? chapters[0]?.url || null
+      : curIdx >= 0 && curIdx + 1 < chapters.length
+        ? chapters[curIdx + 1].url
+        : null,
+    tocUrl: `https://kakuyomu.jp/works/${workId}`,
+    chapters: chapters.slice(0, 1500),
+  });
 }
 
 function extractRoyalRoadFromScriptData(rawHtml: string, cleanUrl: string): NovelNavigation | null {
@@ -1802,7 +1966,7 @@ function extractRoyalRoadFromScriptData(rawHtml: string, cleanUrl: string): Nove
           ? chapters[curIdx + 1].url
           : null,
       tocUrl: tocInfo?.tocUrl || null,
-      chapters: chapters.slice(0, 500),
+      chapters: chapters.slice(0, 1500),
     });
   } catch {
     return null;
@@ -1857,7 +2021,7 @@ function extractChaptersFromSelectDropdowns(doc: Document, cleanUrl: string): No
     }
 
     if (parsed.length >= 2 && (isExplicitChapSelect || parsed.length >= 4)) {
-      return parsed.slice(0, 500);
+      return parsed.slice(0, 1500);
     }
   }
   return [];
@@ -2069,7 +2233,7 @@ function buildChaptersFromSiblingLinks(
     }
   }
 
-  const capped = chapters.slice(0, 500);
+  const capped = chapters.slice(0, 1500);
   const curIdx = capped.findIndex((c) => c.current);
   const tocInfo = deriveKnownTocInfo(cleanUrl);
   const isToc = Boolean(tocInfo?.isTocPage) && curIdx < 0;
@@ -2541,7 +2705,8 @@ async function fetchViaJinaHtmlAndLinks(
     if (
       first &&
       !options?.noCache &&
-      isSuspiciousTrackerPayload(cleanUrl, first.title, first.finalUrl, first.html, first.content)
+      (isSuspiciousTrackerPayload(cleanUrl, first.title, first.finalUrl, first.html, first.content) ||
+        isChallengeOrBlockedPayload(first.title, first.html, first.content))
     ) {
       const fresh = await fetchViaJinaInternal(cleanUrl, {
         format: 'html',
@@ -2562,11 +2727,25 @@ async function fetchViaJinaRenderedMarkdown(
   options?: { noCache?: boolean; signal?: AbortSignal }
 ): Promise<JinaFetchResult | null> {
   try {
-    return await fetchViaJinaInternal(cleanUrl, {
+    const first = await fetchViaJinaInternal(cleanUrl, {
       format: 'markdown',
       noCache: Boolean(options?.noCache),
       signal: options?.signal,
     });
+    if (
+      first &&
+      !options?.noCache &&
+      (isSuspiciousTrackerPayload(cleanUrl, first.title, first.finalUrl, first.html, first.content) ||
+        isChallengeOrBlockedPayload(first.title, first.html, first.content))
+    ) {
+      const fresh = await fetchViaJinaInternal(cleanUrl, {
+        format: 'markdown',
+        noCache: true,
+        signal: options?.signal,
+      });
+      if (fresh) return fresh;
+    }
+    return first;
   } catch (err) {
     if ((err as { name?: string })?.name === 'AbortError') throw err;
     return null;
@@ -2656,9 +2835,9 @@ function extractCleanParagraphsFromHtml(doc: Document, titleHint = ''): string[]
       if (!s) continue;
       if (paras.length === 0 && normTitle && s.toLowerCase() === normTitle) continue;
       paras.push(s);
-      if (paras.length >= 220) break;
+      if (paras.length >= 600) break;
     }
-    if (paras.length >= 220) break;
+    if (paras.length >= 600) break;
   }
 
   if (paras.length >= 2) return paras;
@@ -2666,8 +2845,66 @@ function extractCleanParagraphsFromHtml(doc: Document, titleHint = ''): string[]
   // Fallback for <br>-separated prose inside a single container (e.g. Aozora Bunko .main_text, Hameln #honbun, Blogger)
   const brLines = extractNodeLinesPreservingBreaks(root)
     .filter((s, idx) => s.length >= 1 && !(idx === 0 && normTitle && s.toLowerCase() === normTitle))
-    .slice(0, 220);
+    .slice(0, 600);
   return brLines.length >= paras.length ? brLines : paras;
+}
+
+async function fetchKakuyomuEpisodeSidebarDirect(
+  workId: string,
+  sampleEpisodeUrl: string,
+  currentUrl: string,
+  signal?: AbortSignal
+): Promise<NovelNavigation | null> {
+  const epMatch = sampleEpisodeUrl.match(/kakuyomu\.jp\/works\/(\d+)\/episodes\/(\d+)/i);
+  if (!epMatch || epMatch[1] !== workId) return null;
+  const currentEpMatch = currentUrl.match(/kakuyomu\.jp\/works\/\d+\/episodes\/(\d+)/i);
+  const currentEpId = currentEpMatch ? currentEpMatch[1] : '';
+  const sidebarUrl = `https://kakuyomu.jp/works/${workId}/episodes/${epMatch[2]}/episode_sidebar`;
+
+  const jinaHtml = await fetchViaJinaHtmlAndLinks(sidebarUrl, { signal }).catch(() => null);
+  if (jinaHtml && !isChallengeOrBlockedPayload(jinaHtml.title, jinaHtml.html, jinaHtml.content)) {
+    if (jinaHtml.html) {
+      const parsed = extractKakuyomuEpisodeSidebar(jinaHtml.html, workId, currentEpId);
+      if (parsed && (parsed.chapters?.length || 0) >= 2) return parsed;
+    }
+    if (jinaHtml.links.length > 0 || jinaHtml.content) {
+      const mdNav = extractNovelNavigationFromMarkdown(
+        jinaHtml.content,
+        `https://kakuyomu.jp/works/${workId}`,
+        jinaHtml.links
+      );
+      if ((mdNav.chapters?.length || 0) >= 2) {
+        return applyChapterListToCurrentUrl(
+          {
+            seriesTitle: mdNav.seriesTitle,
+            tocUrl: `https://kakuyomu.jp/works/${workId}`,
+            chapters: mdNav.chapters || [],
+          },
+          currentUrl
+        );
+      }
+    }
+  }
+
+  const jinaMd = await fetchViaJinaRenderedMarkdown(sidebarUrl, { signal }).catch(() => null);
+  if (jinaMd && !isChallengeOrBlockedPayload(jinaMd.title, jinaMd.html, jinaMd.content)) {
+    const mdNav = extractNovelNavigationFromMarkdown(
+      jinaMd.content,
+      `https://kakuyomu.jp/works/${workId}`,
+      jinaMd.links
+    );
+    if ((mdNav.chapters?.length || 0) >= 2) {
+      return applyChapterListToCurrentUrl(
+        {
+          seriesTitle: mdNav.seriesTitle,
+          tocUrl: `https://kakuyomu.jp/works/${workId}`,
+          chapters: mdNav.chapters || [],
+        },
+        currentUrl
+      );
+    }
+  }
+  return null;
 }
 
 async function fetchSeriesTocDirect(
@@ -2677,29 +2914,41 @@ async function fetchSeriesTocDirect(
   const safeToc = toSafeHttpUrl(tocUrl);
   if (!safeToc) return null;
   const cacheKey = canonicalUrlKey(safeToc);
+  const kakuWorkMatch = safeToc.match(/kakuyomu\.jp\/works\/(\d+)\/?$/i);
+  const kakuWorkId = kakuWorkMatch ? kakuWorkMatch[1] : '';
+  const isTrustworthyToc = (rec?: { chapters?: NovelChapterLink[]; authoritative?: boolean } | null) => {
+    const len = rec?.chapters?.length || 0;
+    if (len < 2) return false;
+    // Kakuyomu work pages collapse DOM links at ~7 visible episodes; never trust a <=10 chapter cache unless authoritative (__NEXT_DATA__ / episode_sidebar)
+    if (kakuWorkId && len <= 10 && !rec?.authoritative) return false;
+    return true;
+  };
+
   const mem = seriesTocCache.get(cacheKey);
-  if (mem && mem.chapters.length >= 2) {
-    return applyChapterListToCurrentUrl(mem, currentUrl);
+  if (isTrustworthyToc(mem)) {
+    return applyChapterListToCurrentUrl(mem!, currentUrl);
   }
   const persistedToc = await idbGet<{
     seriesTitle?: string;
     tocUrl: string;
     chapters: NovelChapterLink[];
+    authoritative?: boolean;
   }>('tocs', `toc::${cacheKey}`, 12 * 60 * 60 * 1000);
-  if (persistedToc && Array.isArray(persistedToc.chapters) && persistedToc.chapters.length >= 2) {
-    seriesTocCache.set(cacheKey, persistedToc);
-    return applyChapterListToCurrentUrl(persistedToc, currentUrl);
+  if (isTrustworthyToc(persistedToc)) {
+    seriesTocCache.set(cacheKey, persistedToc!);
+    return applyChapterListToCurrentUrl(persistedToc!, currentUrl);
   }
   if (typeof window !== 'undefined') {
     try {
-      const saved = window.sessionStorage.getItem(`tranx_toc_v2::${cacheKey}`);
+      const saved = window.sessionStorage.getItem(`tranx_toc_v3::${cacheKey}`);
       if (saved) {
         const parsed = JSON.parse(saved) as {
           seriesTitle?: string;
           tocUrl: string;
           chapters: NovelChapterLink[];
+          authoritative?: boolean;
         };
-        if (Array.isArray(parsed.chapters) && parsed.chapters.length >= 2) {
+        if (isTrustworthyToc(parsed)) {
           seriesTocCache.set(cacheKey, parsed);
           void idbPut('tocs', `toc::${cacheKey}`, parsed);
           return applyChapterListToCurrentUrl(parsed, currentUrl);
@@ -2711,10 +2960,11 @@ async function fetchSeriesTocDirect(
   }
 
   const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), 14000);
+  const timer = window.setTimeout(() => ctrl.abort(), 22000);
   try {
     let bestNav: NovelNavigation | null = null;
     let fallbackTitle = '';
+    let authoritative = false;
 
     // Primary: Jina Reader HTML + Links Summary with X-No-Cache (fast CORS, includes Kakuyomu __NEXT_DATA__, Syosetu TOC, RoyalRoad window.chapters!)
     const jinaRes = await fetchViaJinaHtmlAndLinks(safeToc, {
@@ -2733,6 +2983,13 @@ async function fetchSeriesTocDirect(
       if (jinaRes.html) {
         const doc = new DOMParser().parseFromString(jinaRes.html, 'text/html');
         bestNav = extractNovelNavigationFromHtml(doc, jinaRes.html, safeToc, jinaRes.links);
+        if (
+          kakuWorkId &&
+          /__NEXT_DATA__/.test(jinaRes.html) &&
+          (bestNav.chapters?.length || 0) >= 2
+        ) {
+          authoritative = true;
+        }
       }
       if ((!bestNav || (bestNav.chapters?.length || 0) < 2) && (jinaRes.content || jinaRes.links.length > 0)) {
         const mdNav = extractNovelNavigationFromMarkdown(jinaRes.content, safeToc, jinaRes.links);
@@ -2742,9 +2999,29 @@ async function fetchSeriesTocDirect(
       }
     }
 
+    // Kakuyomu fast authoritative rescue: /episode_sidebar (37 KB, lists ALL 84-1500 episodes cleanly!)
+    if (kakuWorkId && (!authoritative || (bestNav?.chapters?.length || 0) <= 10)) {
+      const sampleEpUrl = /kakuyomu\.jp\/works\/\d+\/episodes\/\d+/i.test(currentUrl)
+        ? currentUrl
+        : bestNav?.chapters?.[0]?.url || '';
+      if (sampleEpUrl) {
+        const sidebarNav = await fetchKakuyomuEpisodeSidebarDirect(
+          kakuWorkId,
+          sampleEpUrl,
+          currentUrl,
+          ctrl.signal
+        ).catch(() => null);
+        if (sidebarNav && (sidebarNav.chapters?.length || 0) >= (bestNav?.chapters?.length || 0)) {
+          bestNav = mergeNovelNav(sidebarNav, bestNav);
+          authoritative = true;
+        }
+      }
+    }
+
     // Secondary: Jina Rendered Markdown + Links Summary when HTML TOC was empty/challenged/mojibake
     if (!bestNav || (bestNav.chapters?.length || 0) < 2) {
       const mdRes = await fetchViaJinaRenderedMarkdown(safeToc, {
+        noCache: true,
         signal: ctrl.signal,
       }).catch(() => null);
       if (mdRes && !isChallengeOrBlockedPayload(mdRes.title, mdRes.html, mdRes.content)) {
@@ -2758,16 +3035,30 @@ async function fetchSeriesTocDirect(
           bestNav = mdNav;
         }
       }
+      // If Markdown gave us Episode 1 on Kakuyomu (only 7 visible), expand to ALL episodes via /episode_sidebar!
+      if (kakuWorkId && !authoritative && bestNav?.chapters?.[0]?.url) {
+        const sidebarNav = await fetchKakuyomuEpisodeSidebarDirect(
+          kakuWorkId,
+          bestNav.chapters[0].url,
+          currentUrl,
+          ctrl.signal
+        ).catch(() => null);
+        if (sidebarNav && (sidebarNav.chapters?.length || 0) > (bestNav.chapters?.length || 0)) {
+          bestNav = mergeNovelNav(sidebarNav, bestNav);
+          authoritative = true;
+        }
+      }
     }
 
-    // Tertiary fallback: CORS HTML proxies if Jina didn't find >= 2 chapters
-    if (!bestNav || (bestNav.chapters?.length || 0) < 2) {
+    // Tertiary fallback: CORS HTML proxies if Jina didn't find >= 2 chapters (or Kakuyomu still partial!)
+    if (!bestNav || (bestNav.chapters?.length || 0) < 2 || (kakuWorkId && !authoritative && (bestNav.chapters?.length || 0) <= 10)) {
       const raw = await fetchRawHtmlViaCorsProxy(safeToc, ctrl.signal).catch(() => null);
       if (raw && !isChallengeOrBlockedPayload('', raw, '')) {
         const doc = new DOMParser().parseFromString(raw, 'text/html');
         const proxyNav = extractNovelNavigationFromHtml(doc, raw, safeToc);
         if ((proxyNav.chapters?.length || 0) > (bestNav?.chapters?.length || 0)) {
           bestNav = proxyNav;
+          if (kakuWorkId && /__NEXT_DATA__/.test(raw)) authoritative = true;
         }
       }
     }
@@ -2775,19 +3066,26 @@ async function fetchSeriesTocDirect(
     const bestChapters = bestNav?.chapters || [];
     if (bestChapters.length < 2) return null;
 
-    const seriesTitle = bestNav?.seriesTitle || fallbackTitle || undefined;
+    const rawSeriesTitle = bestNav?.seriesTitle || fallbackTitle || '';
+    const seriesTitle =
+      rawSeriesTitle && !isChallengeOrBlockedPayload(rawSeriesTitle, '', '')
+        ? rawSeriesTitle
+        : undefined;
     const tocRecord = {
       ...(seriesTitle ? { seriesTitle } : {}),
       tocUrl: safeToc,
       chapters: bestChapters,
+      authoritative: authoritative || !kakuWorkId || bestChapters.length > 10,
     };
-    seriesTocCache.set(cacheKey, tocRecord);
-    void idbPut('tocs', `toc::${cacheKey}`, tocRecord);
-    if (typeof window !== 'undefined') {
-      try {
-        window.sessionStorage.setItem(`tranx_toc_v2::${cacheKey}`, JSON.stringify(tocRecord));
-      } catch {
-        // ignore quota
+    if (tocRecord.authoritative) {
+      seriesTocCache.set(cacheKey, tocRecord);
+      void idbPut('tocs', `toc::${cacheKey}`, tocRecord);
+      if (typeof window !== 'undefined') {
+        try {
+          window.sessionStorage.setItem(`tranx_toc_v3::${cacheKey}`, JSON.stringify(tocRecord));
+        } catch {
+          // ignore quota
+        }
       }
     }
     return applyChapterListToCurrentUrl(tocRecord, currentUrl);
@@ -2807,6 +3105,7 @@ export async function translateChapterTitlesDirect(params: {
 }): Promise<Record<string, string>> {
   const { chapters, mode, titleId, tocKey, seriesTitle, signal, onProgress } = params;
   if (!chapters.length || isMockOnlyLocalE2E()) return {};
+  const { tgt } = parseModePair(mode);
   const cacheKey = `${tocKey}::${mode}`;
   let initialMap = translatedChapterTitlesCache.get(cacheKey);
   if (!initialMap) {
@@ -2828,13 +3127,26 @@ export async function translateChapterTitlesDirect(params: {
     if (!ch.url || seenUrls.has(ch.url)) continue;
     seenUrls.add(ch.url);
     uniqueChapters.push(ch);
+    // Self-heal any previously cached chapter title that was left untranslated in source script
+    if (map[ch.url] && isStillUntranslatedForTarget(ch.title, map[ch.url], tgt)) {
+      delete map[ch.url];
+    }
+  }
+  if (
+    map.__seriesTitle__ &&
+    (isChallengeOrBlockedPayload(map.__seriesTitle__, '', '') ||
+      (seriesTitle && isStillUntranslatedForTarget(seriesTitle, map.__seriesTitle__, tgt)))
+  ) {
+    delete map.__seriesTitle__;
   }
 
   const totalCount = uniqueChapters.length;
   const countTranslated = () =>
     uniqueChapters.reduce((acc, ch) => acc + (map[ch.url] ? 1 : 0), 0);
 
-  const needsSeries = Boolean(seriesTitle && seriesTitle.trim() && !map.__seriesTitle__);
+  const cleanSeriesTitle =
+    seriesTitle && !isChallengeOrBlockedPayload(seriesTitle, '', '') ? seriesTitle.trim() : '';
+  const needsSeries = Boolean(cleanSeriesTitle && !map.__seriesTitle__);
   if (countTranslated() >= totalCount && !needsSeries) {
     onProgress?.({ ...map }, totalCount, totalCount);
     return { ...map };
@@ -2869,47 +3181,82 @@ export async function translateChapterTitlesDirect(params: {
     enqueueRange(0, uniqueChapters.length);
   }
 
-  // Process ALL pending chapters in dense 70-chapter waves (1 paced wave at a time across adaptive 2-4 GTX workers -> 92 chapters = only 4 HTTP requests, zero 429 risk for 5-10 users!)
-  const WAVE_SIZE = 70;
+  // Process ALL pending chapters in truncation-safe 54-chapter waves (1 paced wave at a time across adaptive 2-4 GTX workers)
+  const WAVE_SIZE = 54;
   const waveSpecs: Array<{ chapters: NovelChapterLink[]; includeSeries: boolean }> = [];
   const waveCount = Math.max(1, Math.ceil(priorityOrdered.length / WAVE_SIZE));
   for (let w = 0; w < waveCount; w += 1) {
     const waveChapters = priorityOrdered.slice(w * WAVE_SIZE, (w + 1) * WAVE_SIZE);
-    const includeSeries = w === 0 && needsSeries && Boolean(seriesTitle?.trim());
+    const includeSeries = w === 0 && needsSeries && Boolean(cleanSeriesTitle);
     if (waveChapters.length === 0 && !includeSeries) break;
     waveSpecs.push({ chapters: waveChapters, includeSeries });
   }
 
-  await runConcurrentPool(waveSpecs, 1, async ({ chapters: waveChapters, includeSeries }) => {
-    if (signal?.aborted) return;
-    const inputs = includeSeries
-      ? [seriesTitle!.trim(), ...waveChapters.map((c) => c.title.trim())]
-      : waveChapters.map((c) => c.title.trim());
-
-    try {
-      const { outputs } = await translateParagraphsDirect({
-        paragraphs: inputs,
-        mode,
-        titleId,
-        signal,
-      });
+  const runWaves = async (
+    specs: Array<{ chapters: NovelChapterLink[]; includeSeries: boolean }>,
+    allowFallbackStore: boolean
+  ) => {
+    await runConcurrentPool(specs, 1, async ({ chapters: waveChapters, includeSeries }) => {
       if (signal?.aborted) return;
-      let offset = 0;
-      if (includeSeries) {
-        if (outputs[0]) map.__seriesTitle__ = outputs[0];
-        offset = 1;
+      const inputs = includeSeries
+        ? [cleanSeriesTitle, ...waveChapters.map((c) => c.title.trim())]
+        : waveChapters.map((c) => c.title.trim());
+
+      try {
+        const { outputs } = await translateParagraphsDirect({
+          paragraphs: inputs,
+          mode,
+          titleId,
+          signal,
+        });
+        if (signal?.aborted) return;
+        let offset = 0;
+        if (includeSeries) {
+          const outSeries = outputs[0];
+          if (
+            outSeries &&
+            (allowFallbackStore || !isStillUntranslatedForTarget(cleanSeriesTitle, outSeries, tgt))
+          ) {
+            map.__seriesTitle__ = outSeries;
+          }
+          offset = 1;
+        }
+        waveChapters.forEach((ch, idx) => {
+          const translated = outputs[idx + offset];
+          if (
+            translated &&
+            (allowFallbackStore || !isStillUntranslatedForTarget(ch.title, translated, tgt))
+          ) {
+            map[ch.url] = translated;
+          }
+        });
+        translatedChapterTitlesCache.set(cacheKey, { ...map });
+        onProgress?.({ ...map }, countTranslated(), totalCount);
+      } catch (err) {
+        if ((err as { name?: string })?.name === 'AbortError' || signal?.aborted) return;
+        // Continue remaining waves gracefully if a single wave fails transiently
       }
-      waveChapters.forEach((ch, idx) => {
-        const translated = outputs[idx + offset];
-        if (translated) map[ch.url] = translated;
-      });
-      translatedChapterTitlesCache.set(cacheKey, { ...map });
-      onProgress?.({ ...map }, countTranslated(), totalCount);
-    } catch (err) {
-      if ((err as { name?: string })?.name === 'AbortError' || signal?.aborted) return;
-      // Continue remaining waves gracefully if a single wave fails transiently
+    });
+  };
+
+  await runWaves(waveSpecs, false);
+
+  // Automatic mop-up pass: retry any chapter titles that remained untranslated in compact 12-item batches
+  if (!signal?.aborted) {
+    const remaining = uniqueChapters.filter((ch) => ch.title.trim() && !map[ch.url]);
+    const stillNeedsSeries = Boolean(cleanSeriesTitle && !map.__seriesTitle__);
+    if (remaining.length > 0 || stillNeedsSeries) {
+      const mopSpecs: Array<{ chapters: NovelChapterLink[]; includeSeries: boolean }> = [];
+      const mopWaves = Math.max(1, Math.ceil(remaining.length / 12));
+      for (let w = 0; w < mopWaves; w += 1) {
+        const slice = remaining.slice(w * 12, (w + 1) * 12);
+        const inc = w === 0 && stillNeedsSeries;
+        if (slice.length === 0 && !inc) break;
+        mopSpecs.push({ chapters: slice, includeSeries: inc });
+      }
+      await runWaves(mopSpecs, false);
     }
-  });
+  }
 
   if (Object.keys(map).length > 0) {
     void idbPut('tocs', `titles::${cacheKey}`, { ...map });
@@ -3081,7 +3428,7 @@ function cleanReaderMarkdownToParagraphs(md: string, titleHint = ''): string[] {
     }
   }
   flush();
-  return paras.slice(0, 200);
+  return paras.slice(0, 600);
 }
 
 async function fetchWebArticleDirect(
@@ -3090,6 +3437,11 @@ async function fetchWebArticleDirect(
 ): Promise<CachedWebEntry> {
   const cleanUrl = normalizeWebUrl(rawUrl);
   let cached = webArticleCache.get(cleanUrl);
+  if (cached && isBlockedArticleOrTranslation(cached.titleSrc, cached.srcParas, '')) {
+    webArticleCache.delete(cleanUrl);
+    void idbDelete('articles', `art::${cleanUrl}`);
+    cached = undefined;
+  }
   if (cached?.rawHtml && isChallengeOrBlockedPayload('', cached.rawHtml, '')) {
     cached = { ...cached, rawHtml: undefined, htmlFetchAttempted: true };
     webArticleCache.set(cleanUrl, cached);
@@ -3105,21 +3457,25 @@ async function fetchWebArticleDirect(
       6 * 60 * 60 * 1000
     );
     if (idbArticle && Array.isArray(idbArticle.srcParas) && idbArticle.srcParas.length > 0) {
-      // Self-heal any poisoned CloudFront/WAF 403 rawHtml stored from earlier sessions
-      const cleanRawHtml =
-        idbArticle.rawHtml && !isChallengeOrBlockedPayload('', idbArticle.rawHtml, '')
-          ? idbArticle.rawHtml
-          : undefined;
-      const sanitizedEntry: CachedWebEntry = {
-        ...idbArticle,
-        rawHtml: cleanRawHtml,
-        htmlFetchAttempted: true,
-      };
-      webArticleCache.set(cleanUrl, sanitizedEntry);
-      webArticleCache.set(sanitizedEntry.url, sanitizedEntry);
-      cached = sanitizedEntry;
-      if (!options?.needRawHtml || cached.rawHtml || cached.htmlFetchAttempted) {
-        return cached;
+      // Self-heal: completely purge any poisoned CloudFront/WAF 403 article stored in IndexedDB!
+      if (isBlockedArticleOrTranslation(idbArticle.titleSrc, idbArticle.srcParas, '')) {
+        void idbDelete('articles', `art::${cleanUrl}`);
+      } else {
+        const cleanRawHtml =
+          idbArticle.rawHtml && !isChallengeOrBlockedPayload('', idbArticle.rawHtml, '')
+            ? idbArticle.rawHtml
+            : undefined;
+        const sanitizedEntry: CachedWebEntry = {
+          ...idbArticle,
+          rawHtml: cleanRawHtml,
+          htmlFetchAttempted: true,
+        };
+        webArticleCache.set(cleanUrl, sanitizedEntry);
+        webArticleCache.set(sanitizedEntry.url, sanitizedEntry);
+        cached = sanitizedEntry;
+        if (!options?.needRawHtml || cached.rawHtml || cached.htmlFetchAttempted) {
+          return cached;
+        }
       }
     }
   }
@@ -3227,7 +3583,10 @@ async function fetchWebArticleDirectInner(
     const htmlYieldedPoorProse =
       srcParas.length < 2 && !(navFromHtml?.isTocPage && (navFromHtml.chapters?.length || 0) >= 2);
     if (htmlYieldedPoorProse) {
-      const mdRes = await fetchViaJinaRenderedMarkdown(cleanUrl, { signal: ctrl.signal });
+      const mdRes = await fetchViaJinaRenderedMarkdown(cleanUrl, {
+        noCache: hitAntiBotChallenge,
+        signal: ctrl.signal,
+      });
       if (mdRes) {
         if (isChallengeOrBlockedPayload(mdRes.title, mdRes.html, mdRes.content)) {
           hitAntiBotChallenge = true;
@@ -3298,9 +3657,13 @@ async function fetchWebArticleDirectInner(
       }
     }
 
-    // Never keep blocked CloudFront/Cloudflare/WAF HTML in rawHtml
+    // Never keep blocked CloudFront/Cloudflare/WAF HTML or error-page prose!
     if (rawHtml && isChallengeOrBlockedPayload('', rawHtml, '')) {
       rawHtml = '';
+    }
+    if (srcParas.length > 0 && isBlockedArticleOrTranslation(titleSrc, srcParas, '')) {
+      srcParas = [];
+      hitAntiBotChallenge = true;
     }
 
     if (srcParas.length === 0) {
@@ -3334,14 +3697,40 @@ async function fetchWebArticleDirectInner(
         mergedNav = mergeNovelNav(discoveredToc, mergedNav);
       }
     }
+    // Kakuyomu work TOC page rescue: if work page only exposed <= 10 collapsed DOM links (no __NEXT_DATA__),
+    // expand to ALL 84-1500 chapters via Episode 1's lightweight /episode_sidebar!
+    const kakuCurrentWork = finalUrl.match(/kakuyomu\.jp\/works\/(\d+)/i);
+    if (
+      kakuCurrentWork &&
+      (mergedNav.chapters?.length || 0) <= 10 &&
+      !/__NEXT_DATA__/.test(rawHtml)
+    ) {
+      const sampleEpUrl = /kakuyomu\.jp\/works\/\d+\/episodes\/\d+/i.test(finalUrl)
+        ? finalUrl
+        : mergedNav.chapters?.[0]?.url || '';
+      if (sampleEpUrl) {
+        const expanded = await fetchKakuyomuEpisodeSidebarDirect(
+          kakuCurrentWork[1],
+          sampleEpUrl,
+          finalUrl,
+          ctrl.signal
+        ).catch(() => null);
+        if (expanded && (expanded.chapters?.length || 0) > (mergedNav.chapters?.length || 0)) {
+          mergedNav = mergeNovelNav(expanded, mergedNav);
+        }
+      }
+    }
     // If current page itself IS a TOC page with chapters, store it in seriesTocCache for instant chapter navigation
     if (mergedNav.chapters && mergedNav.chapters.length >= 2 && mergedNav.tocUrl) {
       const tocKey = canonicalUrlKey(mergedNav.tocUrl);
-      if (!seriesTocCache.has(tocKey)) {
+      const isAuthoritative =
+        !kakuCurrentWork || /__NEXT_DATA__/.test(rawHtml) || mergedNav.chapters.length > 10;
+      if (isAuthoritative && !seriesTocCache.has(tocKey)) {
         seriesTocCache.set(tocKey, {
           ...(mergedNav.seriesTitle ? { seriesTitle: mergedNav.seriesTitle } : {}),
           tocUrl: mergedNav.tocUrl,
           chapters: mergedNav.chapters,
+          authoritative: true,
         });
       }
     }
@@ -3424,7 +3813,7 @@ export function prefetchNextChapterTranslatedDirect(
         const article = await fetchWebArticleDirect(safe, { needRawHtml: view === 'site' });
         const articleCacheKey = `${article.url}::${mode}`;
         let heading = article.titleSrc;
-        let paras = article.srcParas.slice(0, 180);
+        let paras = article.srcParas.slice(0, 600);
         const existingTr = translatedWebCache.get(articleCacheKey);
         if (existingTr) {
           heading = existingTr.heading;
@@ -3821,7 +4210,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
       'RT',
       'RP',
     ]);
-    const MAX_SITE_NODES = 360;
+    const MAX_SITE_NODES = 900;
     const textNodes: Text[] = [];
     const seenTextNodes = new Set<Text>();
     let totalRawTextChars = 0;
@@ -4030,7 +4419,8 @@ export async function directFetchWebReaderBundle(params: {
     signal: params.signal,
   });
   const tid = params.titleId || article.titleId;
-  const cappedSrc = article.srcParas.slice(0, 180);
+  const cappedSrc = article.srcParas.slice(0, 600);
+  const { tgt } = parseModePair(params.mode);
 
   let titleDst = article.titleSrc;
   let translatedParas = cappedSrc;
@@ -4039,6 +4429,13 @@ export async function directFetchWebReaderBundle(params: {
     const cacheKey1 = `${article.url}::${params.mode}`;
     const cacheKey2 = `${normalizeWebUrl(params.url)}::${params.mode}`;
     let preTranslated = translatedWebCache.get(cacheKey1) || translatedWebCache.get(cacheKey2);
+    if (preTranslated && isBlockedArticleOrTranslation(preTranslated.heading, preTranslated.paras)) {
+      translatedWebCache.delete(cacheKey1);
+      translatedWebCache.delete(cacheKey2);
+      void idbDelete('articles', `tr::${cacheKey1}`);
+      void idbDelete('articles', `tr::${cacheKey2}`);
+      preTranslated = undefined;
+    }
     if (!preTranslated) {
       const idbTr =
         (await idbGet<{ heading: string; paras: string[] }>(
@@ -4053,10 +4450,18 @@ export async function directFetchWebReaderBundle(params: {
               12 * 60 * 60 * 1000
             )
           : undefined);
-      if (idbTr && Array.isArray(idbTr.paras) && idbTr.paras.length >= cappedSrc.length) {
-        preTranslated = idbTr;
-        translatedWebCache.set(cacheKey1, idbTr);
-        translatedWebCache.set(cacheKey2, idbTr);
+      if (idbTr && isBlockedArticleOrTranslation(idbTr.heading, idbTr.paras)) {
+        void idbDelete('articles', `tr::${cacheKey1}`);
+        void idbDelete('articles', `tr::${cacheKey2}`);
+      } else if (idbTr && Array.isArray(idbTr.paras) && idbTr.paras.length >= cappedSrc.length) {
+        const hasUntranslated = cappedSrc.some((s, i) =>
+          isStillUntranslatedForTarget(s, idbTr.paras[i] || '', tgt)
+        );
+        if (!hasUntranslated) {
+          preTranslated = idbTr;
+          translatedWebCache.set(cacheKey1, idbTr);
+          translatedWebCache.set(cacheKey2, idbTr);
+        }
       }
     }
     if (preTranslated) {
@@ -4115,9 +4520,14 @@ export async function directFetchWebReaderBundle(params: {
       titleDst = outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
       translatedParas = outputs.slice(1).map((s) => s.replace(/^#{1,6}\s+/, ''));
       const savedTr = { heading: titleDst, paras: translatedParas };
-      translatedWebCache.set(cacheKey1, savedTr);
-      translatedWebCache.set(cacheKey2, savedTr);
-      void idbPut('articles', `tr::${cacheKey1}`, savedTr);
+      const allClean =
+        !isBlockedArticleOrTranslation(titleDst, translatedParas) &&
+        !cappedSrc.some((s, i) => isStillUntranslatedForTarget(s, translatedParas[i] || '', tgt));
+      if (allClean) {
+        translatedWebCache.set(cacheKey1, savedTr);
+        translatedWebCache.set(cacheKey2, savedTr);
+        void idbPut('articles', `tr::${cacheKey1}`, savedTr);
+      }
     }
   }
 

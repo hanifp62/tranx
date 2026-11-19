@@ -4,7 +4,8 @@
  */
 
 const DB_NAME = 'tranx_perf_cache_v1';
-const DB_VERSION = 1;
+// v2 clears stale pre-Pass-14 entries (CloudFront 403 error payloads, partial 7-ch TOCs, untranslated fallbacks)
+const DB_VERSION = 2;
 
 export type PerfStoreName = 'paras' | 'articles' | 'tocs';
 
@@ -31,12 +32,19 @@ function openPerfDb(): Promise<IDBDatabase | null> {
   dbPromise = new Promise<IDBDatabase | null>((resolve) => {
     try {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
+      req.onupgradeneeded = (ev) => {
         const db = req.result;
+        const oldVersion = ev.oldVersion || 0;
         (['paras', 'articles', 'tocs'] as PerfStoreName[]).forEach((name) => {
           if (!db.objectStoreNames.contains(name)) {
             const store = db.createObjectStore(name, { keyPath: 'k' });
             store.createIndex('t', 't', { unique: false });
+          } else if (oldVersion > 0 && oldVersion < 2) {
+            try {
+              req.transaction?.objectStore(name).clear();
+            } catch {
+              // ignore clear errors during schema upgrade
+            }
           }
         });
       };
@@ -113,6 +121,17 @@ export async function idbGet<T>(
       resolve(undefined);
     }
   });
+}
+
+export async function idbDelete(storeName: PerfStoreName, key: string): Promise<void> {
+  const db = await openPerfDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).delete(key);
+  } catch {
+    // Ignore delete failures
+  }
 }
 
 export async function idbPut<T>(

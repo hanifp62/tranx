@@ -1967,4 +1967,257 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     });
     await expect(headerInstallBtn).toBeVisible();
   });
+
+  test('Pass-14 Regression: Self-heal poisoned 403 IndexedDB cache, Kakuyomu 7->84 episode_sidebar expansion, mutated GTX markers & untranslated mop-up retry', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.route('**/v1/healthz', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
+
+    const workId = '2912051604668493030';
+    const ep1Url = `https://kakuyomu.jp/works/${workId}/episodes/1001`;
+    const workUrl = `https://kakuyomu.jp/works/${workId}`;
+    const totalEps = 84;
+
+    // 1. Pre-seed poisoned IndexedDB cache (403 ERROR article + 403 KESALAHAN translation + partial 7-chapter TOC)
+    await page.goto('/?e2e=1&direct=1');
+    await page.evaluate(
+      async ({ epUrl, tocUrl }) => {
+        await new Promise<void>((resolve, reject) => {
+          const req = indexedDB.open('tranx_perf_cache_v1', 2);
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            ['paras', 'articles', 'tocs'].forEach((n) => {
+              if (!db.objectStoreNames.contains(n)) {
+                const s = db.createObjectStore(n, { keyPath: 'k' });
+                s.createIndex('t', 't', { unique: false });
+              }
+            });
+          };
+          req.onsuccess = () => {
+            const db = req.result;
+            const tx = db.transaction(['articles', 'tocs'], 'readwrite');
+            const now = Date.now();
+            tx.objectStore('articles').put({
+              k: `art::${epUrl}`,
+              t: now,
+              v: {
+                url: epUrl,
+                host: 'kakuyomu.jp',
+                titleId: 't_novel_kakuyomu_2912051604668493030',
+                titleSrc: 'ERROR: The request could not be satisfied',
+                srcParas: ['403 ERROR', 'The request could not be satisfied.'],
+                detectedSource: 'en',
+                novelNav: { isNovel: true, tocUrl, totalChapters: 7 },
+                htmlFetchAttempted: true,
+              },
+            });
+            tx.objectStore('articles').put({
+              k: `tr::${epUrl}::auto-id`,
+              t: now,
+              v: {
+                heading: 'KESALAHAN: Permintaan tidak dapat dipenuhi',
+                paras: ['403 KESALAHAN', 'Permintaan itu tidak dapat dipenuhi.'],
+              },
+            });
+            tx.objectStore('tocs').put({
+              k: `toc::${tocUrl}`,
+              t: now,
+              v: {
+                seriesTitle: 'ERROR: The request could not be satisfied',
+                tocUrl,
+                chapters: Array.from({ length: 7 }, (_, i) => ({
+                  title: `第${i + 1}話 仮タイトル`,
+                  url: `https://kakuyomu.jp/works/2912051604668493030/episodes/${1001 + i}`,
+                })),
+              },
+            });
+            tx.oncomplete = () => {
+              db.close();
+              resolve();
+            };
+            tx.onerror = () => reject(tx.error);
+          };
+          req.onerror = () => reject(req.error);
+        });
+      },
+      { epUrl: ep1Url, tocUrl: workUrl }
+    );
+
+    // 2. Mock Jina: cached ep1 returns CloudFront 403, X-No-Cache retry returns real prose; work page returns ONLY 7 links (no __NEXT_DATA__); /episode_sidebar returns ALL 84 episodes!
+    let ep1NoCacheRetries = 0;
+    let sidebarFetches = 0;
+    await page.route('https://r.jina.ai/**', async (route) => {
+      const reqUrl = route.request().url();
+      const hdrs = route.request().headers();
+      const hasNoCache = hdrs['x-no-cache'] === 'true';
+
+      if (reqUrl.includes('/episode_sidebar')) {
+        sidebarFetches += 1;
+        const sidebarItems = Array.from({ length: totalEps }, (_, i) => {
+          const n = i + 1;
+          return `<li><a href="/works/${workId}/episodes/${1000 + n}"><span>第${n}話 放課後の約束</span><time>2026年7月24日</time></a></li>`;
+        }).join('');
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: '',
+              url: `${ep1Url}/episode_sidebar`,
+              finalUrl: `${ep1Url}/episode_sidebar`,
+              html: `<!doctype html><html><body><ol>${sidebarItems}</ol></body></html>`,
+            },
+          }),
+        });
+        return;
+      }
+
+      if (reqUrl.includes(`/episodes/1001`)) {
+        if (!hasNoCache) {
+          await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            headers: { 'Access-Control-Allow-Origin': '*' },
+            body: JSON.stringify({
+              code: 200,
+              data: {
+                title: 'ERROR: The request could not be satisfied',
+                url: ep1Url,
+                finalUrl: ep1Url,
+                html: '<!doctype html><html><head><title>ERROR: The request could not be satisfied</title></head><body><h1>403 ERROR</h1><h2>The request could not be satisfied.</h2><p>Generated by cloudfront (CloudFront)</p></body></html>',
+              },
+            }),
+          });
+          return;
+        }
+        ep1NoCacheRetries += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: '第1話 学校を休む最高の方法 - 放課後の嘘告物語 - カクヨム',
+              url: ep1Url,
+              finalUrl: ep1Url,
+              html: `<!doctype html><html lang="ja"><head><title>第1話 学校を休む最高の方法</title></head><body><main><h1 class="widget-episodeTitle">第1話 学校を休む最高の方法</h1><div class="widget-episodeBody"><p>朝の光が静かな教室の窓を照らしていた。</p><p>彼は机の上の手紙をそっと開いた。</p></div></main></body></html>`,
+            },
+          }),
+        });
+        return;
+      }
+
+      // Collapsed Kakuyomu work page: ONLY 7 visible links & NO __NEXT_DATA__!
+      const sevenLinksHtml = Array.from(
+        { length: 7 },
+        (_, i) =>
+          `<a href="/works/${workId}/episodes/${1001 + i}">第${i + 1}話 放課後の約束</a>`
+      ).join('');
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({
+          code: 200,
+          data: {
+            title: '放課後の嘘告物語 - カクヨム',
+            url: workUrl,
+            finalUrl: workUrl,
+            html: `<!doctype html><html><head><title>放課後の嘘告物語 - カクヨム</title></head><body><h1>放課後の嘘告物語</h1><div>${sevenLinksHtml}</div></body></html>`,
+          },
+        }),
+      });
+    });
+
+    // 3. Mock GTX with real-world chaos: fullwidth mutated markers (【#2】, [#5]) + 1st attempt leaves 第42話 untranslated to prove mop-up retry!
+    let ep42DroppedOnce = false;
+    await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const reqUrl = new URL(route.request().url());
+      const q = postParams.get('q') || reqUrl.searchParams.get('q') || '';
+      const lines = q.split('\n');
+      const translatedLines = lines.map((line, idx) => {
+        // Simulate first-pass untranslated glitch on Episode 42
+        if (line.includes('第42話') && !ep42DroppedOnce) {
+          ep42DroppedOnce = true;
+          return line;
+        }
+        let out = line
+          .replace(/第(\d+)話\s*放課後の約束/g, 'Bab $1: Janji Sepulang Sekolah')
+          .replace(/第1話\s*学校を休む最高の方法/g, 'Bab 1: Cara Terbaik Istirahat dari Sekolah')
+          .replace(/放課後の嘘告物語/g, 'Kisah Pengakuan Bohong Sepulang Sekolah')
+          .replace(
+            /朝の光が静かな教室の窓を照らしていた。?/g,
+            'Cahaya pagi menyinari jendela ruang kelas yang tenang.'
+          )
+          .replace(
+            /彼は机の上の手紙をそっと開いた。?/g,
+            'Ia membuka surat di atas meja dengan perlahan.'
+          );
+        // Simulate Google Translate mutating marker brackets into fullwidth 【#k】 / [#k]
+        if (idx === 2) out = out.replace(/\[\[#(\d+)\]\]/, '【#$1】');
+        if (idx === 5) out = out.replace(/\[\[#(\d+)\]\]/, '[#$1]');
+        return out;
+      });
+      const segments = translatedLines.map((t, idx) => [
+        idx < translatedLines.length - 1 ? `${t}\n` : t,
+        lines[idx] || '',
+      ]);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([segments, null, 'ja']),
+      });
+    });
+
+    // 4. Open Episode 1 in Site view directly on mobile 390px -> must self-heal 403, expand 7->84 via episode_sidebar, & translate 100%!
+    await page.goto(
+      `/web?e2e=1&direct=1&url=${encodeURIComponent(ep1Url)}&mode=auto-id&view=site`
+    );
+
+    // Dock must show 1 / 84 (NOT 1 / 7!)
+    await expect(page.locator('.novel-chapter-dock')).toContainText('1 / 84', { timeout: 15000 });
+    expect(ep1NoCacheRetries).toBeGreaterThanOrEqual(1);
+    expect(sidebarFetches).toBeGreaterThanOrEqual(1);
+
+    // Site iframe must show REAL translated prose and ZERO 403 KESALAHAN!
+    const siteFrame = page.frameLocator('iframe[title="Pembaca Halaman Terjemahan"]');
+    await expect(siteFrame.locator('body')).toContainText('Cara Terbaik Istirahat dari Sekolah');
+    await expect(siteFrame.locator('body')).toContainText(
+      'Cahaya pagi menyinari jendela ruang kelas yang tenang.'
+    );
+    await expect(siteFrame.locator('body')).not.toContainText('403 KESALAHAN');
+    await expect(siteFrame.locator('body')).not.toContainText('Permintaan itu tidak dapat dipenuhi');
+
+    // Open Chapter Modal -> must show ALL 84 chapters, ZERO error title, and 100% Indonesian including #1, #42 (retried!), and #84!
+    await page.locator('.novel-chapter-dock').getByRole('button', { name: /Daftar bab/ }).click();
+    const dlg = page.getByRole('dialog');
+    await expect(dlg).toBeVisible();
+    await expect(dlg).toContainText('(84)');
+    await expect(dlg).not.toContainText('KESALAHAN');
+    await expect(dlg.getByRole('button', { name: /Bab 1: Janji Sepulang Sekolah/ })).toBeVisible({
+      timeout: 15000,
+    });
+    await expect(dlg.getByRole('button', { name: /Bab 42: Janji Sepulang Sekolah/ })).toBeVisible({
+      timeout: 15000,
+    });
+    await expect(dlg.getByRole('button', { name: /Bab 84: Janji Sepulang Sekolah/ })).toBeVisible({
+      timeout: 15000,
+    });
+    // Zero untranslated Japanese chapter titles across ALL 84 rows!
+    const remainingJpChapters = await dlg
+      .locator('.chapter-list-item')
+      .evaluateAll((els) => els.filter((el) => /[\u3040-\u30ff\u3400-\u9fff]/.test(el.textContent || '')).length);
+    expect(remainingJpChapters).toBe(0);
+    await page.screenshot({
+      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_kakuyomu_84ch_rescue_390.png',
+    });
+  });
 });

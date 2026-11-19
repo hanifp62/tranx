@@ -151,6 +151,7 @@ export interface UiStrings {
   loadingNextChapter: string;
   noChaptersFound: string;
   openTocSite: string;
+  currentChapterBadge: string;
   resumeReadingChapter: string;
   streamingProgressLabel: string;
   installAppMenu: string;
@@ -325,6 +326,7 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     loadingNextChapter: 'Memuat bab berikutnya...',
     noChaptersFound: 'Daftar bab belum tersedia pada halaman ini. Gunakan tombol Bab sebelumnya / Bab berikutnya.',
     openTocSite: 'Buka halaman daftar isi (terjemahan)',
+    currentChapterBadge: 'Aktif',
     resumeReadingChapter: 'Lanjutkan baca',
     streamingProgressLabel: 'Menerjemahkan',
     installAppMenu: 'Pasang aplikasi',
@@ -497,6 +499,7 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     loadingNextChapter: 'Loading next chapter...',
     noChaptersFound: 'Chapter list was not embedded on this page. Use Previous / Next chapter controls.',
     openTocSite: 'Open translated table of contents',
+    currentChapterBadge: 'Current',
     resumeReadingChapter: 'Resume reading',
     streamingProgressLabel: 'Translating',
     installAppMenu: 'Install app',

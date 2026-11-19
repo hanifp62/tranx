@@ -818,7 +818,15 @@ export function TranslatedWebViewer({
     chapterTranslateProgress && chapterTranslateProgress.done < chapterTranslateProgress.total
   );
 
-  // Auto-translate 100% of ALL chapter titles + seriesTitle strictly matching the active target mode
+  // Auto-translate 100% of ALL chapter titles + seriesTitle strictly matching the active target mode.
+  // Keyed by stable TOC signature (not `url` or `view='reader'|'site'`) so switching Ebook <-> Site or
+  // streaming paragraphs NEVER aborts in-flight chapter translation mid-wave!
+  const isOriginalView = view === 'original';
+  const chapterListCount = nav?.chapters?.length || 0;
+  const chapterListRef = useRef(nav?.chapters);
+  chapterListRef.current = nav?.chapters;
+  const chapterBatchSig = `${chapterModeKey}::${chapterListCount}::${nav?.seriesTitle || ''}`;
+
   useEffect(() => {
     const isMockOnlyE2E =
       typeof window !== 'undefined' &&
@@ -827,20 +835,21 @@ export function TranslatedWebViewer({
         window.sessionStorage.getItem('tranx_e2e') === '1') &&
       new URLSearchParams(window.location.search).get('direct') !== '1' &&
       window.sessionStorage.getItem('tranx_e2e_direct') !== '1';
-    if (!nav?.chapters || nav.chapters.length === 0 || view === 'original' || isMockOnlyE2E) {
+    const currentChapters = chapterListRef.current;
+    if (!currentChapters || currentChapters.length === 0 || isOriginalView || isMockOnlyE2E) {
       setChapterTranslateProgress(null);
       return;
     }
     let active = true;
     const ctrl = new AbortController();
-    const total = nav.chapters.length;
+    const total = currentChapters.length;
     setChapterTranslateProgress({ done: 0, total });
     translateChapterTitlesDirect({
-      chapters: nav.chapters,
+      chapters: currentChapters,
       mode,
       titleId: effectiveTitleId,
-      tocKey: nav.tocUrl || url,
-      seriesTitle: nav.seriesTitle,
+      tocKey: nav?.tocUrl || url,
+      seriesTitle: nav?.seriesTitle,
       signal: ctrl.signal,
       onProgress: (partialMap, doneCount, totalCount) => {
         if (!active) return;
@@ -869,12 +878,18 @@ export function TranslatedWebViewer({
       active = false;
       ctrl.abort();
     };
-  }, [nav?.chapters, nav?.tocUrl, nav?.seriesTitle, mode, effectiveTitleId, url, view, chapterModeKey]);
+  }, [chapterBatchSig, mode, effectiveTitleId, isOriginalView, chapterModeKey]);
 
-  const displaySeriesTitle =
+  const rawDisplaySeriesTitle =
     view === 'original'
       ? nav?.seriesTitle || ''
       : translatedTitles.__seriesTitle__ || nav?.seriesTitle || '';
+  const displaySeriesTitle =
+    /^(?:error:|kesalahan:|403\s+(?:error|kesalahan|forbidden)|the request could not be satisfied|permintaan (?:itu )?tidak dapat dipenuhi)/i.test(
+      rawDisplaySeriesTitle.trim()
+    )
+      ? ''
+      : rawDisplaySeriesTitle;
 
   const openChapterUrl = (
     targetUrl: string,
@@ -1673,7 +1688,9 @@ export function TranslatedWebViewer({
                           ? ch.title
                           : translatedTitles[ch.url] || ch.titleDst || ch.title}
                       </span>
-                      {ch.current && <span className="status-badge done">Aktif</span>}
+                      {ch.current && (
+                        <span className="status-badge done">{strings.currentChapterBadge}</span>
+                      )}
                     </button>
                   ))}
                 </div>
