@@ -485,6 +485,13 @@ a.sheet-row-btn {
 
 .install-app-icon-btn {
   color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+}
+
+.install-app-icon-btn:hover {
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 /* Centered Empty Composition vs Active Stream Composition */

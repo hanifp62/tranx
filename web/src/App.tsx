@@ -2014,6 +2014,18 @@ export function App() {
             <IconDots size={18} />
             <span>{strings.sidebarMore}</span>
           </button>
+
+          {isMobile && !pwaState.isInstalled && (
+            <button
+              type="button"
+              className="sidebar-nav-btn pressable"
+              style={{ color: 'var(--accent)', fontWeight: 600 }}
+              onClick={handleInstallAppClick}
+            >
+              <IconDownload size={18} />
+              <span>{strings.installAppMenu}</span>
+            </button>
+          )}
         </div>
 
         {searchOpen && (
@@ -3875,6 +3887,11 @@ export function App() {
                 <ol style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '15px' }}>
                   <li>{strings.installGuideIosStep1}</li>
                   <li>{strings.installGuideIosStep2}</li>
+                </ol>
+              ) : pwaState.isAndroid ? (
+                <ol style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '15px' }}>
+                  <li>{strings.installGuideAndroidStep1}</li>
+                  <li>{strings.installGuideAndroidStep2}</li>
                 </ol>
               ) : pwaState.isMacSafari ? (
                 <p style={{ margin: 0, fontSize: '15px' }}>{strings.installGuideMacSafariStep1}</p>

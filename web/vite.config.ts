@@ -36,6 +36,10 @@ export default defineConfig({
             platform: 'webapp',
             url: 'https://tranx-hanif-id.web.app/manifest.webmanifest',
           },
+          {
+            platform: 'webapp',
+            url: 'https://tranx-hanif-id.firebaseapp.com/manifest.webmanifest',
+          },
         ],
         icons: [
           {

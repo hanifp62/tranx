@@ -163,6 +163,8 @@ export interface UiStrings {
   installGuideTitle: string;
   installGuideIosStep1: string;
   installGuideIosStep2: string;
+  installGuideAndroidStep1: string;
+  installGuideAndroidStep2: string;
   installGuideMacSafariStep1: string;
   installGuideDesktopStep1: string;
   installGuideDesktopStep2: string;
@@ -338,6 +340,8 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     installGuideTitle: 'Cara memasang aplikasi tranX',
     installGuideIosStep1: 'Ketuk tombol Bagikan (ikon kotak dengan panah ke atas) di bilah bawah Safari.',
     installGuideIosStep2: 'Pilih "Tambah ke Layar Utama", lalu ketuk "Tambah".',
+    installGuideAndroidStep1: 'Ketuk menu titik tiga (⋮) di pojok kanan atas Chrome / browser Android Anda.',
+    installGuideAndroidStep2: 'Pilih "Instal aplikasi" atau "Tambahkan ke layar utama", lalu ketuk "Instal" (berfungsi langsung bahkan setelah uninstall).',
     installGuideMacSafariStep1: 'Di Safari macOS, buka menu File lalu pilih "Tambahkan ke Dock" untuk memasang tranX sebagai aplikasi penuh.',
     installGuideDesktopStep1: 'Klik ikon "Pasang tranX" di sisi kanan bilah alamat browser (Chrome / Edge / Brave), atau buka menu titik tiga browser lalu pilih "Pasang aplikasi".',
     installGuideDesktopStep2: 'Konfirmasi "Pasang" agar tranX muncul sebagai aplikasi mandiri di desktop atau layar utama HP Anda.',
@@ -511,6 +515,8 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     installGuideTitle: 'How to install tranX',
     installGuideIosStep1: 'Tap the Share button (square with upward arrow) in Safari.',
     installGuideIosStep2: 'Select "Add to Home Screen", then tap "Add".',
+    installGuideAndroidStep1: 'Tap the three-dot menu (⋮) in the top-right corner of Chrome or your Android browser.',
+    installGuideAndroidStep2: 'Choose "Install app" or "Add to Home screen", then tap "Install" (works immediately even right after uninstalling).',
     installGuideMacSafariStep1: 'In macOS Safari, open the File menu and choose "Add to Dock" to install tranX as a standalone app.',
     installGuideDesktopStep1: 'Click the Install icon on the right side of the address bar (Chrome / Edge / Brave), or open the browser menu and select "Install app".',
     installGuideDesktopStep2: 'Confirm "Install" to add tranX as a full standalone app on your desktop or home screen.',

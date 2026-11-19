@@ -1867,10 +1867,15 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(dialog.locator('.chapter-list-item').nth(59)).toContainText('Bab 60: Catatan Akademi');
     await expect(dialog.locator('.chapter-list-item').nth(91)).toContainText('Bab 92: Catatan Akademi');
     // Verify ZERO untranslated Japanese chapter titles remain across ALL 92 items!
-    const remainingJaInId = await dialog
-      .locator('.chapter-list-item')
-      .evaluateAll((els) => els.filter((el) => /第\d+話/.test(el.textContent || '')).length);
-    expect(remainingJaInId).toBe(0);
+    await expect
+      .poll(
+        () =>
+          dialog
+            .locator('.chapter-list-item')
+            .evaluateAll((els) => els.filter((el) => /第\d+話/.test(el.textContent || '')).length),
+        { timeout: 15000 }
+      )
+      .toBe(0);
     await dialog.getByRole('button', { name: 'Tutup' }).click();
 
     // 2. Switch target mode to auto-en -> ALL 92 chapters + seriesTitle immediately re-translate to English (ZERO stale Indonesian!)
@@ -1881,10 +1886,15 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(dialog.locator('.chapter-list-item').nth(0)).toContainText('Chapter 1: Academy Diary');
     await expect(dialog.locator('.chapter-list-item').nth(59)).toContainText('Chapter 60: Academy Diary');
     await expect(dialog.locator('.chapter-list-item').nth(91)).toContainText('Chapter 92: Academy Diary');
-    const staleIdInEn = await dialog
-      .locator('.chapter-list-item')
-      .evaluateAll((els) => els.filter((el) => /Bab \d+:/.test(el.textContent || '')).length);
-    expect(staleIdInEn).toBe(0);
+    await expect
+      .poll(
+        () =>
+          dialog
+            .locator('.chapter-list-item')
+            .evaluateAll((els) => els.filter((el) => /Bab \d+:/.test(el.textContent || '')).length),
+        { timeout: 15000 }
+      )
+      .toBe(0);
     await dialog.getByRole('button', { name: 'Tutup' }).click();
 
     // 3. Verify complete standalone PWA Manifest + icons + screenshots served by production build!
@@ -1966,6 +1976,51 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       window.dispatchEvent(ev);
     });
     await expect(headerInstallBtn).toBeVisible();
+
+    // 5. Verify mobile 390px reinstall recovery: stale legacy v1 installed flag is auto-cleared, and OS getInstalledRelatedApps()=[] restores BOTH mobile header & hamburger drawer install buttons!
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.evaluate(() => {
+      window.localStorage.setItem('tranx_pwa_installed_device_v1', '1');
+      window.localStorage.setItem(
+        'tranx_pwa_installed_v2',
+        JSON.stringify({ installedAt: Date.now() - 60_000 })
+      );
+      (window as unknown as { __tranxMockRelatedApps?: boolean }).__tranxMockRelatedApps = true;
+      Object.defineProperty(navigator, 'getInstalledRelatedApps', {
+        configurable: true,
+        value: async () => [],
+      });
+    });
+    await page.reload();
+    await page.evaluate(() => {
+      (window as unknown as { __tranxMockRelatedApps?: boolean }).__tranxMockRelatedApps = true;
+      Object.defineProperty(navigator, 'getInstalledRelatedApps', {
+        configurable: true,
+        value: async () => [],
+      });
+      window.dispatchEvent(new Event('focus'));
+    });
+    const mobileHeaderInstall = page
+      .locator('.stage-header')
+      .getByRole('button', { name: 'Pasang aplikasi' });
+    await expect(mobileHeaderInstall).toBeVisible();
+    const legacyRemoved = await page.evaluate(
+      () => window.localStorage.getItem('tranx_pwa_installed_device_v1') === null
+    );
+    expect(legacyRemoved).toBe(true);
+    // Open mobile hamburger drawer -> labeled "Pasang aplikasi" button is clearly visible too!
+    await page.getByRole('button', { name: 'Menu', exact: true }).click();
+    await expect(page.locator('aside.sidebar').getByRole('button', { name: 'Pasang aplikasi' })).toBeVisible();
+    // Simulate OS confirming installed again -> BOTH buttons disappear immediately on focus!
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, 'getInstalledRelatedApps', {
+        configurable: true,
+        value: async () => [{ platform: 'webapp', url: 'https://tranx-hanif-id.web.app/manifest.webmanifest' }],
+      });
+      window.dispatchEvent(new Event('focus'));
+    });
+    await expect(mobileHeaderInstall).toHaveCount(0);
+    await expect(page.locator('aside.sidebar').getByRole('button', { name: 'Pasang aplikasi' })).toHaveCount(0);
   });
 
   test('Pass-14 Regression: Self-heal poisoned 403 IndexedDB cache, Kakuyomu 7->84 episode_sidebar expansion, mutated GTX markers & untranslated mop-up retry', async ({
