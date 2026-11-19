@@ -1,7 +1,16 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import zlib from 'node:zlib';
 import { expect, test } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
+
+const QA_ARTIFACT_DIR =
+  process.env.QA_ARTIFACT_DIR || path.join(process.cwd(), 'test-results', 'qa');
+
+function qaArtifactPath(filename: string): string {
+  fs.mkdirSync(QA_ARTIFACT_DIR, { recursive: true });
+  return path.join(QA_ARTIFACT_DIR, filename);
+}
 
 function createTinyPngBuffer(): Buffer {
   // Valid 1x1 white PNG
@@ -112,7 +121,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.locator('.assistant-prose').first()).toContainText('Chihaya');
     await expect(page.getByRole('button', { name: '千早 \u2192 Chihaya' })).toBeVisible();
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_desktop_terang.png',
+      path: qaArtifactPath('qa_desktop_terang.png'),
     });
 
     // 6. Verify Voice Dictation (Dikte suara) inside K/Composer
@@ -266,7 +275,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     );
     expect(webOverflow1280).toBe(false);
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_desktop_web_reader_1280.png',
+      path: qaArtifactPath('qa_desktop_web_reader_1280.png'),
     });
     // Toggle Berdampingan (bilingual) -> verify TRUE 2-column side-by-side layout on Desktop (>= 1024px)!
     await page.getByRole('button', { name: 'Berdampingan' }).click();
@@ -277,7 +286,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect(biDstBox).not.toBeNull();
     expect(biDstBox!.x).toBeGreaterThan(biSrcBox!.x + 200);
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_desktop_web_bilingual_1280.png',
+      path: qaArtifactPath('qa_desktop_web_bilingual_1280.png'),
     });
     // Click Bab berikutnya -> navigates directly to Chapter 2 without re-entering any URL
     await page.locator('.novel-chapter-dock').getByRole('button', { name: /Bab berikutnya/ }).click();
@@ -336,7 +345,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       .analyze();
     expect(axeDark.violations).toEqual([]);
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_desktop_gelap.png',
+      path: qaArtifactPath('qa_desktop_gelap.png'),
     });
 
     // Switch UI Language to English and back via Undo (first return to empty Baru page)
@@ -887,7 +896,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
 
     // Verify Mobile Laci (320px leaving >= 56px scrim tap area) & Bottom Sheets (K/Lembar bawah)
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_390.png',
+      path: qaArtifactPath('qa_mobile_390.png'),
     });
     const menuBtn = page.getByRole('button', { name: 'Menu', exact: true });
     await menuBtn.click();
@@ -903,7 +912,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     const bodyLocked = await page.evaluate(() => document.body.style.overflow === 'hidden');
     expect(bodyLocked).toBe(true);
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_drawer_390.png',
+      path: qaArtifactPath('qa_mobile_drawer_390.png'),
     });
 
     // Tapping "Lainnya" inside mobile hamburger drawer opens a native Mobile Bottom Sheet (NOT desktop popover)
@@ -1003,7 +1012,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect(axeWebDark.violations).toEqual([]);
 
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_web_reader_390.png',
+      path: qaArtifactPath('qa_mobile_web_reader_390.png'),
     });
 
     // Open Mobile Reader Hamburger Bottom Sheet -> verify all controls + Axe AA in Dark Mode
@@ -1023,7 +1032,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect(axeWebSheet.violations).toEqual([]);
 
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_web_sheet_390.png',
+      path: qaArtifactPath('qa_mobile_web_sheet_390.png'),
     });
 
     // Switch to Situs Terjemahan from the bottom sheet -> verify translated iframe fits mobile viewport cleanly
@@ -1095,7 +1104,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect(headingBox).not.toBeNull();
     expect(headingBox!.x + headingBox!.width).toBeLessThanOrEqual(390);
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_web_site_390.png',
+      path: qaArtifactPath('qa_mobile_web_site_390.png'),
     });
 
     // 5. Regression Test for Blank Site Mode on Mobile: WordPress body.has-sidebar / .no-sidebar + .preloader curtain + .fade-in opacity:0 MUST render visible translated content!
@@ -1142,7 +1151,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     });
     expect(wpArticleOpacity).toBeGreaterThanOrEqual(0.95);
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_wp_site_390.png',
+      path: qaArtifactPath('qa_mobile_wp_site_390.png'),
     });
 
     // 6. Regression Test for AWS CloudFront 403 ERROR in Site Mode + 429 Dual-Endpoint Failover (clients5.google.com) + Multi-User Request Budget!
@@ -1239,7 +1248,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect(primaryGtxHits).toBeGreaterThanOrEqual(1);
     expect(altClients5Hits).toBeGreaterThanOrEqual(1);
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_cf_site_rescue_390.png',
+      path: qaArtifactPath('qa_mobile_cf_site_rescue_390.png'),
     });
   });
 
@@ -2335,7 +2344,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       .evaluateAll((els) => els.filter((el) => /[\u3040-\u30ff\u3400-\u9fff]/.test(el.textContent || '')).length);
     expect(remainingJpChapters).toBe(0);
     await page.screenshot({
-      path: '/Users/hanifpriyambodo/.gemini/antigravity/brain/1c9f5dd7-3454-423b-a588-20da84f6271e/qa_mobile_kakuyomu_84ch_rescue_390.png',
+      path: qaArtifactPath('qa_mobile_kakuyomu_84ch_rescue_390.png'),
     });
   });
 });

@@ -1,8 +1,8 @@
 {
   "name": "tranx",
   "private": true,
-  "version": "2.1.0",
-  "description": "Penerjemah lintas perangkat teks, gambar, dokumen, dan tautan berbahasa Jepang ke bahasa Indonesia atau Inggris berbasis jptrans 1.1.0 dan Firebase Gen-2.",
+  "version": "2.2.0",
+  "description": "Cross-device multilingual PWA translator (ID/EN/JA + auto-detect) for text, images, documents, and ebook web sites powered by jptrans 1.1.0, React 19, and Firebase Gen-2.",
   "scripts": {
     "vendor:jptrans": "python3 -B tools/vendor_jptrans.py",
     "verify:integrity": "python3 -B tools/verify_integrity.py",
