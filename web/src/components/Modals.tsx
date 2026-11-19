@@ -375,8 +375,10 @@ export function SettingsModal({
       const a = document.createElement('a');
       a.href = url;
       a.download = `tranx-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
       onNotify('Cadangan JSON berhasil diunduh');
     } catch (err) {
       setStatusError(err instanceof Error ? err.message : 'Gagal mengekspor cadangan.');

@@ -23,6 +23,8 @@ from .glossary_store import FirestoreGlossary, glossary_entry_to_dict
 from .multilingual import parse_mode_pair, translate_multilingual_document
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_IMAGE_DIMENSION = 8192
+MAX_IMAGE_PIXELS = 25_000_000
 ALLOWED_IMAGE_FORMATS = frozenset({"PNG", "JPEG", "WEBP"})
 
 VISION_SYSTEM_PROMPT = (
@@ -71,19 +73,28 @@ def inspect_image_dimensions(image_bytes: bytes) -> tuple[int, int, str]:
     if len(image_bytes) > MAX_IMAGE_BYTES:
         raise InputError("Ukuran gambar melebihi batas 20 MB")
     try:
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            fmt = (img.format or "").upper()
-            if fmt not in ALLOWED_IMAGE_FORMATS:
-                raise InputError(
-                    f"Format gambar {fmt or 'tidak dikenal'} belum didukung; gunakan PNG, JPG, atau WEBP"
-                )
-            width, height = img.size
+        prev_max_pixels = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                fmt = (img.format or "").upper()
+                if fmt not in ALLOWED_IMAGE_FORMATS:
+                    raise InputError(
+                        f"Format gambar {fmt or 'tidak dikenal'} belum didukung; gunakan PNG, JPG, atau WEBP"
+                    )
+                width, height = img.size
+        finally:
+            Image.MAX_IMAGE_PIXELS = prev_max_pixels
     except InputError:
         raise
+    except Image.DecompressionBombError as exc:
+        raise InputError("Resolusi gambar melampaui batas aman 25 megapiksel") from exc
     except Exception as exc:
         raise InputError("Berkas gambar rusak atau tidak dapat dibaca") from exc
     if width <= 0 or height <= 0:
         raise InputError("Dimensi gambar tidak sah")
+    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION or (width * height) > MAX_IMAGE_PIXELS:
+        raise InputError("Resolusi gambar melampaui batas aman 8192x8192 piksel (25 MP)")
     mime = "image/jpeg" if fmt == "JPEG" else f"image/{fmt.lower()}"
     return width, height, mime
 

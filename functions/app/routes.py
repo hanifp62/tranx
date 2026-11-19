@@ -51,6 +51,7 @@ from tranx_core import (
 from .store import AuthError, Repository
 
 MAX_STORAGE_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_HTTP_PAYLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
 class _RepoUsageAdapter:
@@ -106,6 +107,7 @@ def create_flask_app(
     web_fetcher: Any = fetch_url_safely,
 ) -> Flask:
     app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = MAX_HTTP_PAYLOAD_BYTES
     shared_cache = LayeredTranslationCache(repo.cache_store)
     usage_adapter = _RepoUsageAdapter(repo)
 
@@ -151,6 +153,20 @@ def create_flask_app(
     @app.errorhandler(InputError)
     def _handle_input_error(err: InputError) -> tuple[Response, int]:
         return jsonify({"error": {"code": "INVALID_INPUT", "message": str(err)}}), 400
+
+    @app.errorhandler(413)
+    def _handle_payload_too_large(_err: Any) -> tuple[Response, int]:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "code": "PAYLOAD_TOO_LARGE",
+                        "message": "Ukuran muatan permintaan melebihi batas aman 25 MB.",
+                    }
+                }
+            ),
+            413,
+        )
 
     @app.errorhandler(DailyCapExceeded)
     def _handle_cap_error(err: DailyCapExceeded) -> tuple[Response, int]:

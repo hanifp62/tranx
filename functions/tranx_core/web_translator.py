@@ -286,8 +286,16 @@ def sanitize_soup(soup: BeautifulSoup, final_url: str, rewrite_link_fn: Callable
                 del tag.attrs[attr]
                 continue
             if low in ("href", "src", "action", "formaction"):
-                stripped = val_str.strip().lower()
-                if stripped.startswith(("javascript:", "vbscript:", "data:text/html")):
+                normalized_scheme = re.sub(r"[\x00-\x20]+", "", val_str).lower()
+                if normalized_scheme.startswith(
+                    (
+                        "javascript:",
+                        "vbscript:",
+                        "data:text/html",
+                        "data:image/svg",
+                        "data:application/",
+                    )
+                ):
                     del tag.attrs[attr]
 
         if tag.name == "a" and tag.get("href"):

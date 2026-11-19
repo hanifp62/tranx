@@ -69,8 +69,10 @@ export function MyFilesView({
       const a = document.createElement('a');
       a.href = url;
       a.download = filename;
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (err) {
       onNotify(err instanceof Error ? err.message : 'Gagal mengunduh berkas.');
     }
@@ -172,7 +174,17 @@ export function MyFilesView({
                   <IconColumns size={16} />
                   {strings.readSideBySide}
                 </button>
-                {(['html', 'docx', 'srt', 'txt', 'md'] as const).map((fmt) => (
+                {(
+                  [
+                    'html',
+                    'docx',
+                    'srt',
+                    ...(job.fmt === 'ass' || job.fmt === 'ssa' ? (['ass'] as const) : []),
+                    ...(job.fmt === 'vtt' ? (['vtt'] as const) : []),
+                    'txt',
+                    'md',
+                  ] as const
+                ).map((fmt) => (
                   <button
                     key={fmt}
                     type="button"

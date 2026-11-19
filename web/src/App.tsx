@@ -56,6 +56,8 @@ import {
   isSingleStandaloneUrl,
   parseModePair,
   swapModePair,
+  toSafeHttpUrl,
+  validateUploadedFileMagic,
 } from './lib/directEngine';
 import { startVoiceDictation, type DictationHandle } from './lib/speech';
 import {
@@ -510,12 +512,14 @@ export function App() {
 
   const handleStageFiles = (fileList: FileList | File[], targetTab: WorkTab) => {
     const arr = Array.from(fileList);
-    const next: PendingAttachment[] = arr.map((f) => {
+    const kind: 'gambar' | 'dokumen' = targetTab === 'gambar' ? 'gambar' : 'dokumen';
+    const next: PendingAttachment[] = arr.map((f, idx) => {
       const ext = (f.name.split('.').pop() || '').toLowerCase();
       const maxBytes = settings.maxUploadMb * 1024 * 1024;
+      const attId = `att_${Date.now()}_${idx}_${f.name}`;
       if (f.size > maxBytes) {
         return {
-          id: `att_${Date.now()}_${f.name}`,
+          id: attId,
           file: f,
           name: f.name,
           sizeBytes: f.size,
@@ -527,7 +531,7 @@ export function App() {
       const allowed = targetTab === 'gambar' ? SUPPORTED_IMAGE_EXTS : SUPPORTED_DOC_EXTS;
       if (!allowed.has(ext)) {
         return {
-          id: `att_${Date.now()}_${f.name}`,
+          id: attId,
           file: f,
           name: f.name,
           sizeBytes: f.size,
@@ -540,7 +544,7 @@ export function App() {
         };
       }
       return {
-        id: `att_${Date.now()}_${f.name}`,
+        id: attId,
         file: f,
         name: f.name,
         sizeBytes: f.size,
@@ -549,6 +553,20 @@ export function App() {
       };
     });
     setAttachments((prev) => [...prev, ...next]);
+
+    for (const item of next) {
+      if (item.status === 'ready' && item.file) {
+        void validateUploadedFileMagic(item.file, kind).then((magicErr) => {
+          if (magicErr) {
+            setAttachments((prev) =>
+              prev.map((a) =>
+                a.id === item.id ? { ...a, status: 'error', reason: magicErr } : a
+              )
+            );
+          }
+        });
+      }
+    }
   };
 
   const handleChangeUiLang = async (nextLang: UiLang) => {
@@ -2177,6 +2195,7 @@ export function App() {
                         >
                           {lp.excerptDst}
                         </div>
+
                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                           <button
                             type="button"
@@ -2190,15 +2209,17 @@ export function App() {
                             <IconGlobe size={17} />
                             {strings.openFullTranslatedPage}
                           </button>
-                          <a
-                            href={lp.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="btn-secondary pressable"
-                          >
-                            <IconLink size={17} />
-                            {strings.openOriginalSite}
-                          </a>
+                          {toSafeHttpUrl(lp.url) && (
+                            <a
+                              href={toSafeHttpUrl(lp.url)!}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="btn-secondary pressable"
+                            >
+                              <IconLink size={17} />
+                              {strings.openOriginalSite}
+                            </a>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -2261,6 +2282,16 @@ export function App() {
                           </div>
                         )}
 
+                        {turn.state === 'done' && turn.text && (
+                          <div
+                            className={`assistant-prose ${turnTgt === 'ja' ? 'is-jp' : ''}`}
+                            style={{ fontSize: '15px', lineHeight: '24px' }}
+                            lang={turnTgt}
+                          >
+                            {turn.text.length > 260 ? `${turn.text.slice(0, 260)}...` : turn.text}
+                          </div>
+                        )}
+
                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                           {turn.state === 'running' && turn.jobId && (
                             <button
@@ -2302,7 +2333,19 @@ export function App() {
                                 <IconColumns size={16} />
                                 {strings.readSideBySide}
                               </button>
-                              {(['html', 'srt', 'txt', 'md'] as const).map((fmt) => (
+                              {(
+                                [
+                                  'html',
+                                  'docx',
+                                  'srt',
+                                  ...(turn.fmt === 'ass' || turn.fmt === 'ssa'
+                                    ? (['ass'] as const)
+                                    : []),
+                                  ...(turn.fmt === 'vtt' ? (['vtt'] as const) : []),
+                                  'txt',
+                                  'md',
+                                ] as const
+                              ).map((fmt) => (
                                 <button
                                   key={fmt}
                                   type="button"
@@ -2321,8 +2364,10 @@ export function App() {
                                     const a = document.createElement('a');
                                     a.href = url;
                                     a.download = filename;
+                                    document.body.appendChild(a);
                                     a.click();
-                                    URL.revokeObjectURL(url);
+                                    a.remove();
+                                    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
                                   }}
                                 >
                                   <IconDownload size={16} />.{fmt}
@@ -2346,6 +2391,7 @@ export function App() {
                         <div style={{ fontSize: '14px' }}>
                           {turn.error || 'Terjemahan belum berhasil diselesaikan.'}
                         </div>
+
                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                           {turn.srcText && (
                             <button
@@ -2361,17 +2407,19 @@ export function App() {
                               {strings.retryNow}
                             </button>
                           )}
-                          {turn.srcText && isSingleStandaloneUrl(turn.srcText) && (
-                            <a
-                              href={turn.srcText}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="btn-secondary pressable"
-                            >
-                              <IconLink size={16} />
-                              {strings.openOriginalSite}
-                            </a>
-                          )}
+                          {turn.srcText &&
+                            isSingleStandaloneUrl(turn.srcText) &&
+                            toSafeHttpUrl(turn.srcText) && (
+                              <a
+                                href={toSafeHttpUrl(turn.srcText)!}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="btn-secondary pressable"
+                              >
+                                <IconLink size={16} />
+                                {strings.openOriginalSite}
+                              </a>
+                            )}
                         </div>
                       </div>
                     ) : (

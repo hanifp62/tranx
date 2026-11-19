@@ -558,3 +558,83 @@ def test_cors_origin_allowlist_and_query_token_rejected() -> None:
     assert r_qtok.status_code == 401
 
 
+def test_payload_limit_413_pixel_flood_and_obfuscated_scheme_sanitization() -> None:
+    import struct
+    import zlib
+
+    init_tranx_core()
+    repo = InMemoryRepository()
+
+    def fake_html_fetcher(url: str) -> FetchedPage:
+        return FetchedPage(
+            final_url=url,
+            host="example.jp",
+            content_type="text/html",
+            text=(
+                '<html><head><title>Uji</title></head><body>'
+                '<a id="tabjs" href="java\tscript:alert(1)">klik</a>'
+                '<img id="svguri" src="data:image/svg+xml,<svg onload=alert(1)>">'
+                "<p>おはようございます。</p></body></html>"
+            ),
+        )
+
+    app = create_flask_app(
+        repo,
+        llm_transport=RouteFakeTransport(),
+        web_fetcher=fake_html_fetcher,
+    )
+    client = app.test_client()
+
+    # 1. Oversized HTTP payload rejected with 413 PAYLOAD_TOO_LARGE
+    app.config["MAX_CONTENT_LENGTH"] = 2048
+    try:
+        r_big = client.post(
+            "/v1/chat",
+            data=json.dumps({"text": "A" * 4096}),
+            content_type="application/json",
+            headers=_auth_headers(),
+        )
+        assert r_big.status_code == 413
+        assert r_big.get_json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
+    finally:
+        app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+
+    # 2. Pixel-flood PNG header (10000x10000 = 100 MP > 25 MP cap) rejected with 400
+    ihdr = struct.pack(">IIBBBBB", 10000, 10000, 8, 2, 0, 0, 0)
+
+    def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+        )
+
+    fake_bomb_png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+        + _png_chunk(b"IEND", b"")
+    )
+    b64_bomb = "data:image/png;base64," + base64.b64encode(fake_bomb_png).decode("ascii")
+    r_bomb = client.post(
+        "/v1/image:translate",
+        json={"cid": "c_bomb", "mode": "ja-id", "fileName": "bomb.png", "imageB64": b64_bomb},
+        headers=_auth_headers(),
+    )
+    assert r_bomb.status_code == 400
+    assert r_bomb.get_json()["error"]["code"] == "INVALID_INPUT"
+
+    # 3. Tab-obfuscated javascript: and data:image/svg+xml attributes stripped in /v1/web
+    r_web = client.get(
+        "/v1/web?url=https://example.jp/ch1&mode=ja-id",
+        headers=_auth_headers(),
+    )
+    assert r_web.status_code == 200
+    cleaned = r_web.data.decode("utf-8")
+    assert "javascript" not in cleaned.lower()
+    assert "data:image/svg" not in cleaned.lower()
+    assert "Selamat pagi" in cleaned
+
+
+

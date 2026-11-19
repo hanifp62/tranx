@@ -456,7 +456,7 @@ export async function translateImageRequest(params: {
   imageDataUrl: string;
   titleId?: string;
 }): Promise<{ cid: string; mid: string; titleId: string } & ImageTranslationResult> {
-  if (isLocalE2EMode()) {
+  if (isLocalE2EMode() && !isDirectE2ETest()) {
     const store = getE2EStore();
     const mid = `img_${Date.now().toString(36)}`;
     const { tgt } = parseModePair(params.mode);
@@ -549,7 +549,7 @@ export async function processDocumentSubmission(params: {
   file: File;
   onProgress?: (pct: number) => void;
 }): Promise<string> {
-  if (isLocalE2EMode()) {
+  if (isLocalE2EMode() && !isDirectE2ETest()) {
     const store = getE2EStore();
     const jobId = `job_${Date.now().toString(36)}`;
     const now = Date.now();

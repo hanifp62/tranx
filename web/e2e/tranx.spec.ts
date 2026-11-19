@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import zlib from 'node:zlib';
 import { expect, test } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 
@@ -7,6 +9,21 @@ function createTinyPngBuffer(): Buffer {
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
     'base64'
   );
+}
+
+function createFlatePdfBuffer(englishParagraph: string): Buffer {
+  const escaped = englishParagraph.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+  const contentStream = `BT /F1 12 Tf 72 720 Td (${escaped}) Tj ET`;
+  const deflated = zlib.deflateSync(Buffer.from(contentStream, 'latin1'));
+  const head = Buffer.from(
+    `%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n` +
+      `2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n` +
+      `3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n` +
+      `4 0 obj\n<< /Length ${deflated.length} /Filter /FlateDecode >>\nstream\n`,
+    'latin1'
+  );
+  const tail = Buffer.from(`\nendstream\nendobj\n%%EOF\n`, 'latin1');
+  return Buffer.concat([head, deflated, tail]);
 }
 
 test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine & Accessibility Gate', () => {
@@ -381,6 +398,78 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await page.locator('textarea.composer-textarea').press('Enter');
     await expect(page.locator('.assistant-prose').first()).toContainText('千早');
     await expect(page.locator('.assistant-prose').first()).toContainText('駅を静かに歩いた');
+
+    // 4. Native FlateDecode PDF extraction & translation in Direct Spark Mode (zero Blaze needed)
+    await page.getByRole('button', { name: 'Baru' }).click();
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Inggris' }).click();
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Indonesia' }).click();
+    await page.getByRole('tab', { name: 'Dokumen' }).click();
+    const directDocInput = page.locator('input[type="file"][accept*=".epub"]');
+    await directDocInput.setInputFiles({
+      name: 'naskah-kyoto.pdf',
+      mimeType: 'application/pdf',
+      buffer: createFlatePdfBuffer(
+        'She opened her notebook and read the letter from Tokyo.'
+      ),
+    });
+    await page.getByRole('button', { name: 'Kirim' }).click();
+    await expect(page.getByRole('button', { name: 'Baca berdampingan' })).toBeVisible();
+    await expect(page.getByRole('main')).toContainText(
+      'Ia membuka buku catatannya dan membaca surat dari Tokyo'
+    );
+    await page.getByRole('button', { name: 'Baca berdampingan' }).click();
+    await expect(page.getByRole('main')).toContainText(
+      'She opened her notebook and read the letter from Tokyo.'
+    );
+    await expect(page.getByRole('main')).toContainText(
+      'Ia membuka buku catatannya dan membaca surat dari Tokyo.'
+    );
+    await page.getByRole('button', { name: 'Kembali ke percakapan' }).click();
+
+    // 5. Native .ass subtitle parsing + valid .ass and genuine OOXML .docx export in Direct Spark Mode
+    await page.getByRole('button', { name: 'Baru' }).click();
+    await page.getByRole('tab', { name: 'Dokumen' }).click();
+    const assSample = [
+      '[Script Info]',
+      'Title: Kyoto Episode 1',
+      'ScriptType: v4.00+',
+      '',
+      '[Events]',
+      'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+      'Dialogue: 0,0:00:01.00,0:00:04.00,Default,Chihaya,0,0,0,,{\\an8}The Rainy Gate of Kyoto',
+      '',
+    ].join('\n');
+    await directDocInput.setInputFiles({
+      name: 'episode-01.ass',
+      mimeType: 'text/plain',
+      buffer: Buffer.from(assSample, 'utf-8'),
+    });
+    await page.getByRole('button', { name: 'Kirim' }).click();
+    await expect(page.getByRole('button', { name: 'Baca berdampingan' })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Lainnya' }).click();
+    await page.getByRole('menuitem', { name: 'Berkas saya' }).click();
+    await expect(page.getByRole('main').getByText('episode-01.ass')).toBeVisible();
+
+    const assDlPromise = page.waitForEvent('download');
+    await page.getByRole('main').getByRole('button', { name: '.ass', exact: true }).first().click();
+    const assDl = await assDlPromise;
+    expect(assDl.suggestedFilename()).toBe('episode-01.ass');
+    const assOutText = fs.readFileSync((await assDl.path())!, 'utf-8');
+    expect(assOutText).toContain('[Events]');
+    expect(assOutText).toContain('Dialogue: 0,0:00:01.00,0:00:04.00,Default,Chihaya,0,0,0,,{\\an8}Gerbang Hujan di Kyoto');
+
+    const docxDlPromise = page.waitForEvent('download');
+    await page.getByRole('main').getByRole('button', { name: '.docx', exact: true }).first().click();
+    const docxDl = await docxDlPromise;
+    expect(docxDl.suggestedFilename()).toBe('episode-01.docx');
+    const docxBytes = fs.readFileSync((await docxDl.path())!);
+    expect(docxBytes[0]).toBe(0x50);
+    expect(docxBytes[1]).toBe(0x4b);
+    expect(docxBytes.toString('latin1')).toContain('word/document.xml');
+    expect(docxBytes.toString('utf-8')).toContain('Gerbang Hujan di Kyoto');
   });
 
   test('Tablet 820x1180 & Mobile 390x844: Zero horizontal overflow, unclipped split language bar, >= 44px tap targets, Mode bar ABOVE Composer, Laci & Bottom Sheets', async ({
@@ -497,6 +586,32 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     expect(
       await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)
     ).toBeUndefined();
+
+    // 4b. Security (hunt-file-upload): Spoofed SVG/HTML magic-byte uploads disguised as .png and .pdf rejected
+    await page.getByRole('tab', { name: 'Gambar' }).click();
+    await page.locator('input[type="file"][accept*="image/png"]').setInputFiles({
+      name: 'spoofed-svg.png',
+      mimeType: 'image/png',
+      buffer: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" onload="window.__xss=91234"/>'),
+    });
+    await expect(
+      page.getByText(/Isi biner berkas bukan gambar PNG, JPG, atau WEBP yang sah/i)
+    ).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Kirim' })).toBeDisabled();
+    await page.getByRole('button', { name: 'Hapus lampiran spoofed-svg.png' }).click();
+
+    await page.getByRole('tab', { name: 'Dokumen' }).click();
+    await page.locator('input[type="file"][accept*=".epub"]').setInputFiles({
+      name: 'spoofed-html.pdf',
+      mimeType: 'application/pdf',
+      buffer: Buffer.from('<html><script>window.__xss=91234</script></html>'),
+    });
+    await expect(
+      page.getByText(/Isi biner berkas bukan dokumen PDF yang sah/i)
+    ).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Kirim' })).toBeDisabled();
+    await page.getByRole('button', { name: 'Hapus lampiran spoofed-html.pdf' }).click();
+    await page.getByRole('tab', { name: 'Teks' }).click();
 
     // 5. Menu readiness: Sidebar Cari, Lipat panel samping + Menu expand, Ganti nama, Hapus
     await page.getByRole('button', { name: 'Cari' }).click();
