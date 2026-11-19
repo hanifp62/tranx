@@ -153,6 +153,34 @@ function toMillis(val: unknown): number {
   return Date.now();
 }
 
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  if (!val || typeof val !== 'object') return false;
+  const proto = Object.getPrototypeOf(val);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Recursively removes undefined fields from plain objects/arrays before Firestore writes (preserving FieldValue/Timestamp). */
+export function stripUndefinedDeep<T>(value: T): T {
+  if (value === null || value === undefined || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => item !== undefined)
+      .map((item) => stripUndefinedDeep(item)) as unknown as T;
+  }
+  if (!isPlainObject(value)) {
+    return value;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (v !== undefined) {
+      out[k] = stripUndefinedDeep(v);
+    }
+  }
+  return out as T;
+}
+
 export function glossaryKeyForSurface(surface: string): string {
   const clean = surface.normalize('NFKC').trim();
   let hash = 2166136261;
@@ -630,16 +658,29 @@ export async function saveTurnMessageDirect(
     cleanPayload.imageResult =
       dataUrl && dataUrl.length < 600000 ? turn.imageResult : restImg;
   }
-  if (turn.linkPreview) cleanPayload.linkPreview = turn.linkPreview;
+  if (turn.linkPreview) {
+    const lp = { ...turn.linkPreview };
+    if (lp.novelNav && Array.isArray(lp.novelNav.chapters) && lp.novelNav.chapters.length > 80) {
+      const idx = lp.novelNav.chapters.findIndex((c) => c.current);
+      const start = idx >= 0 ? Math.max(0, Math.min(idx - 25, lp.novelNav.chapters.length - 80)) : 0;
+      lp.novelNav = {
+        ...lp.novelNav,
+        chapters: lp.novelNav.chapters.slice(start, start + 80),
+      };
+    }
+    cleanPayload.linkPreview = stripUndefinedDeep(lp);
+  }
   if (turn.model) cleanPayload.model = turn.model;
   if (turn.ms !== undefined) cleanPayload.ms = turn.ms;
   if (turn.error) cleanPayload.error = turn.error.slice(0, 1000);
 
+  const firestoreSafePayload = stripUndefinedDeep(cleanPayload);
+
   if (!snap.exists()) {
-    cleanPayload.createdAt = serverTimestamp();
-    await setDoc(ref, cleanPayload);
+    firestoreSafePayload.createdAt = serverTimestamp();
+    await setDoc(ref, firestoreSafePayload);
   } else {
-    await updateDoc(ref, cleanPayload as UpdateData<DocumentData>);
+    await updateDoc(ref, firestoreSafePayload as UpdateData<DocumentData>);
   }
 }
 

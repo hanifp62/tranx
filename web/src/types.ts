@@ -100,14 +100,19 @@ export interface ImageTranslationResult {
 
 export interface NovelChapterLink {
   title: string;
+  titleDst?: string;
   url: string;
   current?: boolean;
 }
 
 export interface NovelNavigation {
   isNovel: boolean;
+  isTocPage?: boolean;
   seriesTitle?: string;
   chapterLabel?: string;
+  totalChapters?: number;
+  currentIndex?: number;
+  firstUrl?: string | null;
   prevUrl?: string | null;
   nextUrl?: string | null;
   tocUrl?: string | null;

@@ -51,12 +51,14 @@ import {
   translateImageRequest,
 } from './lib/api';
 import {
+  buildAutoTranslatedSiteUrl,
   buildModePair,
   detectLanguageLocal,
   isSingleStandaloneUrl,
   parseModePair,
   swapModePair,
   toSafeHttpUrl,
+  translateChapterTitlesDirect,
   validateUploadedFileMagic,
 } from './lib/directEngine';
 import { startVoiceDictation, type DictationHandle } from './lib/speech';
@@ -107,7 +109,6 @@ import {
   RenameDialog,
   SettingsModal,
   ShortcutsModal,
-  WebToolsModal,
 } from './components/Modals';
 import {
   GlossaryView,
@@ -209,10 +210,13 @@ export function App() {
   const [logoutOpen, setLogoutOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<ConversationDoc | null>(null);
   const [infoModalKind, setInfoModalKind] = useState<'help' | 'about' | null>(null);
-  const [webToolsOpen, setWebToolsOpen] = useState(false);
-  const [inlineChaptersNav, setInlineChaptersNav] = useState<
-    import('./types').NovelNavigation | null
-  >(null);
+  const [inlineChaptersNav, setInlineChaptersNav] = useState<{
+    nav: import('./types').NovelNavigation;
+    mode: ModePair;
+    titleId?: string;
+  } | null>(null);
+  const [inlineChapterQuery, setInlineChapterQuery] = useState('');
+  const [inlineTranslatedTitles, setInlineTranslatedTitles] = useState<Record<string, string>>({});
 
   /* Source bubble expand & inline edit */
   const [expandedBubbles, setExpandedBubbles] = useState<Record<string, boolean>>({});
@@ -1166,16 +1170,7 @@ export function App() {
           backPath={lastNonWebPathRef.current || '/'}
           strings={strings}
           onNavigate={navigate}
-          onOpenWebTools={() => setWebToolsOpen(true)}
         />
-        {webToolsOpen && (
-          <WebToolsModal
-            mode={qMode}
-            strings={strings}
-            onClose={() => setWebToolsOpen(false)}
-            onNotify={(m) => pushToast(m)}
-          />
-        )}
         {toasts.length > 0 && (
           <div className="toast-container" role="status" aria-live="polite">
             {toasts.map((t) => (
@@ -1501,36 +1496,26 @@ export function App() {
                 flexWrap: 'wrap',
               }}
             >
-              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  className="btn-secondary pressable"
-                  disabled={isFetchingLink}
-                  onClick={async () => {
-                    try {
-                      const clip = (await navigator.clipboard.readText()).trim();
-                      if (clip) {
-                        setLinkUrlInput(clip);
-                      } else {
-                        pushToast('Papan klip masih kosong.');
-                      }
-                    } catch {
-                      pushToast('Tempel URL dengan Cmd/Ctrl+V.');
+              <button
+                type="button"
+                className="btn-secondary pressable"
+                disabled={isFetchingLink}
+                onClick={async () => {
+                  try {
+                    const clip = (await navigator.clipboard.readText()).trim();
+                    if (clip) {
+                      setLinkUrlInput(clip);
+                    } else {
+                      pushToast('Papan klip masih kosong.');
                     }
-                  }}
-                >
-                  <IconCopy size={16} />
-                  {strings.pasteUrlBtn}
-                </button>
-                <button
-                  type="button"
-                  className="btn-secondary pressable"
-                  onClick={() => setWebToolsOpen(true)}
-                >
-                  <IconGlobe size={16} />
-                  {strings.webToolsBtn}
-                </button>
-              </div>
+                  } catch {
+                    pushToast('Tempel URL dengan Cmd/Ctrl+V.');
+                  }
+                }}
+              >
+                <IconCopy size={16} />
+                {strings.pasteUrlBtn}
+              </button>
               <button
                 type="submit"
                 className="btn-primary pressable"
@@ -2258,7 +2243,7 @@ export function App() {
                           </span>
                           {nav?.isNovel && (
                             <span className="status-badge done">
-                              {strings.novelDetectedBadge}
+                              {nav.isTocPage ? strings.ebookTocBadge : strings.novelDetectedBadge}
                               {nav.chapterLabel ? ` · ${nav.chapterLabel}` : ''}
                             </span>
                           )}
@@ -2273,25 +2258,28 @@ export function App() {
                             className="btn-primary pressable"
                             onClick={() =>
                               navigate(
-                                `/web?url=${encodeURIComponent(lp.url)}&mode=${turn.mode}&view=reader&titleId=${encodeURIComponent(lp.titleId)}`
+                                `/web?url=${encodeURIComponent(
+                                  nav?.isTocPage && nav.firstUrl ? nav.firstUrl : lp.url
+                                )}&mode=${turn.mode}&view=reader&titleId=${encodeURIComponent(lp.titleId)}`
                               )
                             }
                           >
                             <IconBook size={17} />
-                            {strings.openFullTranslatedPage}
+                            {nav?.isTocPage && nav.firstUrl
+                              ? strings.startReadingCh1
+                              : strings.openFullTranslatedPage}
                           </button>
-                          <button
-                            type="button"
-                            className="btn-secondary pressable"
-                            onClick={() =>
-                              navigate(
-                                `/web?url=${encodeURIComponent(lp.url)}&mode=${turn.mode}&view=site&titleId=${encodeURIComponent(lp.titleId)}`
-                              )
-                            }
-                          >
-                            <IconGlobe size={17} />
-                            {strings.openTranslatedSite}
-                          </button>
+                          {buildAutoTranslatedSiteUrl(lp.url, turn.mode) && (
+                            <a
+                              href={buildAutoTranslatedSiteUrl(lp.url, turn.mode)!}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="btn-secondary pressable"
+                            >
+                              <IconGlobe size={17} />
+                              {strings.openAutoTranslatedTab}
+                            </a>
+                          )}
                           <button
                             type="button"
                             className="btn-secondary pressable"
@@ -2304,13 +2292,6 @@ export function App() {
                           >
                             <IconCopy size={16} />
                             {strings.copyTranslation}
-                          </button>
-                          <button
-                            type="button"
-                            className="btn-secondary pressable"
-                            onClick={() => setWebToolsOpen(true)}
-                          >
-                            {strings.webToolsBtn}
                           </button>
                         </div>
 
@@ -2327,7 +2308,7 @@ export function App() {
                           {fullArticleText}
                         </div>
 
-                        {nav && (nav.prevUrl || nav.nextUrl || nav.chapters?.length) && (
+                        {nav && (nav.prevUrl || nav.nextUrl || nav.chapters?.length || nav.firstUrl) && (
                           <div className="novel-inline-nav">
                             <button
                               type="button"
@@ -2342,37 +2323,55 @@ export function App() {
                             <button
                               type="button"
                               className="btn-secondary pressable"
-                              onClick={() => setInlineChaptersNav(nav)}
+                              onClick={() => {
+                                setInlineChapterQuery('');
+                                setInlineChaptersNav({ nav, mode: turn.mode, titleId: lp.titleId });
+                                if (nav.chapters && nav.chapters.length > 0) {
+                                  translateChapterTitlesDirect({
+                                    chapters: nav.chapters,
+                                    mode: turn.mode,
+                                    titleId: lp.titleId,
+                                    tocKey: nav.tocUrl || lp.url,
+                                  })
+                                    .then((m) =>
+                                      setInlineTranslatedTitles((prev) => ({ ...prev, ...m }))
+                                    )
+                                    .catch(() => {});
+                                }
+                              }}
                             >
                               <IconBook size={16} />
                               {strings.chapterListBtn}
                               {nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}
                             </button>
-                            <button
-                              type="button"
-                              className="btn-primary pressable"
-                              disabled={!nav.nextUrl || isFetchingLink}
-                              onClick={() =>
-                                nav.nextUrl && handleSubmitLink(undefined, nav.nextUrl)
-                              }
-                            >
-                              {isFetchingLink ? strings.loadingNextChapter : strings.nextChapter}{' '}
-                              {'\u2192'}
-                            </button>
-                          </div>
-                        )}
-
-                        {toSafeHttpUrl(lp.url) && (
-                          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                            <a
-                              href={toSafeHttpUrl(lp.url)!}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="action-chip-btn"
-                            >
-                              <IconLink size={15} />
-                              {strings.openOriginalUntranslated}
-                            </a>
+                            {nav.nextUrl ? (
+                              <button
+                                type="button"
+                                className="btn-primary pressable"
+                                disabled={isFetchingLink}
+                                onClick={() => handleSubmitLink(undefined, nav.nextUrl!)}
+                              >
+                                {isFetchingLink
+                                  ? strings.loadingNextChapter
+                                  : nav.isTocPage
+                                    ? strings.startReadingCh1
+                                    : strings.nextChapter}{' '}
+                                {'\u2192'}
+                              </button>
+                            ) : nav.firstUrl && nav.firstUrl !== lp.url ? (
+                              <button
+                                type="button"
+                                className="btn-primary pressable"
+                                disabled={isFetchingLink}
+                                onClick={() => handleSubmitLink(undefined, nav.firstUrl!)}
+                              >
+                                {strings.readFromChapter1}
+                              </button>
+                            ) : (
+                              <button type="button" className="btn-secondary" disabled>
+                                {strings.nextChapter} {'\u2192'}
+                              </button>
+                            )}
                           </div>
                         )}
                       </div>
@@ -2563,15 +2562,15 @@ export function App() {
                           )}
                           {turn.srcText &&
                             isSingleStandaloneUrl(turn.srcText) &&
-                            toSafeHttpUrl(turn.srcText) && (
+                            buildAutoTranslatedSiteUrl(turn.srcText, turn.mode) && (
                               <a
-                                href={toSafeHttpUrl(turn.srcText)!}
+                                href={buildAutoTranslatedSiteUrl(turn.srcText, turn.mode)!}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="btn-secondary pressable"
                               >
-                                <IconLink size={16} />
-                                {strings.openOriginalSite}
+                                <IconGlobe size={16} />
+                                {strings.openAutoTranslatedTab}
                               </a>
                             )}
                         </div>
@@ -3311,15 +3310,6 @@ export function App() {
         />
       )}
 
-      {webToolsOpen && (
-        <WebToolsModal
-          mode={activeMode}
-          strings={strings}
-          onClose={() => setWebToolsOpen(false)}
-          onNotify={(m) => pushToast(m)}
-        />
-      )}
-
       {inlineChaptersNav && (
         <div className="scrim-backdrop" onClick={() => setInlineChaptersNav(null)}>
           <div
@@ -3331,7 +3321,10 @@ export function App() {
           >
             <div className="modal-header">
               <h2 id="inline-chapters-title" className="modal-title">
-                {inlineChaptersNav.seriesTitle || strings.chapterListBtn}
+                {inlineChaptersNav.nav.seriesTitle || strings.chapterListBtn}
+                {inlineChaptersNav.nav.chapters?.length
+                  ? ` (${inlineChaptersNav.nav.chapters.length})`
+                  : ''}
               </h2>
               <button
                 type="button"
@@ -3343,22 +3336,42 @@ export function App() {
               </button>
             </div>
             <div className="modal-body">
-              {inlineChaptersNav.chapters && inlineChaptersNav.chapters.length > 0 ? (
+              {inlineChaptersNav.nav.chapters && inlineChaptersNav.nav.chapters.length > 6 && (
+                <input
+                  type="search"
+                  className="field-input"
+                  placeholder={strings.searchChaptersPlaceholder}
+                  value={inlineChapterQuery}
+                  onChange={(e) => setInlineChapterQuery(e.target.value)}
+                />
+              )}
+              {inlineChaptersNav.nav.chapters && inlineChaptersNav.nav.chapters.length > 0 ? (
                 <div className="chapter-list-grid">
-                  {inlineChaptersNav.chapters.map((ch, idx) => (
-                    <button
-                      key={`${ch.url}_${idx}`}
-                      type="button"
-                      className={`chapter-list-item pressable ${ch.current ? 'is-current' : ''}`}
-                      onClick={() => {
-                        setInlineChaptersNav(null);
-                        handleSubmitLink(undefined, ch.url);
-                      }}
-                    >
-                      <span>{ch.title}</span>
-                      {ch.current && <span className="status-badge done">Aktif</span>}
-                    </button>
-                  ))}
+                  {inlineChaptersNav.nav.chapters
+                    .filter((ch, idx) => {
+                      if (!inlineChapterQuery.trim()) return true;
+                      const q = inlineChapterQuery.trim().toLowerCase();
+                      const tDst = (inlineTranslatedTitles[ch.url] || ch.titleDst || '').toLowerCase();
+                      return (
+                        ch.title.toLowerCase().includes(q) ||
+                        tDst.includes(q) ||
+                        String(idx + 1).includes(q)
+                      );
+                    })
+                    .map((ch, idx) => (
+                      <button
+                        key={`${ch.url}_${idx}`}
+                        type="button"
+                        className={`chapter-list-item pressable ${ch.current ? 'is-current' : ''}`}
+                        onClick={() => {
+                          setInlineChaptersNav(null);
+                          handleSubmitLink(undefined, ch.url);
+                        }}
+                      >
+                        <span>{inlineTranslatedTitles[ch.url] || ch.titleDst || ch.title}</span>
+                        {ch.current && <span className="status-badge done">Aktif</span>}
+                      </button>
+                    ))}
                 </div>
               ) : (
                 <div style={{ fontSize: '14px', color: 'var(--text-muted)' }}>

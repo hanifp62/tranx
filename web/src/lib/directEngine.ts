@@ -835,16 +835,127 @@ interface CachedWebEntry {
 const webArticleCache = new Map<string, CachedWebEntry>();
 const translatedWebCache = new Map<string, { heading: string; paras: string[] }>();
 const translatedSiteHtmlCache = new Map<string, string>();
+const seriesTocCache = new Map<
+  string,
+  { seriesTitle?: string; tocUrl: string; chapters: NovelChapterLink[] }
+>();
+const translatedChapterTitlesCache = new Map<string, Record<string, string>>();
+
+/**
+ * Automatically generates a Google Translate live-translated website URL
+ * (e.g. https://kakuyomu-jp.translate.goog/...?_x_tr_sl=auto&_x_tr_tl=id&_x_tr_pto=wapp)
+ * that works natively on both Desktop and Mobile browsers without any browser extension.
+ */
+export function buildAutoTranslatedSiteUrl(rawUrl: string, mode: ModePair): string | null {
+  const safe = toSafeHttpUrl(rawUrl);
+  if (!safe) return null;
+  try {
+    const u = new URL(safe);
+    if (u.hostname.endsWith('.translate.goog')) return safe;
+    const { src, tgt } = parseModePair(mode);
+    const hostEncoded = u.hostname.replace(/-/g, '--').replace(/\./g, '-');
+    if (/^[a-z0-9-]+$/i.test(hostEncoded) && hostEncoded.length <= 63 && !u.port) {
+      const out = new URL(`https://${hostEncoded}.translate.goog${u.pathname}${u.search}${u.hash}`);
+      out.searchParams.set('_x_tr_sl', src === 'auto' ? 'auto' : src);
+      out.searchParams.set('_x_tr_tl', tgt);
+      out.searchParams.set('_x_tr_hl', tgt);
+      out.searchParams.set('_x_tr_pto', 'wapp');
+      if (u.protocol === 'http:') out.searchParams.set('_x_tr_sch', 'http');
+      return out.toString();
+    }
+    const fallback = new URL('https://translate.google.com/translate');
+    fallback.searchParams.set('sl', src === 'auto' ? 'auto' : src);
+    fallback.searchParams.set('tl', tgt);
+    fallback.searchParams.set('hl', tgt);
+    fallback.searchParams.set('u', safe);
+    return fallback.toString();
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeNovelNav(nav: NovelNavigation): NovelNavigation {
+  const clean: NovelNavigation = {
+    isNovel: Boolean(nav.isNovel),
+    prevUrl: nav.prevUrl || null,
+    nextUrl: nav.nextUrl || null,
+    tocUrl: nav.tocUrl || null,
+    firstUrl: nav.firstUrl || null,
+  };
+  if (nav.isTocPage) clean.isTocPage = true;
+  if (nav.seriesTitle && nav.seriesTitle.trim()) clean.seriesTitle = nav.seriesTitle.trim();
+  if (nav.chapterLabel && nav.chapterLabel.trim()) clean.chapterLabel = nav.chapterLabel.trim();
+  if (typeof nav.totalChapters === 'number' && nav.totalChapters > 0) {
+    clean.totalChapters = nav.totalChapters;
+  }
+  if (typeof nav.currentIndex === 'number' && nav.currentIndex >= 0) {
+    clean.currentIndex = nav.currentIndex;
+  }
+  if (Array.isArray(nav.chapters) && nav.chapters.length > 0) {
+    clean.chapters = nav.chapters.map((ch) => {
+      const row: NovelChapterLink = {
+        title: (ch.title || '').trim() || 'Bab',
+        url: ch.url,
+      };
+      if (ch.titleDst && ch.titleDst.trim()) row.titleDst = ch.titleDst.trim();
+      if (ch.current) row.current = true;
+      return row;
+    });
+  }
+  return clean;
+}
 
 const NOVEL_HOST_RE =
-  /(kakuyomu\.jp|syosetu\.com|syosetu\.org|alphapolis\.co\.jp|aozora\.gr\.jp|royalroad\.com|scribblehub\.com|webnovel\.com|wuxiaworld\.|novelbin\.|novelfull\.|wattpad\.com|lightnovel|webnovel)/i;
+  /(kakuyomu\.jp|syosetu\.com|syosetu\.org|alphapolis\.co\.jp|aozora\.gr\.jp|royalroad\.com|scribblehub\.com|webnovel\.com|wuxiaworld\.|novelbin\.|novelfull\.|wattpad\.com|lightnovel|webnovel|novelupdates\.|wordpress\.com)/i;
 
 const NEXT_LINK_RE =
-  /(次のエピソード|次の話|次のページ|次へ|次話|次の章|next\s*(chapter|episode|ep|page|part)?|bab\s*(berikutnya|selanjutnya)|halaman\s*(berikutnya|selanjutnya)|selanjutnya|berikutnya|lanjutan|^next$|^»$|^→$)/i;
+  /(次のエピソード|次の話|次のページ|次へ|次話|次の章|next\s*(chapter|episode|ep|page|part|post)?|newer\s*post|bab\s*(berikutnya|selanjutnya)|halaman\s*(berikutnya|selanjutnya)|artikel\s*(berikutnya|selanjutnya)|cerita\s*(berikutnya|selanjutnya)|selanjutnya|berikutnya|lanjutan|^next$|^»$|^→$)/i;
 const PREV_LINK_RE =
-  /(前のエピソード|前の話|前のページ|前へ|前話|前の章|prev(ious)?\s*(chapter|episode|ep|page|part)?|bab\s*sebelumnya|halaman\s*sebelumnya|sebelumnya|^prev$|^«$|^←$)/i;
+  /(前のエピソード|前の話|前のページ|前へ|前話|前の章|prev(ious)?\s*(chapter|episode|ep|page|part|post)?|older\s*post|bab\s*sebelumnya|halaman\s*sebelumnya|artikel\s*sebelumnya|cerita\s*sebelumnya|sebelumnya|^prev$|^«$|^←$)/i;
 const TOC_LINK_RE =
   /(目次|エピソード一覧|作品トップ|table\s*of\s*contents|chapter\s*list|all\s*chapters|daftar\s*(isi|bab)|^toc$)/i;
+
+function deriveKnownTocInfo(rawUrl: string): { tocUrl: string; isTocPage: boolean } | null {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname;
+
+    if (host.includes('kakuyomu.jp')) {
+      const ep = path.match(/^\/works\/(\d+)\/episodes\/\d+/);
+      if (ep) return { tocUrl: `https://kakuyomu.jp/works/${ep[1]}`, isTocPage: false };
+      const wk = path.match(/^\/works\/(\d+)\/?$/);
+      if (wk) return { tocUrl: `https://kakuyomu.jp/works/${wk[1]}`, isTocPage: true };
+    }
+    if (host.includes('syosetu.com')) {
+      const ep = path.match(/^\/(n[a-z0-9]+)\/\d+\/?$/i);
+      if (ep) return { tocUrl: `${u.origin}/${ep[1]}/`, isTocPage: false };
+      const wk = path.match(/^\/(n[a-z0-9]{4,})\/?$/i);
+      if (wk) return { tocUrl: `${u.origin}/${wk[1]}/`, isTocPage: true };
+    }
+    if (host.includes('syosetu.org')) {
+      const ep = path.match(/^\/novel\/(\d+)\/\d+\.html$/i);
+      if (ep) return { tocUrl: `${u.origin}/novel/${ep[1]}/`, isTocPage: false };
+      const wk = path.match(/^\/novel\/(\d+)\/?$/i);
+      if (wk) return { tocUrl: `${u.origin}/novel/${wk[1]}/`, isTocPage: true };
+    }
+    if (host.includes('alphapolis.co.jp')) {
+      const ep = path.match(/^\/novel\/(\d+\/\d+)\/episode\/\d+/i);
+      if (ep) return { tocUrl: `${u.origin}/novel/${ep[1]}`, isTocPage: false };
+      const wk = path.match(/^\/novel\/(\d+\/\d+)\/?$/i);
+      if (wk) return { tocUrl: `${u.origin}/novel/${wk[1]}`, isTocPage: true };
+    }
+    if (host.includes('royalroad.com')) {
+      const ep = path.match(/^\/fiction\/(\d+)\/([^/]+)\/chapter\/\d+/i);
+      if (ep) return { tocUrl: `${u.origin}/fiction/${ep[1]}/${ep[2]}`, isTocPage: false };
+      const wk = path.match(/^\/fiction\/(\d+)\/([^/]+)\/?$/i);
+      if (wk) return { tocUrl: `${u.origin}/fiction/${wk[1]}/${wk[2]}`, isTocPage: true };
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
 
 export function deriveSeriesTitleId(rawUrl: string): string {
   try {
@@ -961,22 +1072,36 @@ function extractKakuyomuFromNextData(
     const chapters: NovelChapterLink[] = orderedIds.map((epId, idx) => {
       const epObj = apollo[`Episode:${epId}`] as { title?: string } | undefined;
       return {
-        title: (epObj?.title || `Episode ${idx + 1}`).trim(),
+        title: (epObj?.title || `Bab ${idx + 1}`).trim(),
         url: `https://kakuyomu.jp/works/${workId}/episodes/${epId}`,
-        current: epId === currentEpId,
+        ...(currentEpId && epId === currentEpId ? { current: true } : {}),
       };
     });
 
-    const curIdx = chapters.findIndex((c) => c.current);
-    return {
+    const curIdx = currentEpId ? chapters.findIndex((c) => c.current) : -1;
+    const isTocPage = !currentEpId;
+    return sanitizeNovelNav({
       isNovel: true,
+      isTocPage,
       seriesTitle,
-      chapterLabel: curIdx >= 0 ? `${curIdx + 1} / ${chapters.length}` : undefined,
+      totalChapters: chapters.length,
+      ...(curIdx >= 0 ? { currentIndex: curIdx } : {}),
+      chapterLabel:
+        curIdx >= 0
+          ? `${curIdx + 1} / ${chapters.length}`
+          : chapters.length > 0
+            ? `${chapters.length} bab`
+            : undefined,
+      firstUrl: chapters[0]?.url || null,
       prevUrl: curIdx > 0 ? chapters[curIdx - 1].url : null,
-      nextUrl: curIdx >= 0 && curIdx + 1 < chapters.length ? chapters[curIdx + 1].url : null,
+      nextUrl: isTocPage
+        ? chapters[0]?.url || null
+        : curIdx >= 0 && curIdx + 1 < chapters.length
+          ? chapters[curIdx + 1].url
+          : null,
       tocUrl: `https://kakuyomu.jp/works/${workId}`,
-      chapters: chapters.slice(0, 200),
-    };
+      chapters: chapters.slice(0, 500),
+    });
   } catch {
     return null;
   }
@@ -1034,32 +1159,61 @@ function deriveNumericChapterFallback(cleanUrl: string): Partial<NovelNavigation
   return {};
 }
 
+const TOC_CTA_SKIP_RE =
+  /^(最初から読む|1話から読む|一話から読む|最新話|最新話を読む|続きを読む|start\s*reading|read\s*first|latest\s*chapter|continue\s*reading|baca\s*dari\s*awal)$/i;
+
 function buildChaptersFromSiblingLinks(
   links: Array<{ title: string; url: string }>,
-  cleanUrl: string
+  cleanUrl: string,
+  tocContextUrl?: string
 ): {
   chapters: NovelChapterLink[];
   prevUrl: string | null;
   nextUrl: string | null;
+  firstUrl: string | null;
+  currentIndex?: number;
+  totalChapters?: number;
   chapterLabel?: string;
 } {
   const curKey = canonicalUrlKey(cleanUrl);
+  const basisUrl = tocContextUrl || cleanUrl;
   let siblingRe: RegExp | null = null;
   try {
-    const u = new URL(cleanUrl);
-    const kaku = u.pathname.match(/^\/works\/(\d+)\/episodes\/\d+/);
-    if (u.hostname.includes('kakuyomu.jp') && kaku) {
+    const u = new URL(basisUrl);
+    const host = u.hostname.toLowerCase();
+    const kaku = u.pathname.match(/^\/works\/(\d+)/);
+    if (host.includes('kakuyomu.jp') && kaku) {
       siblingRe = new RegExp(`^https?://[^/]*kakuyomu\\.jp/works/${kaku[1]}/episodes/\\d+`, 'i');
+    } else if (host.includes('syosetu.com')) {
+      const syo = u.pathname.match(/^\/(n[a-z0-9]+)/i);
+      if (syo) {
+        siblingRe = new RegExp(`^https?://[^/]*syosetu\\.com/${syo[1]}/\\d+/?$`, 'i');
+      }
+    } else if (host.includes('syosetu.org')) {
+      const ham = u.pathname.match(/^\/novel\/(\d+)/);
+      if (ham) {
+        siblingRe = new RegExp(`^https?://[^/]*syosetu\\.org/novel/${ham[1]}/\\d+\\.html$`, 'i');
+      }
+    } else if (host.includes('alphapolis.co.jp')) {
+      const alpha = u.pathname.match(/^\/novel\/(\d+\/\d+)/);
+      if (alpha) {
+        siblingRe = new RegExp(
+          `^https?://[^/]*alphapolis\\.co\\.jp/novel/${alpha[1]}/episode/\\d+`,
+          'i'
+        );
+      }
+    } else if (host.includes('royalroad.com')) {
+      const rr = u.pathname.match(/^\/fiction\/(\d+)/);
+      if (rr) {
+        siblingRe = new RegExp(`^https?://[^/]*royalroad\\.com/fiction/${rr[1]}/[^/]+/chapter/\\d+`, 'i');
+      }
     } else {
-      const syo = u.pathname.match(/^\/(n[a-z0-9]+)\/\d+/i);
-      if (u.hostname.includes('syosetu.com') && syo) {
-        siblingRe = new RegExp(`^https?://[^/]*syosetu\\.com/${syo[1]}/\\d+`, 'i');
-      } else {
-        const generic = u.pathname.match(/^(.*\/(?:chapter|bab|episode|episodes|ep|ch)[-_/?]?)\d+/i);
-        if (generic) {
-          const escapedOrigin = `${u.origin}${generic[1]}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          siblingRe = new RegExp(`^${escapedOrigin}\\d+`, 'i');
-        }
+      const generic = u.pathname.match(
+        /^(.*\/(?:chapter|bab|episode|episodes|ep|ch|part|bagian|cards)[-_/?]?)\d+/i
+      );
+      if (generic) {
+        const escapedOrigin = `${u.origin}${generic[1]}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        siblingRe = new RegExp(`^${escapedOrigin}\\d+`, 'i');
       }
     }
   } catch {
@@ -1067,29 +1221,49 @@ function buildChaptersFromSiblingLinks(
   }
 
   if (!siblingRe) {
-    return { chapters: [], prevUrl: null, nextUrl: null };
+    return { chapters: [], prevUrl: null, nextUrl: null, firstUrl: null };
   }
 
   const seen = new Set<string>();
   const chapters: NovelChapterLink[] = [];
   for (const item of links) {
     if (!siblingRe.test(item.url)) continue;
+    const rawLabel = item.title
+      .replace(/\s*\d{4}年\d{1,2}月\d{1,2}日.*$/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (TOC_CTA_SKIP_RE.test(rawLabel)) continue;
     const key = canonicalUrlKey(item.url);
     if (seen.has(key)) continue;
     seen.add(key);
     chapters.push({
-      title: item.title.trim() || `Bab ${chapters.length + 1}`,
+      title: rawLabel || `Bab ${chapters.length + 1}`,
       url: item.url,
-      current: key === curKey,
+      ...(key === curKey ? { current: true } : {}),
     });
   }
 
-  const curIdx = chapters.findIndex((c) => c.current);
+  const capped = chapters.slice(0, 500);
+  const curIdx = capped.findIndex((c) => c.current);
+  const tocInfo = deriveKnownTocInfo(cleanUrl);
+  const isToc = Boolean(tocInfo?.isTocPage) && curIdx < 0;
   return {
-    chapters: chapters.slice(0, 200),
-    prevUrl: curIdx > 0 ? chapters[curIdx - 1].url : null,
-    nextUrl: curIdx >= 0 && curIdx + 1 < chapters.length ? chapters[curIdx + 1].url : null,
-    chapterLabel: curIdx >= 0 ? `${curIdx + 1} / ${chapters.length}` : undefined,
+    chapters: capped,
+    firstUrl: capped[0]?.url || null,
+    prevUrl: curIdx > 0 ? capped[curIdx - 1].url : null,
+    nextUrl: isToc
+      ? capped[0]?.url || null
+      : curIdx >= 0 && curIdx + 1 < capped.length
+        ? capped[curIdx + 1].url
+        : null,
+    ...(curIdx >= 0 ? { currentIndex: curIdx } : {}),
+    ...(capped.length > 0 ? { totalChapters: capped.length } : {}),
+    chapterLabel:
+      curIdx >= 0
+        ? `${curIdx + 1} / ${capped.length}`
+        : capped.length > 0
+          ? `${capped.length} bab`
+          : undefined,
   };
 }
 
@@ -1099,16 +1273,18 @@ function extractNovelNavigationFromHtml(
   cleanUrl: string
 ): NovelNavigation {
   const curKey = canonicalUrlKey(cleanUrl);
-  const kakuMatch = cleanUrl.match(/kakuyomu\.jp\/works\/(\d+)\/episodes\/(\d+)/i);
-  const nextDataNav = kakuMatch
-    ? extractKakuyomuFromNextData(rawHtml, kakuMatch[1], kakuMatch[2])
-    : null;
+  const tocInfo = deriveKnownTocInfo(cleanUrl);
+  const kakuEpMatch = cleanUrl.match(/kakuyomu\.jp\/works\/(\d+)\/episodes\/(\d+)/i);
+  const kakuWorkMatch = !kakuEpMatch ? cleanUrl.match(/kakuyomu\.jp\/works\/(\d+)\/?$/i) : null;
+  const nextDataNav = kakuEpMatch
+    ? extractKakuyomuFromNextData(rawHtml, kakuEpMatch[1], kakuEpMatch[2])
+    : kakuWorkMatch
+      ? extractKakuyomuFromNextData(rawHtml, kakuWorkMatch[1], '')
+      : null;
 
   let prevUrl: string | null = nextDataNav?.prevUrl || null;
   let nextUrl: string | null = nextDataNav?.nextUrl || null;
-  let tocUrl: string | null =
-    nextDataNav?.tocUrl ||
-    (kakuMatch ? `https://kakuyomu.jp/works/${kakuMatch[1]}` : null);
+  let tocUrl: string | null = nextDataNav?.tocUrl || tocInfo?.tocUrl || null;
 
   // W3C standard <link rel="prev|next">
   if (!prevUrl) {
@@ -1120,16 +1296,16 @@ function extractNovelNavigationFromHtml(
     if (linkNext) nextUrl = resolveSafeSiblingUrl(linkNext, cleanUrl);
   }
 
-  // Site-specific IDs & classes (Kakuyomu, Syosetu, AlphaPolis)
+  // Site-specific & WordPress/novel pagination selectors
   if (!prevUrl) {
     const el = doc.querySelector(
-      '#contentMain-readPreviousEpisode, a[data-test="previous-episode-link"], .c-pager__item--before, a.prev-episode'
+      '#contentMain-readPreviousEpisode, a[data-test="previous-episode-link"], .c-pager__item--before, a.prev-episode, .nav-previous a, .post-navigation .nav-previous a, a.prev.page-numbers'
     );
     if (el?.getAttribute('href')) prevUrl = resolveSafeSiblingUrl(el.getAttribute('href')!, cleanUrl);
   }
   if (!nextUrl) {
     const el = doc.querySelector(
-      '#contentMain-readNextEpisode, a[data-test="next-episode-link"], .c-pager__item--next, a.next-episode'
+      '#contentMain-readNextEpisode, a[data-test="next-episode-link"], .c-pager__item--next, a.next-episode, .nav-next a, .post-navigation .nav-next a, a.next.page-numbers'
     );
     if (el?.getAttribute('href')) nextUrl = resolveSafeSiblingUrl(el.getAttribute('href')!, cleanUrl);
   }
@@ -1150,12 +1326,12 @@ function extractNovelNavigationFromHtml(
     allAnchors.push({ title: label, url: abs });
 
     if (!nextUrl && canonicalUrlKey(abs) !== curKey) {
-      if (NEXT_LINK_RE.test(label) || /next[-_]?(ep|chap|page)|readNext/i.test(clsAndId)) {
+      if (NEXT_LINK_RE.test(label) || /next[-_]?(ep|chap|page|post)|readNext/i.test(clsAndId)) {
         nextUrl = abs;
       }
     }
     if (!prevUrl && canonicalUrlKey(abs) !== curKey) {
-      if (PREV_LINK_RE.test(label) || /prev(ious)?[-_]?(ep|chap|page)|readPrevious/i.test(clsAndId)) {
+      if (PREV_LINK_RE.test(label) || /prev(ious)?[-_]?(ep|chap|page|post)|readPrevious/i.test(clsAndId)) {
         prevUrl = abs;
       }
     }
@@ -1179,26 +1355,37 @@ function extractNovelNavigationFromHtml(
 
   const isNovel =
     Boolean(nextDataNav?.isNovel) ||
+    Boolean(tocInfo) ||
     isKnownNovelUrl(cleanUrl) ||
     Boolean(fallback.isNovel) ||
     chapters.length >= 2 ||
     Boolean(prevUrl || nextUrl);
 
-  return {
+  const curIdx =
+    nextDataNav?.currentIndex !== undefined
+      ? nextDataNav.currentIndex
+      : siblingNav.currentIndex;
+
+  return sanitizeNovelNav({
     isNovel,
+    isTocPage: Boolean(nextDataNav?.isTocPage || (tocInfo?.isTocPage && chapters.length >= 1)),
     seriesTitle: nextDataNav?.seriesTitle,
     chapterLabel: nextDataNav?.chapterLabel || siblingNav.chapterLabel || fallback.chapterLabel,
+    totalChapters: nextDataNav?.totalChapters || siblingNav.totalChapters,
+    currentIndex: curIdx,
+    firstUrl: nextDataNav?.firstUrl || siblingNav.firstUrl || chapters[0]?.url || null,
     prevUrl,
     nextUrl,
     tocUrl,
     chapters: chapters.length > 0 ? chapters : undefined,
-  };
+  });
 }
 
 function extractNovelNavigationFromMarkdown(md: string, cleanUrl: string): NovelNavigation {
   const curKey = canonicalUrlKey(cleanUrl);
+  const tocInfo = deriveKnownTocInfo(cleanUrl);
   const mdLinks: Array<{ title: string; url: string }> = [];
-  const linkRe = /\[([^\]\n]{1,120})\]\((https?:\/\/[^)\s]+)\)/g;
+  const linkRe = /\[([^\]\n]{1,140})\]\((https?:\/\/[^)\s]+)\)/g;
   let m: RegExpExecArray | null;
   while ((m = linkRe.exec(md)) !== null) {
     const safe = toSafeHttpUrl(m[2]);
@@ -1208,18 +1395,13 @@ function extractNovelNavigationFromMarkdown(md: string, cleanUrl: string): Novel
 
   let prevUrl: string | null = null;
   let nextUrl: string | null = null;
-  let tocUrl: string | null = null;
+  let tocUrl: string | null = tocInfo?.tocUrl || null;
 
   for (const item of mdLinks) {
     if (canonicalUrlKey(item.url) === curKey) continue;
     if (!nextUrl && NEXT_LINK_RE.test(item.title)) nextUrl = item.url;
     if (!prevUrl && PREV_LINK_RE.test(item.title)) prevUrl = item.url;
     if (!tocUrl && TOC_LINK_RE.test(item.title)) tocUrl = item.url;
-  }
-
-  const kakuMatch = cleanUrl.match(/kakuyomu\.jp\/works\/(\d+)\/episodes\/(\d+)/i);
-  if (kakuMatch && !tocUrl) {
-    tocUrl = `https://kakuyomu.jp/works/${kakuMatch[1]}`;
   }
 
   const siblingNav = buildChaptersFromSiblingLinks(mdLinks, cleanUrl);
@@ -1232,36 +1414,228 @@ function extractNovelNavigationFromMarkdown(md: string, cleanUrl: string): Novel
   if (!tocUrl && fallback.tocUrl) tocUrl = fallback.tocUrl;
 
   const isNovel =
+    Boolean(tocInfo) ||
     isKnownNovelUrl(cleanUrl) ||
     Boolean(fallback.isNovel) ||
     siblingNav.chapters.length >= 2 ||
     Boolean(prevUrl || nextUrl);
 
-  return {
+  return sanitizeNovelNav({
     isNovel,
+    isTocPage: Boolean(tocInfo?.isTocPage && siblingNav.chapters.length >= 1),
     chapterLabel: siblingNav.chapterLabel || fallback.chapterLabel,
+    totalChapters: siblingNav.totalChapters,
+    currentIndex: siblingNav.currentIndex,
+    firstUrl: siblingNav.firstUrl,
     prevUrl,
     nextUrl,
     tocUrl,
     chapters: siblingNav.chapters.length > 0 ? siblingNav.chapters : undefined,
-  };
+  });
+}
+
+function applyChapterListToCurrentUrl(
+  tocData: { seriesTitle?: string; tocUrl: string; chapters: NovelChapterLink[] },
+  currentUrl: string
+): NovelNavigation {
+  const curKey = canonicalUrlKey(currentUrl);
+  const tocInfo = deriveKnownTocInfo(currentUrl);
+  const marked: NovelChapterLink[] = tocData.chapters.map((ch) => ({
+    title: ch.title,
+    ...(ch.titleDst ? { titleDst: ch.titleDst } : {}),
+    url: ch.url,
+    ...(canonicalUrlKey(ch.url) === curKey ? { current: true } : {}),
+  }));
+  const curIdx = marked.findIndex((c) => c.current);
+  const isTocPage = Boolean(tocInfo?.isTocPage) && curIdx < 0;
+  return sanitizeNovelNav({
+    isNovel: true,
+    isTocPage,
+    seriesTitle: tocData.seriesTitle,
+    totalChapters: marked.length,
+    ...(curIdx >= 0 ? { currentIndex: curIdx } : {}),
+    chapterLabel:
+      curIdx >= 0
+        ? `${curIdx + 1} / ${marked.length}`
+        : marked.length > 0
+          ? `${marked.length} bab`
+          : undefined,
+    firstUrl: marked[0]?.url || null,
+    prevUrl: curIdx > 0 ? marked[curIdx - 1].url : null,
+    nextUrl: isTocPage
+      ? marked[0]?.url || null
+      : curIdx >= 0 && curIdx + 1 < marked.length
+        ? marked[curIdx + 1].url
+        : null,
+    tocUrl: tocData.tocUrl,
+    chapters: marked,
+  });
+}
+
+async function fetchSeriesTocDirect(
+  tocUrl: string,
+  currentUrl: string
+): Promise<NovelNavigation | null> {
+  const safeToc = toSafeHttpUrl(tocUrl);
+  if (!safeToc) return null;
+  const cacheKey = canonicalUrlKey(safeToc);
+  const mem = seriesTocCache.get(cacheKey);
+  if (mem && mem.chapters.length >= 2) {
+    return applyChapterListToCurrentUrl(mem, currentUrl);
+  }
+  if (typeof window !== 'undefined') {
+    try {
+      const saved = window.sessionStorage.getItem(`tranx_toc_v1::${cacheKey}`);
+      if (saved) {
+        const parsed = JSON.parse(saved) as {
+          seriesTitle?: string;
+          tocUrl: string;
+          chapters: NovelChapterLink[];
+        };
+        if (Array.isArray(parsed.chapters) && parsed.chapters.length >= 2) {
+          seriesTocCache.set(cacheKey, parsed);
+          return applyChapterListToCurrentUrl(parsed, currentUrl);
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), 11000);
+  try {
+    let mdNav: NovelNavigation | null = null;
+    let mdTitle = '';
+    let htmlNav: NovelNavigation | null = null;
+
+    const jinaToc = (async () => {
+      try {
+        const resp = await fetch(`https://r.jina.ai/${safeToc}`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          signal: ctrl.signal,
+        });
+        if (!resp.ok) return;
+        const ctype = resp.headers.get('content-type') || '';
+        let content = '';
+        if (ctype.includes('application/json')) {
+          const j = await resp.json();
+          mdTitle = String(j?.data?.title || '')
+            .replace(/\s*[-–|]\s*(カクヨム|小説家になろう|ハーメルン|Kakuyomu).*$/i, '')
+            .trim();
+          content = String(j?.data?.content || '');
+        } else {
+          content = await resp.text();
+        }
+        if (content) {
+          mdNav = extractNovelNavigationFromMarkdown(content, safeToc);
+        }
+      } catch {
+        // ignore
+      }
+    })();
+
+    const htmlToc = (async () => {
+      try {
+        const raw = await fetchRawHtmlViaCorsProxy(safeToc, ctrl.signal);
+        if (!raw) return;
+        const doc = new DOMParser().parseFromString(raw, 'text/html');
+        htmlNav = extractNovelNavigationFromHtml(doc, raw, safeToc);
+      } catch {
+        // ignore
+      }
+    })();
+
+    await Promise.all([jinaToc, htmlToc]);
+
+    const htmlChapters = (htmlNav as NovelNavigation | null)?.chapters || [];
+    const mdChapters = (mdNav as NovelNavigation | null)?.chapters || [];
+    const bestChapters = htmlChapters.length >= mdChapters.length ? htmlChapters : mdChapters;
+    if (bestChapters.length < 2) return null;
+
+    const seriesTitle =
+      (htmlNav as NovelNavigation | null)?.seriesTitle ||
+      mdTitle ||
+      undefined;
+    const tocRecord = {
+      ...(seriesTitle ? { seriesTitle } : {}),
+      tocUrl: safeToc,
+      chapters: bestChapters,
+    };
+    seriesTocCache.set(cacheKey, tocRecord);
+    if (typeof window !== 'undefined') {
+      try {
+        window.sessionStorage.setItem(`tranx_toc_v1::${cacheKey}`, JSON.stringify(tocRecord));
+      } catch {
+        // ignore quota
+      }
+    }
+    return applyChapterListToCurrentUrl(tocRecord, currentUrl);
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+export async function translateChapterTitlesDirect(params: {
+  chapters: NovelChapterLink[];
+  mode: ModePair;
+  titleId?: string;
+  tocKey: string;
+}): Promise<Record<string, string>> {
+  const { chapters, mode, titleId, tocKey } = params;
+  if (!chapters.length) return {};
+  const cacheKey = `${tocKey}::${mode}`;
+  const cached = translatedChapterTitlesCache.get(cacheKey);
+  if (cached && Object.keys(cached).length >= Math.min(chapters.length, 60)) {
+    return cached;
+  }
+  const map: Record<string, string> = { ...(cached || {}) };
+  // Prioritize window around current chapter (or first 80 chapters) so TOC translates fast
+  const curIdx = chapters.findIndex((c) => c.current);
+  const start = curIdx >= 0 ? Math.max(0, curIdx - 30) : 0;
+  const slice = chapters.slice(start, start + 80).filter((c) => !map[c.url] && c.title.trim());
+  if (slice.length > 0) {
+    try {
+      const { outputs } = await translateParagraphsDirect({
+        paragraphs: slice.map((c) => c.title),
+        mode,
+        titleId,
+      });
+      slice.forEach((ch, idx) => {
+        if (outputs[idx]) map[ch.url] = outputs[idx];
+      });
+      translatedChapterTitlesCache.set(cacheKey, map);
+    } catch {
+      // Keep original titles gracefully if network hiccups
+    }
+  }
+  return map;
 }
 
 function mergeNovelNav(primary: NovelNavigation, secondary?: NovelNavigation | null): NovelNavigation {
-  if (!secondary) return primary;
+  if (!secondary) return sanitizeNovelNav(primary);
   const chapters =
     (primary.chapters?.length || 0) >= (secondary.chapters?.length || 0)
       ? primary.chapters
       : secondary.chapters;
-  return {
+  const currentIndex =
+    primary.currentIndex !== undefined ? primary.currentIndex : secondary.currentIndex;
+  const totalChapters =
+    (chapters?.length || 0) || primary.totalChapters || secondary.totalChapters;
+  return sanitizeNovelNav({
     isNovel: primary.isNovel || secondary.isNovel,
+    isTocPage: primary.isTocPage || secondary.isTocPage,
     seriesTitle: primary.seriesTitle || secondary.seriesTitle,
     chapterLabel: primary.chapterLabel || secondary.chapterLabel,
+    totalChapters,
+    currentIndex,
+    firstUrl: primary.firstUrl || secondary.firstUrl || chapters?.[0]?.url || null,
     prevUrl: primary.prevUrl || secondary.prevUrl || null,
     nextUrl: primary.nextUrl || secondary.nextUrl || null,
     tocUrl: primary.tocUrl || secondary.tocUrl || null,
     chapters,
-  };
+  });
 }
 
 async function fetchRawHtmlViaCorsProxy(
@@ -1348,8 +1722,6 @@ async function fetchWebArticleDirect(
     let navFromMd: NovelNavigation | null = null;
     let navFromHtml: NovelNavigation | null = null;
 
-    const shouldFetchHtmlNow = Boolean(options?.needRawHtml) || isKnownNovelUrl(cleanUrl);
-
     const jinaPromise =
       srcParas.length > 0
         ? Promise.resolve()
@@ -1386,24 +1758,32 @@ async function fetchWebArticleDirect(
             }
           })();
 
-    const htmlPromise =
-      rawHtml || !shouldFetchHtmlNow
-        ? Promise.resolve()
-        : (async () => {
-            // Bounded fast timeout so a slow CORS proxy never stalls Jina Reader
-            const htmlCtrl = new AbortController();
-            const htmlTimer = window.setTimeout(() => htmlCtrl.abort(), 8500);
-            try {
-              const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, htmlCtrl.signal);
-              if (fetched) rawHtml = fetched;
-            } catch {
-              // Ignore proxy timeout when Jina Reader succeeds
-            } finally {
-              window.clearTimeout(htmlTimer);
-            }
-          })();
+    // Always run bounded fast parallel HTML fetch so ANY novel/blog site detects rel="next"/TOC links
+    const htmlPromise = rawHtml
+      ? Promise.resolve()
+      : (async () => {
+          const htmlCtrl = new AbortController();
+          const htmlTimer = window.setTimeout(
+            () => htmlCtrl.abort(),
+            options?.needRawHtml ? 9000 : 5500
+          );
+          try {
+            const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, htmlCtrl.signal);
+            if (fetched) rawHtml = fetched;
+          } catch {
+            // Ignore proxy timeout when Jina Reader succeeds
+          } finally {
+            window.clearTimeout(htmlTimer);
+          }
+        })();
 
-    await Promise.all([jinaPromise, htmlPromise]);
+    const knownToc = deriveKnownTocInfo(cleanUrl);
+    const earlyTocPromise =
+      knownToc && !knownToc.isTocPage
+        ? fetchSeriesTocDirect(knownToc.tocUrl, cleanUrl).catch(() => null)
+        : Promise.resolve(null);
+
+    const [, , earlyTocNav] = await Promise.all([jinaPromise, htmlPromise, earlyTocPromise]);
 
     // If Jina returned nothing and we didn't fetch raw HTML yet, try raw HTML proxy now
     if (srcParas.length === 0 && !rawHtml) {
@@ -1449,10 +1829,33 @@ async function fetchWebArticleDirect(
       `${titleSrc}\n${srcParas.slice(0, 6).join('\n')}`,
       'ja'
     );
-    const mergedNav = mergeNovelNav(
-      navFromHtml || { isNovel: isKnownNovelUrl(finalUrl) },
+    let mergedNav = mergeNovelNav(
+      navFromHtml || sanitizeNovelNav({ isNovel: isKnownNovelUrl(finalUrl) }),
       navFromMd || cached?.novelNav
     );
+    if (earlyTocNav) {
+      mergedNav = mergeNovelNav(earlyTocNav, mergedNav);
+    } else if (
+      mergedNav.tocUrl &&
+      canonicalUrlKey(mergedNav.tocUrl) !== canonicalUrlKey(finalUrl) &&
+      (mergedNav.chapters?.length || 0) < 2
+    ) {
+      const discoveredToc = await fetchSeriesTocDirect(mergedNav.tocUrl, finalUrl).catch(() => null);
+      if (discoveredToc) {
+        mergedNav = mergeNovelNav(discoveredToc, mergedNav);
+      }
+    }
+    // If current page itself IS a TOC page with chapters, store it in seriesTocCache for instant chapter navigation
+    if (mergedNav.chapters && mergedNav.chapters.length >= 2 && mergedNav.tocUrl) {
+      const tocKey = canonicalUrlKey(mergedNav.tocUrl);
+      if (!seriesTocCache.has(tocKey)) {
+        seriesTocCache.set(tocKey, {
+          ...(mergedNav.seriesTitle ? { seriesTitle: mergedNav.seriesTitle } : {}),
+          tocUrl: mergedNav.tocUrl,
+          chapters: mergedNav.chapters,
+        });
+      }
+    }
 
     const entry: CachedWebEntry = {
       url: finalUrl,

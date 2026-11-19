@@ -1361,28 +1361,27 @@ textarea {
   font-weight: 600;
 }
 
-.web-tools-block {
+.ebook-toc-hero {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 14px;
+  gap: 14px;
+  padding: 18px;
   border-radius: var(--r-card);
   border: 1px solid var(--border);
-  background: var(--bg);
+  background: var(--surface);
+  box-shadow: var(--shadow-e1);
 }
 
-.web-tools-code {
-  display: block;
-  padding: 10px 12px;
-  border-radius: var(--r-control);
+.ebook-next-card {
+  margin-top: 28px;
+  padding: 20px;
+  border-radius: var(--r-card);
   border: 1px solid var(--border);
   background: var(--surface);
-  color: var(--text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  overflow-x: auto;
-  word-break: break-all;
+  box-shadow: var(--shadow-e1);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .toast-bar {

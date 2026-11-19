@@ -232,12 +232,18 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.getByRole('button', { name: 'Kembali ke percakapan' })).toBeVisible();
     await page.getByRole('button', { name: 'Kembali ke percakapan' }).click();
 
-    // 10. Verify Mode Link switches directly to dedicated Link page + Novel Reader + Bab berikutnya + Daftar bab + Situs Terjemahan + Alat Web & HP
+    // 10. Verify Mode Link switches directly to dedicated Link page + Ebook Reader + Bab berikutnya + Daftar bab + Situs Terjemahan + auto-translated Google Translate URL (and zero Alat Web & HP)
     await page.getByRole('tab', { name: 'Link' }).click();
     await expect(page.locator('textarea.composer-textarea')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /Alat Web & HP|Web & Mobile tools/i })).toHaveCount(0);
     await page.getByPlaceholder(/https:\/\//).fill('https://www.aozora.gr.jp/cards/1.html');
     await page.getByRole('button', { name: 'Terjemahkan halaman' }).click();
-    await expect(page.getByText(/Novel terdeteksi/)).toBeVisible();
+    await expect(page.getByText(/Ebook terdeteksi/)).toBeVisible();
+    const autoSiteHref = await page
+      .getByRole('link', { name: 'Buka web terjemahan otomatis' })
+      .getAttribute('href');
+    expect(autoSiteHref || '').toContain('www-aozora-gr-jp.translate.goog');
+    expect(autoSiteHref || '').toContain('_x_tr_tl=en');
     await expect(
       page.getByRole('button', { name: 'Buka halaman terjemahan penuh' })
     ).toBeVisible();
@@ -250,25 +256,19 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await page.getByRole('button', { name: 'Berdampingan' }).click();
     await expect(page.getByText('千早は小さく笑った。')).toBeVisible();
     // Click Bab berikutnya -> navigates directly to Chapter 2 without re-entering any URL
-    await page.getByRole('button', { name: /Bab berikutnya/ }).click();
+    await page.locator('.novel-chapter-dock').getByRole('button', { name: /Bab berikutnya/ }).click();
     await expect(page.getByRole('heading', { name: 'Bab 2: Lentera di Kyoto' })).toBeVisible();
+    await expect(page.getByText(/Anda berada di bab terakhir yang tersedia/)).toBeVisible();
     // Open Daftar bab modal -> jump back to Bab 1
-    await page.getByRole('button', { name: /Daftar bab/ }).click();
+    await page.locator('.novel-chapter-dock').getByRole('button', { name: /Daftar bab/ }).click();
     await expect(page.getByRole('dialog')).toBeVisible();
     await page.getByRole('dialog').getByRole('button', { name: /Bab 1: Hujan di Rashomon/ }).click();
     await expect(page.getByRole('heading', { name: 'Bab 1: Hujan di Rashomon' })).toBeVisible();
     // Switch to Situs Terjemahan (extension-less full translated website inside sandboxed iframe)
     await page.getByRole('button', { name: 'Situs Terjemahan' }).click();
     await expect(page.locator('iframe[title="Pembaca Halaman Terjemahan"]')).toBeVisible();
-    // Open Alat Web & HP modal and verify zero javascript: <a href> in DOM
-    await page.getByRole('button', { name: 'Alat Web & HP' }).click();
-    await expect(
-      page
-        .getByRole('dialog')
-        .getByRole('heading', { name: 'Alat Terjemahan Otomatis (Desktop & HP)' })
-    ).toBeVisible();
+    await expect(page.getByRole('button', { name: /Alat Web & HP|Web & Mobile tools/i })).toHaveCount(0);
     await expect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
-    await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Kembali' }).click();
 
     // 11. Verify Lainnya -> Berkas saya & Daftar nama (14-field glossary)
@@ -344,9 +344,54 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       await route.fulfill({ status: 404, body: 'Not Found' });
     });
 
-    // CORS-enabled raw HTML proxy mock (tests real directEngine novel link detection, XSS stripping, and <a href> rewriting in Situs Terjemahan)
+    // CORS-enabled raw HTML proxy mock (tests real directEngine Kakuyomu TOC + episode Ebook reader, XSS stripping, and <a href> rewriting)
     await page.route('https://api.allorigins.win/raw**', async (route) => {
       const targetParam = new URL(route.request().url()).searchParams.get('url') || '';
+      if (targetParam.includes('kakuyomu.jp/works/2912051604668493030/episodes/')) {
+        // Real Kakuyomu episode HTML does NOT contain __NEXT_DATA__ TOC; tranX must auto-fetch /works/2912051604668493030!
+        const isEp101 = targetParam.includes('episodes/101');
+        const isEp102 = targetParam.includes('episodes/102');
+        const html = isEp101
+          ? `<!doctype html><html><head><title>Episode 1: Best Way to Skip School</title></head><body><h1>Episode 1: Best Way to Skip School</h1><p>Morning rain tapped softly against the classroom window.</p><a id="contentMain-readNextEpisode" href="/works/2912051604668493030/episodes/102">次のエピソード</a></body></html>`
+          : isEp102
+            ? `<!doctype html><html><head><title>Episode 2: After School Confession</title></head><body><h1>Episode 2: After School Confession</h1><p>Lantern light swayed quietly across the wet stone alley.</p><a id="contentMain-readPreviousEpisode" href="/works/2912051604668493030/episodes/101">前のエピソード</a><a id="contentMain-readNextEpisode" href="/works/2912051604668493030/episodes/103">次のエピソード</a></body></html>`
+            : `<!doctype html><html><head><title>Episode 3: Tatsuya Secret Effort</title></head><body><h1>Episode 3: Tatsuya Secret Effort</h1><p>Chihaya stood quietly under the wooden gate while listening to the rain.</p><a id="contentMain-readPreviousEpisode" href="/works/2912051604668493030/episodes/102">前のエピソード</a></body></html>`;
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html; charset=utf-8',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: html,
+        });
+        return;
+      }
+      if (targetParam.includes('kakuyomu.jp/works/2912051604668493030')) {
+        const nextData = JSON.stringify({
+          props: {
+            pageProps: {
+              __APOLLO_STATE__: {
+                'Work:2912051604668493030': { title: 'Kyoto School Story' },
+                'TableOfContentsChapter:1': {
+                  episodeUnions: [
+                    { __ref: 'Episode:101' },
+                    { __ref: 'Episode:102' },
+                    { __ref: 'Episode:103' },
+                  ],
+                },
+                'Episode:101': { title: 'Episode 1: Best Way to Skip School' },
+                'Episode:102': { title: 'Episode 2: After School Confession' },
+                'Episode:103': { title: 'Episode 3: Tatsuya Secret Effort' },
+              },
+            },
+          },
+        });
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html; charset=utf-8',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: `<!doctype html><html><head><title>Kyoto School Story - Kakuyomu</title><script id="__NEXT_DATA__" type="application/json">${nextData}</script></head><body><h1>Kyoto School Story</h1><p>A school romance novel in Kyoto.</p></body></html>`,
+        });
+        return;
+      }
       const isCh2 = targetParam.includes('2.html');
       const html = isCh2
         ? `<!doctype html><html><head><title>Chapter 2: The Lanterns of Kyoto</title></head><body><h1>Chapter 2: The Lanterns of Kyoto</h1><p>Lantern light swayed quietly across the wet stone alley.</p><nav><a rel="prev" href="/cards/1.html">Previous Chapter</a></nav></body></html>`
@@ -359,9 +404,76 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       });
     });
 
-    // CORS-enabled Jina Reader mock matching real r.jina.ai JSON schema (including pure-punctuation line)
+    // CORS-enabled Jina Reader mock matching real r.jina.ai JSON schema (including pure-punctuation line & Kakuyomu)
     await page.route('https://r.jina.ai/**', async (route) => {
-      const isCh2 = route.request().url().includes('2.html');
+      const reqUrl = route.request().url();
+      if (reqUrl.includes('kakuyomu.jp/works/2912051604668493030/episodes/101')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: 'Episode 1: Best Way to Skip School',
+              content: 'Morning rain tapped softly against the classroom window.',
+              url: 'https://kakuyomu.jp/works/2912051604668493030/episodes/101',
+            },
+          }),
+        });
+        return;
+      }
+      if (reqUrl.includes('kakuyomu.jp/works/2912051604668493030/episodes/102')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: 'Episode 2: After School Confession',
+              content: 'Lantern light swayed quietly across the wet stone alley.',
+              url: 'https://kakuyomu.jp/works/2912051604668493030/episodes/102',
+            },
+          }),
+        });
+        return;
+      }
+      if (reqUrl.includes('kakuyomu.jp/works/2912051604668493030/episodes/103')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: 'Episode 3: Tatsuya Secret Effort',
+              content:
+                'Chihaya stood quietly under the wooden gate while listening to the rain.\n\n[前のエピソード](https://kakuyomu.jp/works/2912051604668493030/episodes/102)',
+              url: 'https://kakuyomu.jp/works/2912051604668493030/episodes/103',
+            },
+          }),
+        });
+        return;
+      }
+      if (reqUrl.includes('kakuyomu.jp/works/2912051604668493030')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: 'Kyoto School Story - Kakuyomu',
+              content:
+                'A school romance novel in Kyoto.\n\n[最初から読む](https://kakuyomu.jp/works/2912051604668493030/episodes/101)\n[Episode 1: Best Way to Skip School](https://kakuyomu.jp/works/2912051604668493030/episodes/101)\n[Episode 2: After School Confession](https://kakuyomu.jp/works/2912051604668493030/episodes/102)\n[Episode 3: Tatsuya Secret Effort](https://kakuyomu.jp/works/2912051604668493030/episodes/103)',
+              url: 'https://kakuyomu.jp/works/2912051604668493030',
+            },
+          }),
+        });
+        return;
+      }
+      const isCh2 = reqUrl.includes('2.html');
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -402,6 +514,14 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
           return line.replace(/Selamat pagi/gi, 'Good morning');
         }
         return line
+          .replace(/Episode 1: Best Way to Skip School/gi, 'Bab 1: Cara Terbaik Bolos Sekolah')
+          .replace(/Episode 2: After School Confession/gi, 'Bab 2: Pengakuan Sepulang Sekolah')
+          .replace(/Episode 3: Tatsuya Secret Effort/gi, 'Bab 3: Usaha Rahasia Tatsuya')
+          .replace(/Kyoto School Story/gi, 'Kisah Sekolah Kyoto')
+          .replace(
+            /Morning rain tapped softly against the classroom window/gi,
+            'Hujan pagi mengetuk lembut jendela ruang kelas'
+          )
           .replace(/Chapter 2: The Lanterns of Kyoto/gi, 'Bab 2: Lentera di Kyoto')
           .replace(
             /Lantern light swayed quietly across the wet stone alley/gi,
@@ -435,16 +555,16 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto('/?e2e=1&direct=1');
 
-    // 1. Mode Link with bare URL (no https:// prefix) -> zero "Failed to fetch", auto-detects Novel + Next Chapter
+    // 1. Mode Link with bare URL (no https:// prefix) -> zero "Failed to fetch", auto-detects Ebook + Next Chapter
     await page.getByRole('tab', { name: 'Link' }).click();
     await page.getByPlaceholder(/https:\/\//).fill('www.aozora.gr.jp/cards/1.html');
     await page.getByRole('button', { name: 'Terjemahkan halaman' }).click();
 
     await expect(page.getByRole('main').getByText('Gerbang Hujan di Kyoto')).toBeVisible();
-    await expect(page.getByText(/Novel terdeteksi/)).toBeVisible();
+    await expect(page.getByText(/Ebook terdeteksi/)).toBeVisible();
     await expect(page.getByText(/Failed to fetch/i)).toHaveCount(0);
 
-    // Open full translated reader (/web Mode Baca) and jump to Bab berikutnya without re-entering any URL
+    // Open full translated Ebook reader (/web Mode Ebook)
     await page.getByRole('button', { name: 'Buka halaman terjemahan penuh' }).click();
     await expect(page.getByRole('heading', { name: 'Gerbang Hujan di Kyoto' })).toBeVisible();
 
@@ -460,10 +580,45 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)
     ).toBeUndefined();
 
-    // Click Bab berikutnya from Novel dock -> translates Chapter 2 automatically
-    await page.getByRole('button', { name: 'Mode Baca' }).click();
-    await page.getByRole('button', { name: /Bab berikutnya/ }).click();
+    // Click Bab berikutnya from Ebook dock -> translates Chapter 2 automatically
+    await page.getByRole('button', { name: 'Mode Ebook' }).click();
+    await page.locator('.novel-chapter-dock').getByRole('button', { name: /Bab berikutnya/ }).click();
     await expect(page.getByRole('heading', { name: 'Bab 2: Lentera di Kyoto' })).toBeVisible();
+    await page.getByRole('button', { name: 'Kembali' }).click();
+
+    // 1a. Real Kakuyomu Ebook Auto-TOC Enrichment:
+    // Opening the LAST episode (103) auto-fetches /works/2912051604668493030 TOC (3/3), translates chapter titles,
+    // allows jumping to Chapter 1 ("Baca dari Bab 1"), and advancing Chapter 1 -> Chapter 2 seamlessly!
+    await page.getByRole('tab', { name: 'Link' }).click();
+    await page
+      .getByPlaceholder(/https:\/\//)
+      .fill('https://kakuyomu.jp/works/2912051604668493030/episodes/103');
+    await page.getByRole('button', { name: 'Terjemahkan halaman' }).click();
+    await expect(page.getByText(/Ebook terdeteksi · 3 \/ 3/)).toBeVisible();
+    const kakuAutoUrl = await page
+      .getByRole('link', { name: 'Buka web terjemahan otomatis' })
+      .last()
+      .getAttribute('href');
+    expect(kakuAutoUrl || '').toContain('kakuyomu-jp.translate.goog/works/2912051604668493030/episodes/103');
+    expect(kakuAutoUrl || '').toContain('_x_tr_tl=id');
+
+    await page.getByRole('button', { name: 'Buka halaman terjemahan penuh' }).last().click();
+    await expect(page.getByRole('heading', { name: 'Bab 3: Usaha Rahasia Tatsuya' })).toBeVisible();
+    await expect(page.getByText(/Anda berada di bab terakhir yang tersedia \(3 \/ 3\)/)).toBeVisible();
+    await page.locator('.ebook-next-card').getByRole('button', { name: 'Baca dari Bab 1' }).click();
+    await expect(page.getByRole('heading', { name: 'Bab 1: Cara Terbaik Bolos Sekolah' })).toBeVisible();
+    await expect(page.getByText(/Ebook terdeteksi · 1 \/ 3/)).toBeVisible();
+    // Advance Bab 1 -> Bab 2 using end-of-chapter Ebook continuation card without typing any URL
+    await page.locator('.ebook-next-card').getByRole('button', { name: /Bab berikutnya/ }).click();
+    await expect(page.getByRole('heading', { name: 'Bab 2: Pengakuan Sepulang Sekolah' })).toBeVisible();
+    await expect(page.getByText(/Ebook terdeteksi · 2 \/ 3/)).toBeVisible();
+    await page.getByRole('button', { name: 'Kembali' }).click();
+
+    // 1a-ii. Kakuyomu Work/TOC URL -> auto-detected as Ebook TOC with "Mulai baca Bab 1"
+    await page.goto('/web?url=https%3A%2F%2Fkakuyomu.jp%2Fworks%2F2912051604668493030&mode=auto-id&view=reader');
+    await expect(page.getByText(/Daftar isi Ebook/)).toBeVisible();
+    await page.locator('.ebook-toc-hero').getByRole('button', { name: /Mulai baca Bab 1/ }).click();
+    await expect(page.getByRole('heading', { name: 'Bab 1: Cara Terbaik Bolos Sekolah' })).toBeVisible();
     await page.getByRole('button', { name: 'Kembali' }).click();
 
     // 1b. Extension-less URL shortcuts: /r/<url> and PWA /share?text=... auto-route straight into /web

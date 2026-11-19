@@ -17,7 +17,12 @@ import {
   fetchWebReaderBundle,
   mergeTitleGlossaries,
 } from '../lib/api';
-import { parseModePair, toSafeHttpUrl } from '../lib/directEngine';
+import {
+  buildAutoTranslatedSiteUrl,
+  parseModePair,
+  toSafeHttpUrl,
+  translateChapterTitlesDirect,
+} from '../lib/directEngine';
 import {
   DEFAULT_STYLE,
   removeGlossaryEntry,
@@ -648,7 +653,7 @@ export function GlossaryView({
   );
 }
 
-/* /web?url=...: Extension-less Auto-Translating Web Browser & Novel Reader */
+/* /web?url=...: Ebook Chapter-by-Chapter Reader & Auto-Translated Web Browser */
 export function TranslatedWebViewer({
   user,
   url,
@@ -658,7 +663,6 @@ export function TranslatedWebViewer({
   backPath = '/',
   strings,
   onNavigate,
-  onOpenWebTools,
 }: {
   user: AuthSessionUser;
   url: string;
@@ -668,15 +672,18 @@ export function TranslatedWebViewer({
   backPath?: string;
   strings: UiStrings;
   onNavigate: (path: string) => void;
-  onOpenWebTools?: () => void;
 }) {
   const [mode, setMode] = useState<ModePair>(initialMode);
   const [view, setView] = useState<'reader' | 'site' | 'original'>(initialView);
   const [bilingual, setBilingual] = useState(false);
   const [chaptersOpen, setChaptersOpen] = useState(false);
+  const [chapterQuery, setChapterQuery] = useState('');
+  const [translatedTitles, setTranslatedTitles] = useState<Record<string, string>>({});
+  const [translatingChapters, setTranslatingChapters] = useState(false);
   const [bundle, setBundle] = useState<WebReaderBundle | null>(null);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const autoTranslatedSiteUrl = buildAutoTranslatedSiteUrl(url, mode);
   const safeExternalUrl = toSafeHttpUrl(url);
 
   useEffect(() => {
@@ -688,6 +695,7 @@ export function TranslatedWebViewer({
     setLoading(true);
     setErrorMsg(null);
     setChaptersOpen(false);
+    setChapterQuery('');
     fetchWebReaderBundle({ user, url, mode, titleId, view })
       .then((res) => {
         if (active) {
@@ -714,7 +722,36 @@ export function TranslatedWebViewer({
   const { tgt } = parseModePair(mode);
   const isJpOut = view === 'original' ? bundle?.detectedSource === 'ja' : tgt === 'ja';
 
-  const openChapterUrl = (targetUrl: string, targetView: 'reader' | 'site' = view === 'site' ? 'site' : 'reader') => {
+  // Auto-translate chapter titles when TOC is visible or chapter modal opens
+  useEffect(() => {
+    if (!nav?.chapters || nav.chapters.length === 0) return;
+    if (!chaptersOpen && !nav.isTocPage && !nav.nextUrl) return;
+    let active = true;
+    setTranslatingChapters(true);
+    translateChapterTitlesDirect({
+      chapters: nav.chapters,
+      mode,
+      titleId: effectiveTitleId,
+      tocKey: nav.tocUrl || url,
+    })
+      .then((map) => {
+        if (active) {
+          setTranslatedTitles((prev) => ({ ...prev, ...map }));
+          setTranslatingChapters(false);
+        }
+      })
+      .catch(() => {
+        if (active) setTranslatingChapters(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [chaptersOpen, nav?.isTocPage, nav?.chapters, nav?.tocUrl, nav?.nextUrl, mode, effectiveTitleId, url]);
+
+  const openChapterUrl = (
+    targetUrl: string,
+    targetView: 'reader' | 'site' = view === 'site' ? 'site' : 'reader'
+  ) => {
     setChaptersOpen(false);
     const qs = new URLSearchParams({
       url: targetUrl,
@@ -745,6 +782,27 @@ export function TranslatedWebViewer({
     return () => window.removeEventListener('keydown', onKey);
   }, [nav, loading, mode, view, effectiveTitleId]);
 
+  const nextChapterObj =
+    nav?.chapters && nav.nextUrl
+      ? nav.chapters.find((c) => c.url === nav.nextUrl)
+      : undefined;
+  const nextChapterDisplayTitle = nextChapterObj
+    ? translatedTitles[nextChapterObj.url] || nextChapterObj.titleDst || nextChapterObj.title
+    : '';
+  const canRestartFromCh1 = Boolean(
+    nav?.isNovel && !nav.nextUrl && !nav.isTocPage && nav.firstUrl && nav.firstUrl !== bundle?.url
+  );
+  const filteredChapters = (nav?.chapters || []).filter((ch, idx) => {
+    if (!chapterQuery.trim()) return true;
+    const q = chapterQuery.trim().toLowerCase();
+    const tDst = (translatedTitles[ch.url] || ch.titleDst || '').toLowerCase();
+    return (
+      ch.title.toLowerCase().includes(q) ||
+      tDst.includes(q) ||
+      String(idx + 1).includes(q)
+    );
+  });
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100dvh' }}>
       <header className="web-viewer-topbar">
@@ -762,6 +820,7 @@ export function TranslatedWebViewer({
               className={view === 'reader' ? 'btn-primary pressable' : 'btn-secondary pressable'}
               onClick={() => setView('reader')}
             >
+              <IconBook size={15} />
               {strings.readerModeTab}
             </button>
             <button
@@ -780,7 +839,7 @@ export function TranslatedWebViewer({
               {strings.originalViewTab}
             </button>
           </div>
-          {view === 'reader' && (
+          {view === 'reader' && !nav?.isTocPage && (
             <button
               type="button"
               className={bilingual ? 'btn-primary pressable' : 'btn-secondary pressable'}
@@ -811,15 +870,6 @@ export function TranslatedWebViewer({
             <option value="en-id">{strings.langEn} {'\u2192'} {strings.langId}</option>
             <option value="en-ja">{strings.langEn} {'\u2192'} {strings.langJa}</option>
           </select>
-          {onOpenWebTools && (
-            <button
-              type="button"
-              className="btn-secondary pressable"
-              onClick={onOpenWebTools}
-            >
-              {strings.webToolsBtn}
-            </button>
-          )}
           {effectiveTitleId && (
             <button
               type="button"
@@ -829,16 +879,15 @@ export function TranslatedWebViewer({
               {strings.glossary}
             </button>
           )}
-          {safeExternalUrl && (
+          {autoTranslatedSiteUrl && (
             <a
-              href={safeExternalUrl}
+              href={autoTranslatedSiteUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="action-chip-btn"
-              title={strings.openOriginalUntranslated}
+              className="btn-secondary pressable"
             >
               <IconLink size={15} />
-              {strings.openOriginalUntranslated}
+              {strings.openAutoTranslatedTab}
             </a>
           )}
         </div>
@@ -854,15 +903,16 @@ export function TranslatedWebViewer({
             <div className="result-card">
               <span className="status-badge error">{strings.cannotTranslateWeb}</span>
               <div>{errorMsg}</div>
-              {safeExternalUrl && (
+              {autoTranslatedSiteUrl && safeExternalUrl && (
                 <div>
                   <a
-                    href={safeExternalUrl}
+                    href={autoTranslatedSiteUrl}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="btn-primary pressable"
                   >
-                    {strings.openOriginalUntranslated}
+                    <IconGlobe size={16} />
+                    {strings.openAutoTranslatedTab}
                   </a>
                 </div>
               )}
@@ -897,7 +947,7 @@ export function TranslatedWebViewer({
                 <span>{bundle.host}</span>
                 {nav?.isNovel && (
                   <span className="status-badge done">
-                    {strings.novelDetectedBadge}
+                    {nav.isTocPage ? strings.ebookTocBadge : strings.novelDetectedBadge}
                     {nav.chapterLabel ? ` · ${nav.chapterLabel}` : ''}
                   </span>
                 )}
@@ -908,68 +958,206 @@ export function TranslatedWebViewer({
               </h1>
             </div>
 
-            <div
-              className={`novel-reader-body assistant-prose ${isJpOut ? 'is-jp' : ''}`}
-              lang={view === 'original' ? bundle.detectedSource : tgt}
-            >
-              {bundle.sentences.map((pair) =>
-                bilingual && view === 'reader' ? (
-                  <div key={pair.i} className="bilingual-pair-card">
-                    <div
-                      className="bilingual-pair-src"
-                      style={{
-                        fontFamily:
-                          bundle.detectedSource === 'ja' ? 'var(--font-jp)' : 'var(--font-ui)',
-                      }}
+            {nav?.isTocPage && nav.chapters && nav.chapters.length > 0 && view !== 'original' ? (
+              <div className="ebook-toc-hero">
+                <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
+                  {nav.firstUrl && (
+                    <button
+                      type="button"
+                      className="btn-primary pressable"
+                      onClick={() => openChapterUrl(nav.firstUrl!, 'reader')}
                     >
-                      {pair.src}
-                    </div>
-                    <p className="novel-reader-para">{pair.dst}</p>
+                      <IconBook size={16} />
+                      {strings.startReadingCh1} {'\u2192'}
+                    </button>
+                  )}
+                  <input
+                    type="search"
+                    className="field-input"
+                    style={{ flex: '1 1 220px', minHeight: '42px' }}
+                    placeholder={strings.searchChaptersPlaceholder}
+                    value={chapterQuery}
+                    onChange={(e) => setChapterQuery(e.target.value)}
+                  />
+                </div>
+                {translatingChapters && (
+                  <div style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
+                    {strings.translatingChapters}
                   </div>
-                ) : (
-                  <p key={pair.i} className="novel-reader-para">
-                    {view === 'original' ? pair.src : pair.dst}
-                  </p>
-                )
-              )}
-            </div>
+                )}
+                <div className="chapter-list-grid">
+                  {filteredChapters.map((ch, idx) => (
+                    <button
+                      key={`${ch.url}_${idx}`}
+                      type="button"
+                      className="chapter-list-item pressable"
+                      onClick={() => openChapterUrl(ch.url, 'reader')}
+                    >
+                      <span>{translatedTitles[ch.url] || ch.titleDst || ch.title}</span>
+                      <span style={{ fontSize: '12px', color: 'var(--text-subtle)', flexShrink: 0 }}>
+                        #{idx + 1}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <>
+                <div
+                  className={`novel-reader-body assistant-prose ${isJpOut ? 'is-jp' : ''}`}
+                  lang={view === 'original' ? bundle.detectedSource : tgt}
+                >
+                  {bundle.sentences.map((pair) =>
+                    bilingual && view === 'reader' ? (
+                      <div key={pair.i} className="bilingual-pair-card">
+                        <div
+                          className="bilingual-pair-src"
+                          style={{
+                            fontFamily:
+                              bundle.detectedSource === 'ja' ? 'var(--font-jp)' : 'var(--font-ui)',
+                          }}
+                        >
+                          {pair.src}
+                        </div>
+                        <p className="novel-reader-para">{pair.dst}</p>
+                      </div>
+                    ) : (
+                      <p key={pair.i} className="novel-reader-para">
+                        {view === 'original' ? pair.src : pair.dst}
+                      </p>
+                    )
+                  )}
+                </div>
+
+                {nav?.isNovel && (
+                  <div className="ebook-next-card">
+                    {nav.nextUrl ? (
+                      <>
+                        <div style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
+                          {strings.continueNextChapter}
+                        </div>
+                        {nextChapterDisplayTitle && (
+                          <div style={{ fontWeight: 600, fontSize: '16px' }}>
+                            {nextChapterDisplayTitle}
+                          </div>
+                        )}
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                          <button
+                            type="button"
+                            className="btn-primary pressable"
+                            onClick={() => openChapterUrl(nav.nextUrl!)}
+                          >
+                            {strings.nextChapter} {'\u2192'}
+                          </button>
+                          {nav.chapters && nav.chapters.length > 0 && (
+                            <button
+                              type="button"
+                              className="btn-secondary pressable"
+                              onClick={() => setChaptersOpen(true)}
+                            >
+                              <IconBook size={16} />
+                              {strings.chapterListBtn} ({nav.chapters.length})
+                            </button>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div style={{ fontWeight: 600, fontSize: '15px' }}>
+                          {strings.lastChapterReached}
+                          {nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                          {canRestartFromCh1 && nav.firstUrl && (
+                            <button
+                              type="button"
+                              className="btn-primary pressable"
+                              onClick={() => openChapterUrl(nav.firstUrl!)}
+                            >
+                              <IconBook size={16} />
+                              {strings.readFromChapter1}
+                            </button>
+                          )}
+                          {nav.prevUrl && (
+                            <button
+                              type="button"
+                              className="btn-secondary pressable"
+                              onClick={() => openChapterUrl(nav.prevUrl!)}
+                            >
+                              {'\u2190'} {strings.prevChapter}
+                            </button>
+                          )}
+                          {(nav.chapters?.length || nav.tocUrl) && (
+                            <button
+                              type="button"
+                              className="btn-secondary pressable"
+                              onClick={() => setChaptersOpen(true)}
+                            >
+                              <IconBook size={16} />
+                              {strings.chapterListBtn}
+                              {nav.chapters?.length ? ` (${nav.chapters.length})` : ''}
+                            </button>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
           </article>
         ) : null}
       </div>
 
-      {!loading && !errorMsg && nav && (nav.prevUrl || nav.nextUrl || nav.chapters?.length || nav.tocUrl) && (
-        <nav className="novel-chapter-dock" aria-label={strings.chapterListBtn}>
-          <div className="novel-chapter-dock-inner">
-            <button
-              type="button"
-              className="btn-secondary pressable"
-              disabled={!nav.prevUrl}
-              onClick={() => nav.prevUrl && openChapterUrl(nav.prevUrl)}
-            >
-              {'\u2190'} {strings.prevChapter}
-            </button>
+      {!loading &&
+        !errorMsg &&
+        nav &&
+        (nav.prevUrl || nav.nextUrl || nav.chapters?.length || nav.tocUrl) && (
+          <nav className="novel-chapter-dock" aria-label={strings.chapterListBtn}>
+            <div className="novel-chapter-dock-inner">
+              <button
+                type="button"
+                className="btn-secondary pressable"
+                disabled={!nav.prevUrl}
+                onClick={() => nav.prevUrl && openChapterUrl(nav.prevUrl)}
+              >
+                {'\u2190'} {strings.prevChapter}
+              </button>
 
-            <button
-              type="button"
-              className="btn-secondary pressable"
-              onClick={() => setChaptersOpen(true)}
-            >
-              <IconBook size={16} />
-              {strings.chapterListBtn}
-              {nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}
-            </button>
+              <button
+                type="button"
+                className="btn-secondary pressable"
+                onClick={() => setChaptersOpen(true)}
+              >
+                <IconBook size={16} />
+                {strings.chapterListBtn}
+                {nav.chapterLabel ? ` (${nav.chapterLabel})` : ''}
+              </button>
 
-            <button
-              type="button"
-              className="btn-primary pressable"
-              disabled={!nav.nextUrl}
-              onClick={() => nav.nextUrl && openChapterUrl(nav.nextUrl)}
-            >
-              {strings.nextChapter} {'\u2192'}
-            </button>
-          </div>
-        </nav>
-      )}
+              {nav.nextUrl ? (
+                <button
+                  type="button"
+                  className="btn-primary pressable"
+                  onClick={() => openChapterUrl(nav.nextUrl!)}
+                >
+                  {nav.isTocPage ? strings.startReadingCh1 : strings.nextChapter} {'\u2192'}
+                </button>
+              ) : canRestartFromCh1 && nav.firstUrl ? (
+                <button
+                  type="button"
+                  className="btn-primary pressable"
+                  onClick={() => openChapterUrl(nav.firstUrl!)}
+                >
+                  {strings.readFromChapter1}
+                </button>
+              ) : (
+                <button type="button" className="btn-secondary" disabled>
+                  {strings.nextChapter} {'\u2192'}
+                </button>
+              )}
+            </div>
+          </nav>
+        )}
 
       {chaptersOpen && nav && (
         <div className="scrim-backdrop" onClick={() => setChaptersOpen(false)}>
@@ -983,6 +1171,7 @@ export function TranslatedWebViewer({
             <div className="modal-header">
               <h2 id="chapter-list-title" className="modal-title">
                 {nav.seriesTitle || strings.chapterListBtn}
+                {nav.chapters?.length ? ` (${nav.chapters.length})` : ''}
               </h2>
               <button
                 type="button"
@@ -994,28 +1183,42 @@ export function TranslatedWebViewer({
               </button>
             </div>
             <div className="modal-body">
+              {nav.chapters && nav.chapters.length > 6 && (
+                <input
+                  type="search"
+                  className="field-input"
+                  placeholder={strings.searchChaptersPlaceholder}
+                  value={chapterQuery}
+                  onChange={(e) => setChapterQuery(e.target.value)}
+                />
+              )}
+              {translatingChapters && (
+                <div style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
+                  {strings.translatingChapters}
+                </div>
+              )}
               {nav.tocUrl && (
                 <div>
                   <button
                     type="button"
                     className="btn-secondary pressable"
-                    onClick={() => openChapterUrl(nav.tocUrl!, 'site')}
+                    onClick={() => openChapterUrl(nav.tocUrl!, 'reader')}
                   >
                     <IconGlobe size={16} />
                     {strings.openTocSite}
                   </button>
                 </div>
               )}
-              {nav.chapters && nav.chapters.length > 0 ? (
+              {filteredChapters.length > 0 ? (
                 <div className="chapter-list-grid">
-                  {nav.chapters.map((ch, idx) => (
+                  {filteredChapters.map((ch, idx) => (
                     <button
                       key={`${ch.url}_${idx}`}
                       type="button"
                       className={`chapter-list-item pressable ${ch.current ? 'is-current' : ''}`}
                       onClick={() => openChapterUrl(ch.url)}
                     >
-                      <span>{ch.title}</span>
+                      <span>{translatedTitles[ch.url] || ch.titleDst || ch.title}</span>
                       {ch.current && <span className="status-badge done">Aktif</span>}
                     </button>
                   ))}
