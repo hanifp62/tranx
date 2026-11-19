@@ -1572,7 +1572,13 @@ async function fetchViaJinaHtmlAndLinks(
             ? d.url
             : cleanUrl;
       const html = typeof d.html === 'string' ? d.html : '';
-      const content = String(d.content || d.description || '').trim();
+      // Never substitute 1-line meta description as full article body when real HTML is returned
+      const content =
+        typeof d.content === 'string' && d.content.trim()
+          ? d.content.trim()
+          : !html && typeof d.description === 'string'
+            ? d.description.trim()
+            : '';
       const linksObj = d.links && typeof d.links === 'object' ? (d.links as Record<string, unknown>) : {};
       const links: Array<{ title: string; url: string }> = [];
       for (const [k, v] of Object.entries(linksObj)) {
@@ -1629,15 +1635,15 @@ function extractCleanParagraphsFromHtml(doc: Document, titleHint = ''): string[]
   const nodes = Array.from(root.querySelectorAll('h1, h2, h3, p, blockquote'));
   const paras = nodes
     .map((n) => (n.textContent || '').replace(/\s+/g, ' ').trim())
-    .filter((s, idx) => s.length >= 2 && !(idx === 0 && normTitle && s.toLowerCase() === normTitle))
-    .slice(0, 140);
+    .filter((s, idx) => s.length >= 1 && !(idx === 0 && normTitle && s.toLowerCase() === normTitle))
+    .slice(0, 220);
   if (paras.length >= 2) return paras;
 
   const fallbackText = (root.textContent || '')
     .split(/\n{2,}/)
     .map((s) => s.replace(/\s+/g, ' ').trim())
-    .filter((s, idx) => s.length >= 2 && !(idx === 0 && normTitle && s.toLowerCase() === normTitle))
-    .slice(0, 140);
+    .filter((s, idx) => s.length >= 1 && !(idx === 0 && normTitle && s.toLowerCase() === normTitle))
+    .slice(0, 220);
   return fallbackText.length >= paras.length ? fallbackText : paras;
 }
 
@@ -1938,8 +1944,9 @@ async function fetchWebArticleDirect(
         const docTitle = (doc.title || '').trim();
         if (docTitle) titleSrc = docTitle;
       }
-      if (srcParas.length === 0) {
-        srcParas = extractCleanParagraphsFromHtml(doc, titleSrc);
+      const htmlParas = extractCleanParagraphsFromHtml(doc, titleSrc);
+      if (htmlParas.length > srcParas.length || srcParas.length < 2) {
+        if (htmlParas.length > 0) srcParas = htmlParas;
       }
     }
 
@@ -2022,7 +2029,7 @@ export async function directPreviewLink(params: {
   const tid = params.titleId || article.titleId;
   const mid = `lnk_${Date.now().toString(36)}`;
 
-  const cappedParas = article.srcParas.slice(0, 80);
+  const cappedParas = article.srcParas.slice(0, 160);
   const fullInputs = [article.titleSrc, ...cappedParas];
   const { outputs, detectedSource, matchedChips } = await translateParagraphsDirect({
     paragraphs: fullInputs,
@@ -2395,7 +2402,7 @@ export async function directFetchWebReaderBundle(params: {
     needRawHtml: params.view === 'site',
   });
   const tid = params.titleId || article.titleId;
-  const cappedSrc = article.srcParas.slice(0, 80);
+  const cappedSrc = article.srcParas.slice(0, 180);
 
   let titleDst = article.titleSrc;
   let translatedParas = cappedSrc;

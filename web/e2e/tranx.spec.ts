@@ -360,9 +360,10 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
             code: 200,
             data: {
               title: 'Episode 1: Best Way to Skip School',
+              description: 'Short meta description that must NOT replace full episode HTML prose.',
               url: 'https://kakuyomu.jp/works/2912051604668493030/episodes/101',
               finalUrl: 'https://kakuyomu.jp/works/2912051604668493030/episodes/101',
-              html: `<!doctype html><html><head><title>Episode 1: Best Way to Skip School</title></head><body><div class="widget-episodeBody"><p>Morning rain tapped softly against the classroom window.</p></div><a id="contentMain-readNextEpisode" href="/works/2912051604668493030/episodes/102">次のエピソード Episode 2</a></body></html>`,
+              html: `<!doctype html><html><head><title>Episode 1: Best Way to Skip School</title></head><body><div class="widget-episodeBody"><p>Morning rain tapped softly against the classroom window.</p><p>She opened her notebook and read the letter from Tokyo.</p></div><a id="contentMain-readNextEpisode" href="/works/2912051604668493030/episodes/102">次のエピソード Episode 2</a></body></html>`,
               links: {
                 '次のエピソード Episode 2':
                   'https://kakuyomu.jp/works/2912051604668493030/episodes/102',
@@ -604,6 +605,14 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await page.locator('.ebook-next-card').getByRole('button', { name: 'Baca dari Bab 1' }).click();
     await expect(page.getByRole('heading', { name: 'Bab 1: Cara Terbaik Bolos Sekolah' })).toBeVisible();
     await expect(page.getByText(/Ebook terdeteksi · 1 \/ 3/)).toBeVisible();
+    // Ensure full HTML episode body prose is rendered (never replaced by 1-line meta description!)
+    await expect(page.locator('.novel-reader-body')).toContainText(
+      'Hujan pagi mengetuk lembut jendela ruang kelas'
+    );
+    await expect(page.locator('.novel-reader-body')).toContainText(
+      'Ia membuka buku catatannya dan membaca surat dari Tokyo'
+    );
+    await expect(page.locator('.novel-reader-body')).not.toContainText('Short meta description');
     // Switch to Situs Terjemahan on Episode 1 -> click rewritten Next Episode link inside iframe -> Episode 2 stays translated!
     await page.getByRole('button', { name: 'Situs Terjemahan' }).click();
     const kakuSiteFrame = page.frameLocator('iframe[title="Pembaca Halaman Terjemahan"]');
