@@ -1008,8 +1008,9 @@ function resolveSafeSiblingUrl(href: string, baseUrl: string): string | null {
   const cleanHref = (href || '').trim();
   if (!cleanHref || cleanHref.startsWith('#')) return null;
   try {
-    const abs = new URL(cleanHref, baseUrl).toString();
-    return toSafeHttpUrl(abs);
+    const u = new URL(cleanHref, baseUrl);
+    u.hash = '';
+    return toSafeHttpUrl(u.toString());
   } catch {
     return null;
   }
@@ -1038,7 +1039,9 @@ function extractKakuyomuFromNextData(
     const apollo = data?.props?.pageProps?.__APOLLO_STATE__;
     if (!apollo || typeof apollo !== 'object') return null;
 
-    const workObj = apollo[`Work:${workId}`] as { title?: string } | undefined;
+    const workObj = apollo[`Work:${workId}`] as
+      | { title?: string; tableOfContentsV2?: Array<{ __ref?: string }> }
+      | undefined;
     const seriesTitle = typeof workObj?.title === 'string' ? workObj.title.trim() : undefined;
     const orderedIds: string[] = [];
     const seen = new Set<string>();
@@ -1053,12 +1056,27 @@ function extractKakuyomuFromNextData(
       }
     };
 
-    for (const [key, val] of Object.entries(apollo)) {
-      if (!val || typeof val !== 'object') continue;
-      if (key.startsWith('TableOfContentsChapter:')) {
-        const unions = (val as { episodeUnions?: Array<{ __ref?: string }> }).episodeUnions;
-        if (Array.isArray(unions)) {
-          for (const item of unions) pushEpRef(item?.__ref);
+    const pushTocChapterObj = (tocObj: unknown) => {
+      if (!tocObj || typeof tocObj !== 'object') return;
+      const unions = (tocObj as { episodeUnions?: Array<{ __ref?: string }> }).episodeUnions;
+      if (Array.isArray(unions)) {
+        for (const item of unions) pushEpRef(item?.__ref);
+      }
+    };
+
+    // Follow authoritative Work.tableOfContentsV2 order first (preserves multi-arc volume order)
+    if (Array.isArray(workObj?.tableOfContentsV2)) {
+      for (const tocRef of workObj.tableOfContentsV2) {
+        if (tocRef?.__ref && apollo[tocRef.__ref]) {
+          pushTocChapterObj(apollo[tocRef.__ref]);
+        }
+      }
+    }
+
+    if (orderedIds.length === 0) {
+      for (const [key, val] of Object.entries(apollo)) {
+        if (key.startsWith('TableOfContentsChapter:')) {
+          pushTocChapterObj(val);
         }
       }
     }
@@ -1270,7 +1288,8 @@ function buildChaptersFromSiblingLinks(
 function extractNovelNavigationFromHtml(
   doc: Document,
   rawHtml: string,
-  cleanUrl: string
+  cleanUrl: string,
+  extraLinks: Array<{ title: string; url: string }> = []
 ): NovelNavigation {
   const curKey = canonicalUrlKey(cleanUrl);
   const tocInfo = deriveKnownTocInfo(cleanUrl);
@@ -1340,6 +1359,18 @@ function extractNovelNavigationFromHtml(
     }
   }
 
+  // Merge links extracted by Jina Reader (data.links summary) as well
+  for (const item of extraLinks) {
+    const abs = resolveSafeSiblingUrl(item.url, cleanUrl);
+    if (!abs) continue;
+    const label = item.title.replace(/\s+/g, ' ').trim();
+    allAnchors.push({ title: label, url: abs });
+    if (canonicalUrlKey(abs) === curKey) continue;
+    if (!nextUrl && NEXT_LINK_RE.test(label)) nextUrl = abs;
+    if (!prevUrl && PREV_LINK_RE.test(label)) prevUrl = abs;
+    if (!tocUrl && TOC_LINK_RE.test(label)) tocUrl = abs;
+  }
+
   const siblingNav = buildChaptersFromSiblingLinks(allAnchors, cleanUrl);
   const chapters =
     nextDataNav?.chapters && nextDataNav.chapters.length > 0
@@ -1381,16 +1412,25 @@ function extractNovelNavigationFromHtml(
   });
 }
 
-function extractNovelNavigationFromMarkdown(md: string, cleanUrl: string): NovelNavigation {
+function extractNovelNavigationFromMarkdown(
+  md: string,
+  cleanUrl: string,
+  extraLinks: Array<{ title: string; url: string }> = []
+): NovelNavigation {
   const curKey = canonicalUrlKey(cleanUrl);
   const tocInfo = deriveKnownTocInfo(cleanUrl);
   const mdLinks: Array<{ title: string; url: string }> = [];
-  const linkRe = /\[([^\]\n]{1,140})\]\((https?:\/\/[^)\s]+)\)/g;
+  const linkRe = /\[([^\]]{1,180})\]\((https?:\/\/[^)\s]+)\)/g;
   let m: RegExpExecArray | null;
   while ((m = linkRe.exec(md)) !== null) {
-    const safe = toSafeHttpUrl(m[2]);
+    const safe = resolveSafeSiblingUrl(m[2], cleanUrl);
     if (!safe) continue;
     mdLinks.push({ title: m[1].replace(/\s+/g, ' ').trim(), url: safe });
+  }
+  for (const item of extraLinks) {
+    const safe = resolveSafeSiblingUrl(item.url, cleanUrl);
+    if (!safe) continue;
+    mdLinks.push({ title: item.title.replace(/\s+/g, ' ').trim(), url: safe });
   }
 
   let prevUrl: string | null = null;
@@ -1472,6 +1512,135 @@ function applyChapterListToCurrentUrl(
   });
 }
 
+interface JinaFetchResult {
+  title: string;
+  finalUrl: string;
+  html: string;
+  content: string;
+  links: Array<{ title: string; url: string }>;
+}
+
+function isSuspiciousTrackerPayload(
+  requestedUrl: string,
+  title: string,
+  finalUrl: string,
+  html: string,
+  content: string
+): boolean {
+  const combined = `${title} ${content.slice(0, 300)} ${html.slice(0, 400)}`;
+  if (/1x1 image|tacker probe|tracker probe|impact-ad\.jp|doubleclick\.net/i.test(combined)) {
+    return true;
+  }
+  try {
+    const reqHost = new URL(requestedUrl).hostname.toLowerCase().replace(/^www\./, '');
+    const finHost = new URL(finalUrl).hostname.toLowerCase().replace(/^www\./, '');
+    if (finHost && reqHost && finHost !== reqHost && !finHost.endsWith(`.${reqHost}`) && !reqHost.endsWith(`.${finHost}`)) {
+      if (html.length < 2500 && content.length < 400) return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+async function fetchViaJinaHtmlAndLinks(
+  cleanUrl: string,
+  options?: { noCache?: boolean; signal?: AbortSignal }
+): Promise<JinaFetchResult | null> {
+  const attempt = async (noCache: boolean): Promise<JinaFetchResult | null> => {
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      'X-Return-Format': 'html',
+      'X-With-Links-Summary': 'true',
+    };
+    if (noCache) headers['X-No-Cache'] = 'true';
+    const resp = await fetch(`https://r.jina.ai/${cleanUrl}`, {
+      method: 'GET',
+      headers,
+      signal: options?.signal,
+    });
+    if (!resp.ok) return null;
+    const ctype = resp.headers.get('content-type') || '';
+    if (ctype.includes('application/json')) {
+      const json = await resp.json();
+      const d = json?.data || {};
+      const title = String(d.title || '').trim();
+      const finalUrl =
+        typeof d.finalUrl === 'string' && d.finalUrl.startsWith('http')
+          ? d.finalUrl
+          : typeof d.url === 'string' && d.url.startsWith('http')
+            ? d.url
+            : cleanUrl;
+      const html = typeof d.html === 'string' ? d.html : '';
+      const content = String(d.content || d.description || '').trim();
+      const linksObj = d.links && typeof d.links === 'object' ? (d.links as Record<string, unknown>) : {};
+      const links: Array<{ title: string; url: string }> = [];
+      for (const [k, v] of Object.entries(linksObj)) {
+        if (typeof v === 'string' && v.startsWith('http')) {
+          links.push({ title: k, url: v });
+        }
+      }
+      return { title, finalUrl, html, content, links };
+    }
+    const rawTxt = await resp.text();
+    const titleMatch = rawTxt.match(/^Title:\s*(.+)$/m);
+    return {
+      title: titleMatch ? titleMatch[1].trim() : '',
+      finalUrl: cleanUrl,
+      html: /<(html|body|article|div|p)\b/i.test(rawTxt) ? rawTxt : '',
+      content: rawTxt,
+      links: [],
+    };
+  };
+
+  try {
+    const first = await attempt(Boolean(options?.noCache));
+    if (
+      first &&
+      !options?.noCache &&
+      isSuspiciousTrackerPayload(cleanUrl, first.title, first.finalUrl, first.html, first.content)
+    ) {
+      const fresh = await attempt(true);
+      if (fresh) return fresh;
+    }
+    return first;
+  } catch (err) {
+    if ((err as { name?: string })?.name === 'AbortError') throw err;
+    return null;
+  }
+}
+
+function extractCleanParagraphsFromHtml(doc: Document, titleHint = ''): string[] {
+  const clone = doc.cloneNode(true) as Document;
+  // Remove scripts, styles, chrome, ads, and ruby readings (<rt>/<rp>) so kanji text stays clean
+  clone
+    .querySelectorAll(
+      'script, style, noscript, svg, nav, footer, header, aside, form, rt, rp, [aria-hidden="true"], .widget-episodeNavigation, #contentMain-episodeNavigation, .c-pager'
+    )
+    .forEach((el) => el.remove());
+
+  const root =
+    clone.querySelector(
+      '.widget-episodeBody, #novel_honbun, .p-novel__body, #honbun, .main_text, .novel-body, .episode-body, .chapter-content, .entry-content, .post-content, article, main'
+    ) || clone.body;
+
+  if (!root) return [];
+  const normTitle = titleHint.replace(/\s+/g, ' ').trim().toLowerCase();
+  const nodes = Array.from(root.querySelectorAll('h1, h2, h3, p, blockquote'));
+  const paras = nodes
+    .map((n) => (n.textContent || '').replace(/\s+/g, ' ').trim())
+    .filter((s, idx) => s.length >= 2 && !(idx === 0 && normTitle && s.toLowerCase() === normTitle))
+    .slice(0, 140);
+  if (paras.length >= 2) return paras;
+
+  const fallbackText = (root.textContent || '')
+    .split(/\n{2,}/)
+    .map((s) => s.replace(/\s+/g, ' ').trim())
+    .filter((s, idx) => s.length >= 2 && !(idx === 0 && normTitle && s.toLowerCase() === normTitle))
+    .slice(0, 140);
+  return fallbackText.length >= paras.length ? fallbackText : paras;
+}
+
 async function fetchSeriesTocDirect(
   tocUrl: string,
   currentUrl: string
@@ -1485,7 +1654,7 @@ async function fetchSeriesTocDirect(
   }
   if (typeof window !== 'undefined') {
     try {
-      const saved = window.sessionStorage.getItem(`tranx_toc_v1::${cacheKey}`);
+      const saved = window.sessionStorage.getItem(`tranx_toc_v2::${cacheKey}`);
       if (saved) {
         const parsed = JSON.parse(saved) as {
           seriesTitle?: string;
@@ -1503,61 +1672,49 @@ async function fetchSeriesTocDirect(
   }
 
   const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), 11000);
+  const timer = window.setTimeout(() => ctrl.abort(), 14000);
   try {
-    let mdNav: NovelNavigation | null = null;
-    let mdTitle = '';
-    let htmlNav: NovelNavigation | null = null;
+    let bestNav: NovelNavigation | null = null;
+    let fallbackTitle = '';
 
-    const jinaToc = (async () => {
-      try {
-        const resp = await fetch(`https://r.jina.ai/${safeToc}`, {
-          method: 'GET',
-          headers: { Accept: 'application/json' },
-          signal: ctrl.signal,
-        });
-        if (!resp.ok) return;
-        const ctype = resp.headers.get('content-type') || '';
-        let content = '';
-        if (ctype.includes('application/json')) {
-          const j = await resp.json();
-          mdTitle = String(j?.data?.title || '')
-            .replace(/\s*[-–|]\s*(カクヨム|小説家になろう|ハーメルン|Kakuyomu).*$/i, '')
-            .trim();
-          content = String(j?.data?.content || '');
-        } else {
-          content = await resp.text();
-        }
-        if (content) {
-          mdNav = extractNovelNavigationFromMarkdown(content, safeToc);
-        }
-      } catch {
-        // ignore
+    // Primary: Jina Reader HTML + Links Summary with X-No-Cache (fast CORS, includes Kakuyomu __NEXT_DATA__ 84+ chapters!)
+    const jinaRes = await fetchViaJinaHtmlAndLinks(safeToc, {
+      noCache: true,
+      signal: ctrl.signal,
+    }).catch(() => null);
+
+    if (jinaRes) {
+      fallbackTitle = jinaRes.title
+        .replace(/\s*[-–|]\s*(カクヨム|小説家になろう|ハーメルン|Kakuyomu).*$/i, '')
+        .trim();
+      if (jinaRes.html) {
+        const doc = new DOMParser().parseFromString(jinaRes.html, 'text/html');
+        bestNav = extractNovelNavigationFromHtml(doc, jinaRes.html, safeToc, jinaRes.links);
       }
-    })();
+      if ((!bestNav || (bestNav.chapters?.length || 0) < 2) && (jinaRes.content || jinaRes.links.length > 0)) {
+        const mdNav = extractNovelNavigationFromMarkdown(jinaRes.content, safeToc, jinaRes.links);
+        if ((mdNav.chapters?.length || 0) > (bestNav?.chapters?.length || 0)) {
+          bestNav = mdNav;
+        }
+      }
+    }
 
-    const htmlToc = (async () => {
-      try {
-        const raw = await fetchRawHtmlViaCorsProxy(safeToc, ctrl.signal);
-        if (!raw) return;
+    // Secondary fallback: CORS HTML proxies if Jina didn't find >= 2 chapters
+    if (!bestNav || (bestNav.chapters?.length || 0) < 2) {
+      const raw = await fetchRawHtmlViaCorsProxy(safeToc, ctrl.signal).catch(() => null);
+      if (raw) {
         const doc = new DOMParser().parseFromString(raw, 'text/html');
-        htmlNav = extractNovelNavigationFromHtml(doc, raw, safeToc);
-      } catch {
-        // ignore
+        const proxyNav = extractNovelNavigationFromHtml(doc, raw, safeToc);
+        if ((proxyNav.chapters?.length || 0) > (bestNav?.chapters?.length || 0)) {
+          bestNav = proxyNav;
+        }
       }
-    })();
+    }
 
-    await Promise.all([jinaToc, htmlToc]);
-
-    const htmlChapters = (htmlNav as NovelNavigation | null)?.chapters || [];
-    const mdChapters = (mdNav as NovelNavigation | null)?.chapters || [];
-    const bestChapters = htmlChapters.length >= mdChapters.length ? htmlChapters : mdChapters;
+    const bestChapters = bestNav?.chapters || [];
     if (bestChapters.length < 2) return null;
 
-    const seriesTitle =
-      (htmlNav as NovelNavigation | null)?.seriesTitle ||
-      mdTitle ||
-      undefined;
+    const seriesTitle = bestNav?.seriesTitle || fallbackTitle || undefined;
     const tocRecord = {
       ...(seriesTitle ? { seriesTitle } : {}),
       tocUrl: safeToc,
@@ -1566,7 +1723,7 @@ async function fetchSeriesTocDirect(
     seriesTocCache.set(cacheKey, tocRecord);
     if (typeof window !== 'undefined') {
       try {
-        window.sessionStorage.setItem(`tranx_toc_v1::${cacheKey}`, JSON.stringify(tocRecord));
+        window.sessionStorage.setItem(`tranx_toc_v2::${cacheKey}`, JSON.stringify(tocRecord));
       } catch {
         // ignore quota
       }
@@ -1719,103 +1876,70 @@ async function fetchWebArticleDirect(
     let finalUrl = cached?.url || cleanUrl;
     let rawMarkdown = cached?.rawMarkdown || '';
     let rawHtml = cached?.rawHtml || '';
+    let jinaLinks: Array<{ title: string; url: string }> = [];
     let navFromMd: NovelNavigation | null = null;
     let navFromHtml: NovelNavigation | null = null;
 
+    const knownToc = deriveKnownTocInfo(cleanUrl);
+
+    // Primary fetch: Jina Reader HTML + Links Summary (returns FULL real HTML + links with CORS!)
     const jinaPromise =
-      srcParas.length > 0
+      srcParas.length > 0 && rawHtml
         ? Promise.resolve()
         : (async () => {
-            try {
-              const resp = await fetch(`https://r.jina.ai/${cleanUrl}`, {
-                method: 'GET',
-                headers: { Accept: 'application/json' },
-                signal: ctrl.signal,
-              });
-              if (resp.ok) {
-                const ctype = resp.headers.get('content-type') || '';
-                let contentText = '';
-                if (ctype.includes('application/json')) {
-                  const json = await resp.json();
-                  const d = json?.data || {};
-                  titleSrc = String(d.title || host).trim() || host;
-                  contentText = String(d.content || d.description || '').trim();
-                  if (typeof d.url === 'string' && d.url.startsWith('http')) {
-                    finalUrl = d.url;
-                  }
-                } else {
-                  const rawTxt = await resp.text();
-                  const titleMatch = rawTxt.match(/^Title:\s*(.+)$/m);
-                  if (titleMatch) titleSrc = titleMatch[1].trim();
-                  contentText = rawTxt;
-                }
-                rawMarkdown = contentText;
-                navFromMd = extractNovelNavigationFromMarkdown(contentText, finalUrl);
-                srcParas = cleanReaderMarkdownToParagraphs(contentText);
-              }
-            } catch (err) {
-              if ((err as { name?: string })?.name === 'AbortError') throw err;
+            const res = await fetchViaJinaHtmlAndLinks(cleanUrl, {
+              noCache: Boolean(knownToc?.isTocPage),
+              signal: ctrl.signal,
+            });
+            if (!res) return;
+            if (res.title) titleSrc = res.title;
+            if (
+              res.finalUrl &&
+              !isSuspiciousTrackerPayload(cleanUrl, res.title, res.finalUrl, res.html, res.content)
+            ) {
+              finalUrl = res.finalUrl;
+            }
+            if (res.html) rawHtml = res.html;
+            if (res.content) rawMarkdown = res.content;
+            if (res.links.length > 0) jinaLinks = res.links;
+            if (res.content || res.links.length > 0) {
+              navFromMd = extractNovelNavigationFromMarkdown(res.content, finalUrl, res.links);
+            }
+            if (res.content && srcParas.length === 0) {
+              srcParas = cleanReaderMarkdownToParagraphs(res.content);
             }
           })();
 
-    // Always run bounded fast parallel HTML fetch so ANY novel/blog site detects rel="next"/TOC links
-    const htmlPromise = rawHtml
-      ? Promise.resolve()
-      : (async () => {
-          const htmlCtrl = new AbortController();
-          const htmlTimer = window.setTimeout(
-            () => htmlCtrl.abort(),
-            options?.needRawHtml ? 9000 : 5500
-          );
-          try {
-            const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, htmlCtrl.signal);
-            if (fetched) rawHtml = fetched;
-          } catch {
-            // Ignore proxy timeout when Jina Reader succeeds
-          } finally {
-            window.clearTimeout(htmlTimer);
-          }
-        })();
-
-    const knownToc = deriveKnownTocInfo(cleanUrl);
     const earlyTocPromise =
       knownToc && !knownToc.isTocPage
         ? fetchSeriesTocDirect(knownToc.tocUrl, cleanUrl).catch(() => null)
         : Promise.resolve(null);
 
-    const [, , earlyTocNav] = await Promise.all([jinaPromise, htmlPromise, earlyTocPromise]);
+    const [, earlyTocNav] = await Promise.all([jinaPromise, earlyTocPromise]);
 
-    // If Jina returned nothing and we didn't fetch raw HTML yet, try raw HTML proxy now
-    if (srcParas.length === 0 && !rawHtml) {
-      const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, ctrl.signal);
-      if (fetched) rawHtml = fetched;
+    // Fallback: only hit external CORS proxies if Jina returned no HTML (or we still need HTML for view=site)
+    if (!rawHtml && (srcParas.length === 0 || options?.needRawHtml)) {
+      const htmlCtrl = new AbortController();
+      const htmlTimer = window.setTimeout(() => htmlCtrl.abort(), 7000);
+      try {
+        const fetched = await fetchRawHtmlViaCorsProxy(cleanUrl, htmlCtrl.signal);
+        if (fetched) rawHtml = fetched;
+      } catch {
+        // Ignore slow proxy fallback
+      } finally {
+        window.clearTimeout(htmlTimer);
+      }
     }
 
     if (rawHtml) {
       const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
-      navFromHtml = extractNovelNavigationFromHtml(doc, rawHtml, finalUrl);
-
+      navFromHtml = extractNovelNavigationFromHtml(doc, rawHtml, finalUrl, jinaLinks);
+      if (!titleSrc || titleSrc === host) {
+        const docTitle = (doc.title || '').trim();
+        if (docTitle) titleSrc = docTitle;
+      }
       if (srcParas.length === 0) {
-        const clone = doc.cloneNode(true) as Document;
-        clone
-          .querySelectorAll('script, style, noscript, nav, footer, header, aside, svg')
-          .forEach((el) => el.remove());
-        titleSrc = (clone.title || host).trim() || host;
-        const root =
-          clone.querySelector('article, main, .widget-episodeBody, #novel_honbun, .main_text') ||
-          clone.body;
-        const nodes = Array.from(root?.querySelectorAll('h1, h2, h3, p') || []);
-        srcParas = nodes
-          .map((n) => (n.textContent || '').replace(/\s+/g, ' ').trim())
-          .filter((s) => s.length >= 2)
-          .slice(0, 140);
-        if (srcParas.length === 0 && root?.textContent) {
-          srcParas = root.textContent
-            .split(/\n{2,}/)
-            .map((s) => s.replace(/\s+/g, ' ').trim())
-            .filter((s) => s.length >= 2)
-            .slice(0, 140);
-        }
+        srcParas = extractCleanParagraphsFromHtml(doc, titleSrc);
       }
     }
 
@@ -2131,6 +2255,19 @@ async function buildTranslatedSiteHtmlDirect(params: {
       }
     }
 
+    // Strip ruby readings (<rt>/<rp>) so translated text nodes don't mix furigana beside Latin prose
+    doc.querySelectorAll('rt, rp').forEach((el) => el.remove());
+
+    // Inject lightweight responsive safety CSS so translated site fits cleanly on Desktop & Mobile
+    const head = doc.head || doc.createElement('head');
+    if (!doc.head && doc.documentElement) {
+      doc.documentElement.insertBefore(head, doc.body);
+    }
+    const safeStyle = doc.createElement('style');
+    safeStyle.textContent =
+      'html,body{overflow-x:hidden !important;max-width:100vw !important;} img,video{max-width:100% !important;height:auto !important;}';
+    head.appendChild(safeStyle);
+
     // Collect visible text nodes for in-place DOM translation (preserving site layout)
     const skipParentTags = new Set([
       'SCRIPT',
@@ -2141,11 +2278,13 @@ async function buildTranslatedSiteHtmlDirect(params: {
       'TEXTAREA',
       'SVG',
       'MATH',
+      'RT',
+      'RP',
     ]);
     const textNodes: Text[] = [];
     const walker = doc.createTreeWalker(doc.body || doc.documentElement, NodeFilter.SHOW_TEXT);
     let node = walker.nextNode();
-    while (node && textNodes.length < 320) {
+    while (node && textNodes.length < 480) {
       const parent = node.parentElement;
       const val = (node.nodeValue || '').trim();
       if (

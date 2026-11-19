@@ -2269,17 +2269,18 @@ export function App() {
                               ? strings.startReadingCh1
                               : strings.openFullTranslatedPage}
                           </button>
-                          {buildAutoTranslatedSiteUrl(lp.url, turn.mode) && (
-                            <a
-                              href={buildAutoTranslatedSiteUrl(lp.url, turn.mode)!}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="btn-secondary pressable"
-                            >
-                              <IconGlobe size={17} />
-                              {strings.openAutoTranslatedTab}
-                            </a>
-                          )}
+                          <button
+                            type="button"
+                            className="btn-secondary pressable"
+                            onClick={() =>
+                              navigate(
+                                `/web?url=${encodeURIComponent(lp.url)}&mode=${turn.mode}&view=site&titleId=${encodeURIComponent(lp.titleId)}`
+                              )
+                            }
+                          >
+                            <IconGlobe size={17} />
+                            {strings.openTranslatedSite}
+                          </button>
                           <button
                             type="button"
                             className="btn-secondary pressable"

@@ -691,6 +691,10 @@ export function TranslatedWebViewer({
   }, [initialView, url]);
 
   useEffect(() => {
+    setMode(initialMode);
+  }, [initialMode]);
+
+  useEffect(() => {
     let active = true;
     setLoading(true);
     setErrorMsg(null);
@@ -879,9 +883,11 @@ export function TranslatedWebViewer({
               {strings.glossary}
             </button>
           )}
-          {autoTranslatedSiteUrl && (
+          {safeExternalUrl && (
             <a
-              href={autoTranslatedSiteUrl}
+              href={`/web?url=${encodeURIComponent(safeExternalUrl)}&mode=${encodeURIComponent(mode)}&view=site${
+                effectiveTitleId ? `&titleId=${encodeURIComponent(effectiveTitleId)}` : ''
+              }`}
               target="_blank"
               rel="noopener noreferrer"
               className="btn-secondary pressable"
