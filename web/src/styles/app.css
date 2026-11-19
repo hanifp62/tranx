@@ -447,6 +447,58 @@ textarea {
   font-weight: 500;
 }
 
+/* Native-grade PWA Install Notification Bar */
+.pwa-install-banner {
+  margin: 8px auto 0 auto;
+  width: min(720px, calc(100% - 32px));
+  padding: 12px 14px;
+  border-radius: var(--r-card);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-e1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.pwa-install-banner-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1 1 240px;
+}
+
+.pwa-install-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pwa-install-banner-title {
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.pwa-install-banner-desc {
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--text-muted);
+}
+
+.pwa-install-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
 /* Centered Empty Composition vs Active Stream Composition */
 .stage-body {
   flex: 1;

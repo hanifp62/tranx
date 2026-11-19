@@ -1430,4 +1430,187 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.getByText(/verifikasi keamanan \/ anti-bot \(Cloudflare\)/i)).toBeVisible();
     await expect(page.getByRole('link', { name: 'Buka situs asli' })).toBeVisible();
   });
+
+  test('All-Chapters Mode-Locked Translation (92 Kakuyomu chapters ID & EN) + Full Standalone PWA Manifest & Install App Notification', async ({
+    page,
+  }) => {
+    await page.route('**/v1/healthz', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
+
+    // Build a realistic 92-episode Kakuyomu __NEXT_DATA__ work (exceeds old 60/80 caps!)
+    const episodeCount = 92;
+    const apollo: Record<string, unknown> = {
+      'Work:999001': {
+        title: '京都学園物語',
+        tableOfContentsV2: [{ __ref: 'TableOfContentsChapter:1' }],
+      },
+      'TableOfContentsChapter:1': {
+        episodeUnions: Array.from({ length: episodeCount }, (_, i) => ({
+          __ref: `Episode:${1001 + i}`,
+        })),
+      },
+    };
+    for (let i = 1; i <= episodeCount; i += 1) {
+      apollo[`Episode:${1000 + i}`] = {
+        title: `第${i}話 学園の日記`,
+      };
+    }
+    const nextData92 = JSON.stringify({
+      props: { pageProps: { __APOLLO_STATE__: apollo } },
+    });
+
+    await page.route('https://r.jina.ai/**', async (route) => {
+      const reqUrl = route.request().url();
+      if (reqUrl.includes('kakuyomu.jp/works/999001/episodes/1060')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({
+            code: 200,
+            data: {
+              title: '第60話 学園の日記 - 京都学園物語',
+              url: 'https://kakuyomu.jp/works/999001/episodes/1060',
+              html: `<!doctype html><html><head><title>第60話 学園の日記</title></head><body><div class="widget-episodeBody"><p>午後の教室に風が吹いた。</p><p>チャイムが鳴り響いた。</p></div></body></html>`,
+            },
+          }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({
+          code: 200,
+          data: {
+            title: '京都学園物語 - カクヨム',
+            url: 'https://kakuyomu.jp/works/999001',
+            html: `<!doctype html><html><head><title>京都学園物語</title><script id="__NEXT_DATA__" type="application/json">${nextData92}</script></head><body><h1>京都学園物語</h1><p>紹介文</p></body></html>`,
+          },
+        }),
+      });
+    });
+
+    await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      const reqUrl = new URL(route.request().url());
+      const tl = reqUrl.searchParams.get('tl') || 'id';
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const q = postParams.get('q') || reqUrl.searchParams.get('q') || '';
+      const lines = q.split('\n').map((line) => {
+        if (tl === 'en') {
+          return line
+            .replace(/京都学園物語/g, 'Kyoto Academy Story')
+            .replace(/第(\d+)話 学園の日記/g, 'Chapter $1: Academy Diary')
+            .replace(/午後の教室に風が吹いた。/g, 'A breeze blew through the afternoon classroom.')
+            .replace(/チャイムが鳴り響いた。/g, 'The school bell echoed.');
+        }
+        return line
+          .replace(/京都学園物語/g, 'Kisah Akademi Kyoto')
+          .replace(/第(\d+)話 学園の日記/g, 'Bab $1: Catatan Akademi')
+          .replace(/午後の教室に風が吹いた。/g, 'Angin bertiup di ruang kelas sore.')
+          .replace(/チャイムが鳴り響いた。/g, 'Bel sekolah berbunyi nyaring.');
+      });
+      const segments = lines.map((t, idx) => [idx < lines.length - 1 ? `${t}\n` : t, t]);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([segments, null, 'ja']),
+      });
+    });
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // 1. Open Episode 60 of 92 in auto-id -> ALL 92 chapters (including #1, #60, AND #92!) + seriesTitle MUST be Indonesian!
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fkakuyomu.jp%2Fworks%2F999001%2Fepisodes%2F1060&mode=auto-id&view=reader'
+    );
+    await expect(page.getByText(/Ebook terdeteksi · 60 \/ 92/)).toBeVisible();
+    await expect(page.getByText('Kisah Akademi Kyoto').first()).toBeVisible();
+    await page.locator('.novel-chapter-dock').getByRole('button', { name: /Daftar bab/ }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.getByRole('heading', { name: /Kisah Akademi Kyoto \(92\)/ })).toBeVisible();
+    await expect(dialog.locator('.chapter-list-item')).toHaveCount(92);
+    await expect(dialog.locator('.chapter-list-item').nth(0)).toContainText('Bab 1: Catatan Akademi');
+    await expect(dialog.locator('.chapter-list-item').nth(59)).toContainText('Bab 60: Catatan Akademi');
+    await expect(dialog.locator('.chapter-list-item').nth(91)).toContainText('Bab 92: Catatan Akademi');
+    // Verify ZERO untranslated Japanese chapter titles remain across ALL 92 items!
+    const remainingJaInId = await dialog
+      .locator('.chapter-list-item')
+      .evaluateAll((els) => els.filter((el) => /第\d+話/.test(el.textContent || '')).length);
+    expect(remainingJaInId).toBe(0);
+    await dialog.getByRole('button', { name: 'Tutup' }).click();
+
+    // 2. Switch target mode to auto-en -> ALL 92 chapters + seriesTitle immediately re-translate to English (ZERO stale Indonesian!)
+    await page.getByLabel('Pasangan bahasa').selectOption('auto-en');
+    await expect(page.getByText('Kyoto Academy Story').first()).toBeVisible();
+    await page.locator('.novel-chapter-dock').getByRole('button', { name: /Daftar bab/ }).click();
+    await expect(dialog.getByRole('heading', { name: /Kyoto Academy Story \(92\)/ })).toBeVisible();
+    await expect(dialog.locator('.chapter-list-item').nth(0)).toContainText('Chapter 1: Academy Diary');
+    await expect(dialog.locator('.chapter-list-item').nth(59)).toContainText('Chapter 60: Academy Diary');
+    await expect(dialog.locator('.chapter-list-item').nth(91)).toContainText('Chapter 92: Academy Diary');
+    const staleIdInEn = await dialog
+      .locator('.chapter-list-item')
+      .evaluateAll((els) => els.filter((el) => /Bab \d+:/.test(el.textContent || '')).length);
+    expect(staleIdInEn).toBe(0);
+    await dialog.getByRole('button', { name: 'Tutup' }).click();
+
+    // 3. Verify complete standalone PWA Manifest + icons + screenshots served by production build!
+    const manifestResp = await page.request.get('/manifest.webmanifest');
+    expect(manifestResp.status()).toBe(200);
+    const manifest = await manifestResp.json();
+    expect(manifest.id).toBe('/');
+    expect(manifest.display).toBe('standalone');
+    expect(manifest.start_url).toBe('/');
+    expect(manifest.icons.some((i: { sizes: string; purpose: string }) => i.sizes === '192x192' && i.purpose === 'any')).toBe(true);
+    expect(manifest.icons.some((i: { sizes: string; purpose: string }) => i.sizes === '512x512' && i.purpose === 'maskable')).toBe(true);
+    expect(manifest.screenshots?.length).toBeGreaterThanOrEqual(2);
+    expect((await page.request.get('/screenshots/desktop-wide.png')).status()).toBe(200);
+    expect((await page.request.get('/screenshots/mobile-narrow.png')).status()).toBe(200);
+    expect(manifest.shortcuts?.length).toBeGreaterThanOrEqual(3);
+
+    // 4. Verify Install App Notification Banner on beforeinstallprompt + Axe WCAG 2.2 AA + native prompt() + appinstalled toast!
+    await page.goto('/?e2e=1');
+    await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toBeVisible();
+
+    // Account menu always exposes "Pasang aplikasi" when not installed
+    await page.locator('.account-row-btn').click();
+    await expect(page.getByRole('menuitem', { name: 'Pasang aplikasi' })).toBeVisible();
+    await page.getByRole('menuitem', { name: 'Pasang aplikasi' }).click();
+    await expect(page.getByRole('heading', { name: 'Cara memasang aplikasi tranX' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    // Simulate browser firing native beforeinstallprompt event
+    await page.evaluate(() => {
+      const ev = new Event('beforeinstallprompt', { cancelable: true }) as Event & {
+        prompt?: () => Promise<void>;
+        userChoice?: Promise<{ outcome: 'accepted'; platform: string }>;
+      };
+      (window as unknown as { __pwaPromptCalled?: boolean }).__pwaPromptCalled = false;
+      ev.prompt = async () => {
+        (window as unknown as { __pwaPromptCalled?: boolean }).__pwaPromptCalled = true;
+      };
+      ev.userChoice = Promise.resolve({ outcome: 'accepted', platform: 'web' });
+      window.dispatchEvent(ev);
+    });
+
+    const installBanner = page.getByRole('region', { name: 'Pasang aplikasi tranX' });
+    await expect(installBanner).toBeVisible();
+
+    // Axe WCAG 2.2 AA check with install notification visible
+    const axeInstall = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeInstall.violations).toEqual([]);
+
+    await installBanner.getByRole('button', { name: 'Pasang sekarang' }).click();
+    const promptInvoked = await page.evaluate(
+      () => (window as unknown as { __pwaPromptCalled?: boolean }).__pwaPromptCalled
+    );
+    expect(promptInvoked).toBe(true);
+    await expect(installBanner).toHaveCount(0);
+    await expect(page.getByText('tranX berhasil dipasang sebagai aplikasi!')).toBeVisible();
+  });
 });

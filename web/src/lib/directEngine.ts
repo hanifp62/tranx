@@ -2559,35 +2559,104 @@ export async function translateChapterTitlesDirect(params: {
   mode: ModePair;
   titleId?: string;
   tocKey: string;
+  seriesTitle?: string;
+  signal?: AbortSignal;
+  onProgress?: (partialMap: Record<string, string>, doneCount: number, totalCount: number) => void;
 }): Promise<Record<string, string>> {
-  const { chapters, mode, titleId, tocKey } = params;
+  const { chapters, mode, titleId, tocKey, seriesTitle, signal, onProgress } = params;
   if (!chapters.length) return {};
   const cacheKey = `${tocKey}::${mode}`;
-  const cached = translatedChapterTitlesCache.get(cacheKey);
-  if (cached && Object.keys(cached).length >= Math.min(chapters.length, 60)) {
-    return cached;
+  const map: Record<string, string> = { ...(translatedChapterTitlesCache.get(cacheKey) || {}) };
+
+  const uniqueChapters: NovelChapterLink[] = [];
+  const seenUrls = new Set<string>();
+  for (const ch of chapters) {
+    if (!ch.url || seenUrls.has(ch.url)) continue;
+    seenUrls.add(ch.url);
+    uniqueChapters.push(ch);
   }
-  const map: Record<string, string> = { ...(cached || {}) };
-  // Prioritize window around current chapter (or first 80 chapters) so TOC translates fast
-  const curIdx = chapters.findIndex((c) => c.current);
-  const start = curIdx >= 0 ? Math.max(0, curIdx - 30) : 0;
-  const slice = chapters.slice(start, start + 80).filter((c) => !map[c.url] && c.title.trim());
-  if (slice.length > 0) {
+
+  const totalCount = uniqueChapters.length;
+  const countTranslated = () =>
+    uniqueChapters.reduce((acc, ch) => acc + (map[ch.url] ? 1 : 0), 0);
+
+  const needsSeries = Boolean(seriesTitle && seriesTitle.trim() && !map.__seriesTitle__);
+  if (countTranslated() >= totalCount && !needsSeries) {
+    onProgress?.({ ...map }, totalCount, totalCount);
+    return { ...map };
+  }
+
+  // Emit cached chapters immediately so UI updates with 0 delay
+  const initialDone = countTranslated();
+  if (initialDone > 0) {
+    onProgress?.({ ...map }, initialDone, totalCount);
+  }
+
+  // Build priority-ordered list covering 100% of ALL chapters (visible window first, then every remaining chapter!)
+  const curIdx = uniqueChapters.findIndex((c) => c.current);
+  const priorityOrdered: NovelChapterLink[] = [];
+  const queuedUrls = new Set<string>();
+  const enqueueRange = (from: number, to: number) => {
+    const start = Math.max(0, from);
+    const end = Math.min(uniqueChapters.length, to);
+    for (let i = start; i < end; i += 1) {
+      const ch = uniqueChapters[i];
+      if (!ch || queuedUrls.has(ch.url) || map[ch.url] || !ch.title.trim()) continue;
+      queuedUrls.add(ch.url);
+      priorityOrdered.push(ch);
+    }
+  };
+
+  if (curIdx >= 0) {
+    enqueueRange(curIdx - 12, curIdx + 33);
+    enqueueRange(curIdx + 33, uniqueChapters.length);
+    enqueueRange(0, curIdx - 12);
+  } else {
+    enqueueRange(0, uniqueChapters.length);
+  }
+
+  // Process ALL pending chapters in fast 45-chapter waves (using 3-worker parallel GTX + L1/L2 cache!)
+  const WAVE_SIZE = 45;
+  let seriesPending = needsSeries;
+
+  const waveCount = Math.max(1, Math.ceil(priorityOrdered.length / WAVE_SIZE));
+  for (let w = 0; w < waveCount; w += 1) {
+    if (signal?.aborted) break;
+    const waveChapters = priorityOrdered.slice(w * WAVE_SIZE, (w + 1) * WAVE_SIZE);
+    const includeSeries = seriesPending && Boolean(seriesTitle?.trim());
+    if (waveChapters.length === 0 && !includeSeries) break;
+
+    const inputs = includeSeries
+      ? [seriesTitle!.trim(), ...waveChapters.map((c) => c.title.trim())]
+      : waveChapters.map((c) => c.title.trim());
+
     try {
       const { outputs } = await translateParagraphsDirect({
-        paragraphs: slice.map((c) => c.title),
+        paragraphs: inputs,
         mode,
         titleId,
+        signal,
       });
-      slice.forEach((ch, idx) => {
-        if (outputs[idx]) map[ch.url] = outputs[idx];
+      if (signal?.aborted) break;
+      let offset = 0;
+      if (includeSeries) {
+        if (outputs[0]) map.__seriesTitle__ = outputs[0];
+        seriesPending = false;
+        offset = 1;
+      }
+      waveChapters.forEach((ch, idx) => {
+        const translated = outputs[idx + offset];
+        if (translated) map[ch.url] = translated;
       });
-      translatedChapterTitlesCache.set(cacheKey, map);
-    } catch {
-      // Keep original titles gracefully if network hiccups
+      translatedChapterTitlesCache.set(cacheKey, { ...map });
+      onProgress?.({ ...map }, countTranslated(), totalCount);
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError' || signal?.aborted) break;
+      // Continue remaining waves gracefully if a single wave fails transiently
     }
   }
-  return map;
+
+  return { ...map };
 }
 
 function mergeNovelNav(primary: NovelNavigation, secondary?: NovelNavigation | null): NovelNavigation {
@@ -3185,22 +3254,28 @@ async function buildTranslatedSiteHtmlDirect(params: {
 
   const { tgt } = parseModePair(mode);
   const nav = article.novelNav;
+  const navLabels =
+    tgt === 'en'
+      ? { prev: 'Previous chapter', toc: 'Chapters', next: 'Next chapter' }
+      : tgt === 'ja'
+        ? { prev: '前の話', toc: '目次', next: '次の話' }
+        : { prev: 'Bab sebelumnya', toc: 'Daftar bab', next: 'Bab berikutnya' };
   const navButtonsHtml =
     nav.prevUrl || nav.nextUrl || nav.tocUrl
       ? `<div style="position:sticky;bottom:0;z-index:9999;background:#141917;color:#FAFBFA;padding:12px 16px;display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;border-top:1px solid #2B3230;font-family:Inter,-apple-system,sans-serif;font-size:14px;">
           ${
             nav.prevUrl
-              ? `<a href="${escapeHtml(buildTranxWebHref(nav.prevUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">&#8592; Bab sebelumnya</a>`
+              ? `<a href="${escapeHtml(buildTranxWebHref(nav.prevUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">&#8592; ${navLabels.prev}</a>`
               : ''
           }
           ${
             nav.tocUrl
-              ? `<a href="${escapeHtml(buildTranxWebHref(nav.tocUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">Daftar bab</a>`
+              ? `<a href="${escapeHtml(buildTranxWebHref(nav.tocUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">${navLabels.toc}</a>`
               : ''
           }
           ${
             nav.nextUrl
-              ? `<a href="${escapeHtml(buildTranxWebHref(nav.nextUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="background:#17695B;color:#FFFFFF;text-decoration:none;padding:8px 16px;border-radius:10px;font-weight:600;">Bab berikutnya &#8594;</a>`
+              ? `<a href="${escapeHtml(buildTranxWebHref(nav.nextUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="background:#17695B;color:#FFFFFF;text-decoration:none;padding:8px 16px;border-radius:10px;font-weight:600;">${navLabels.next} &#8594;</a>`
               : ''
           }
         </div>`
@@ -3405,16 +3480,26 @@ async function buildTranslatedSiteHtmlDirect(params: {
     )
     .join('\n');
 
+  const translatedChapMap =
+    nav.chapters && nav.chapters.length > 0
+      ? await translateChapterTitlesDirect({
+          chapters: nav.chapters,
+          mode,
+          titleId: params.titleId || article.titleId,
+          tocKey: nav.tocUrl || article.url,
+          seriesTitle: nav.seriesTitle,
+        })
+      : {};
+
   const chaptersHtml =
     nav.chapters && nav.chapters.length > 0
       ? `<section style="margin-top:32px;padding-top:20px;border-top:1px solid #DEE3E0;">
-          <h2 style="font-family:Inter,-apple-system,sans-serif;font-size:16px;">Daftar Bab</h2>
+          <h2 style="font-family:Inter,-apple-system,sans-serif;font-size:16px;">${navLabels.toc} (${nav.chapters.length})</h2>
           <ul style="list-style:none;padding:0;margin:12px 0;display:flex;flex-direction:column;gap:8px;font-family:Inter,-apple-system,sans-serif;font-size:14px;">
             ${nav.chapters
-              .slice(0, 40)
               .map(
                 (ch) =>
-                  `<li><a href="${escapeHtml(buildTranxWebHref(ch.url, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#17695B;font-weight:${ch.current ? '700' : '500'};text-decoration:none;">${escapeHtml(ch.title)}</a></li>`
+                  `<li><a href="${escapeHtml(buildTranxWebHref(ch.url, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#17695B;font-weight:${ch.current ? '700' : '500'};text-decoration:none;">${escapeHtml(translatedChapMap[ch.url] || ch.titleDst || ch.title)}</a></li>`
               )
               .join('')}
           </ul>

@@ -681,8 +681,13 @@ export function TranslatedWebViewer({
   const [chaptersOpen, setChaptersOpen] = useState(false);
   const [chapterQuery, setChapterQuery] = useState('');
   const deferredChapterQuery = useDeferredValue(chapterQuery);
-  const [translatedTitles, setTranslatedTitles] = useState<Record<string, string>>({});
-  const [translatingChapters, setTranslatingChapters] = useState(false);
+  const [translatedTitlesByKey, setTranslatedTitlesByKey] = useState<
+    Record<string, Record<string, string>>
+  >({});
+  const [chapterTranslateProgress, setChapterTranslateProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [bundle, setBundle] = useState<WebReaderBundle | null>(null);
   const [loading, setLoading] = useState(true);
   const [streamProgress, setStreamProgress] = useState<{ done: number; total: number } | null>(null);
@@ -771,32 +776,62 @@ export function TranslatedWebViewer({
   const nav = bundle?.novelNav;
   const { tgt } = parseModePair(mode);
   const isJpOut = view === 'original' ? bundle?.detectedSource === 'ja' : tgt === 'ja';
+  const chapterModeKey = `${nav?.tocUrl || url}::${mode}`;
+  const translatedTitles = translatedTitlesByKey[chapterModeKey] || {};
+  const translatingChapters = Boolean(
+    chapterTranslateProgress && chapterTranslateProgress.done < chapterTranslateProgress.total
+  );
 
-  // Auto-translate chapter titles when TOC is visible or chapter modal opens
+  // Auto-translate 100% of ALL chapter titles + seriesTitle strictly matching the active target mode
   useEffect(() => {
-    if (!nav?.chapters || nav.chapters.length === 0) return;
-    if (!chaptersOpen && !nav.isTocPage && !nav.nextUrl) return;
+    if (!nav?.chapters || nav.chapters.length === 0 || view === 'original') {
+      setChapterTranslateProgress(null);
+      return;
+    }
     let active = true;
-    setTranslatingChapters(true);
+    const ctrl = new AbortController();
+    const total = nav.chapters.length;
+    setChapterTranslateProgress({ done: 0, total });
     translateChapterTitlesDirect({
       chapters: nav.chapters,
       mode,
       titleId: effectiveTitleId,
       tocKey: nav.tocUrl || url,
+      seriesTitle: nav.seriesTitle,
+      signal: ctrl.signal,
+      onProgress: (partialMap, doneCount, totalCount) => {
+        if (!active) return;
+        setTranslatedTitlesByKey((prev) => ({
+          ...prev,
+          [chapterModeKey]: partialMap,
+        }));
+        setChapterTranslateProgress(
+          doneCount < totalCount ? { done: doneCount, total: totalCount } : null
+        );
+      },
     })
       .then((map) => {
         if (active) {
-          setTranslatedTitles((prev) => ({ ...prev, ...map }));
-          setTranslatingChapters(false);
+          setTranslatedTitlesByKey((prev) => ({
+            ...prev,
+            [chapterModeKey]: map,
+          }));
+          setChapterTranslateProgress(null);
         }
       })
       .catch(() => {
-        if (active) setTranslatingChapters(false);
+        if (active) setChapterTranslateProgress(null);
       });
     return () => {
       active = false;
+      ctrl.abort();
     };
-  }, [chaptersOpen, nav?.isTocPage, nav?.chapters, nav?.tocUrl, nav?.nextUrl, mode, effectiveTitleId, url]);
+  }, [nav?.chapters, nav?.tocUrl, nav?.seriesTitle, mode, effectiveTitleId, url, view, chapterModeKey]);
+
+  const displaySeriesTitle =
+    view === 'original'
+      ? nav?.seriesTitle || ''
+      : translatedTitles.__seriesTitle__ || nav?.seriesTitle || '';
 
   const openChapterUrl = (
     targetUrl: string,
@@ -1062,7 +1097,7 @@ export function TranslatedWebViewer({
                     {nav.chapterLabel ? ` · ${nav.chapterLabel}` : ''}
                   </span>
                 )}
-                {nav?.seriesTitle && <span>{nav.seriesTitle}</span>}
+                {displaySeriesTitle && <span>{displaySeriesTitle}</span>}
               </div>
               <h1 className="novel-reader-title">
                 {view === 'original' ? bundle.titleSrc : bundle.titleDst}
@@ -1114,9 +1149,10 @@ export function TranslatedWebViewer({
                     onChange={(e) => setChapterQuery(e.target.value)}
                   />
                 </div>
-                {translatingChapters && (
+                {translatingChapters && chapterTranslateProgress && (
                   <div style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
-                    {strings.translatingChapters}
+                    {strings.translatingChapters} ({chapterTranslateProgress.done}/
+                    {chapterTranslateProgress.total})
                   </div>
                 )}
                 <div className="chapter-list-grid">
@@ -1325,7 +1361,7 @@ export function TranslatedWebViewer({
           >
             <div className="modal-header">
               <h2 id="chapter-list-title" className="modal-title">
-                {nav.seriesTitle || strings.chapterListBtn}
+                {displaySeriesTitle || strings.chapterListBtn}
                 {nav.chapters?.length ? ` (${nav.chapters.length})` : ''}
               </h2>
               <button
@@ -1347,9 +1383,10 @@ export function TranslatedWebViewer({
                   onChange={(e) => setChapterQuery(e.target.value)}
                 />
               )}
-              {translatingChapters && (
+              {translatingChapters && chapterTranslateProgress && (
                 <div style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
-                  {strings.translatingChapters}
+                  {strings.translatingChapters} ({chapterTranslateProgress.done}/
+                  {chapterTranslateProgress.total})
                 </div>
               )}
               {nav.tocUrl && (
@@ -1373,7 +1410,11 @@ export function TranslatedWebViewer({
                       className={`chapter-list-item pressable ${ch.current ? 'is-current' : ''}`}
                       onClick={() => openChapterUrl(ch.url)}
                     >
-                      <span>{translatedTitles[ch.url] || ch.titleDst || ch.title}</span>
+                      <span>
+                        {view === 'original'
+                          ? ch.title
+                          : translatedTitles[ch.url] || ch.titleDst || ch.title}
+                      </span>
                       {ch.current && <span className="status-badge done">Aktif</span>}
                     </button>
                   ))}

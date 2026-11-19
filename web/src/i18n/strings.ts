@@ -153,6 +153,18 @@ export interface UiStrings {
   openTocSite: string;
   resumeReadingChapter: string;
   streamingProgressLabel: string;
+  installAppMenu: string;
+  installBannerTitle: string;
+  installBannerDesc: string;
+  installNowBtn: string;
+  installLaterBtn: string;
+  installSuccessToast: string;
+  installGuideTitle: string;
+  installGuideIosStep1: string;
+  installGuideIosStep2: string;
+  installGuideMacSafariStep1: string;
+  installGuideDesktopStep1: string;
+  installGuideDesktopStep2: string;
   closeLabel: string;
 }
 
@@ -310,6 +322,18 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     openTocSite: 'Buka halaman daftar isi (terjemahan)',
     resumeReadingChapter: 'Lanjutkan baca',
     streamingProgressLabel: 'Menerjemahkan',
+    installAppMenu: 'Pasang aplikasi',
+    installBannerTitle: 'Pasang aplikasi tranX',
+    installBannerDesc: 'Buka sebagai aplikasi penuh di layar utama, lebih cepat, dan siap dipakai di desktop maupun HP.',
+    installNowBtn: 'Pasang sekarang',
+    installLaterBtn: 'Nanti',
+    installSuccessToast: 'tranX berhasil dipasang sebagai aplikasi!',
+    installGuideTitle: 'Cara memasang aplikasi tranX',
+    installGuideIosStep1: 'Ketuk tombol Bagikan (ikon kotak dengan panah ke atas) di bilah bawah Safari.',
+    installGuideIosStep2: 'Pilih "Tambah ke Layar Utama", lalu ketuk "Tambah".',
+    installGuideMacSafariStep1: 'Di Safari macOS, buka menu File lalu pilih "Tambahkan ke Dock" untuk memasang tranX sebagai aplikasi penuh.',
+    installGuideDesktopStep1: 'Klik ikon "Pasang tranX" di sisi kanan bilah alamat browser (Chrome / Edge / Brave), atau buka menu titik tiga browser lalu pilih "Pasang aplikasi".',
+    installGuideDesktopStep2: 'Konfirmasi "Pasang" agar tranX muncul sebagai aplikasi mandiri di desktop atau layar utama HP Anda.',
     closeLabel: 'Tutup',
   },
   en: {
@@ -465,6 +489,18 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     openTocSite: 'Open translated table of contents',
     resumeReadingChapter: 'Resume reading',
     streamingProgressLabel: 'Translating',
+    installAppMenu: 'Install app',
+    installBannerTitle: 'Install the tranX app',
+    installBannerDesc: 'Launch as a full standalone app from your home screen or desktop for faster reading.',
+    installNowBtn: 'Install now',
+    installLaterBtn: 'Later',
+    installSuccessToast: 'tranX has been installed as an app!',
+    installGuideTitle: 'How to install tranX',
+    installGuideIosStep1: 'Tap the Share button (square with upward arrow) in Safari.',
+    installGuideIosStep2: 'Select "Add to Home Screen", then tap "Add".',
+    installGuideMacSafariStep1: 'In macOS Safari, open the File menu and choose "Add to Dock" to install tranX as a standalone app.',
+    installGuideDesktopStep1: 'Click the Install icon on the right side of the address bar (Chrome / Edge / Brave), or open the browser menu and select "Install app".',
+    installGuideDesktopStep2: 'Confirm "Install" to add tranX as a full standalone app on your desktop or home screen.',
     closeLabel: 'Close',
   },
 };

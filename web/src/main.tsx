@@ -1,8 +1,12 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { initPwaInstallCapture } from './lib/pwaInstall';
 import './styles/tokens.css';
 import './styles/app.css';
 import { App } from './App';
+
+// Capture beforeinstallprompt & appinstalled synchronously before React mounts
+initPwaInstallCapture();
 
 if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
   const hadPreviousController = Boolean(navigator.serviceWorker.controller);

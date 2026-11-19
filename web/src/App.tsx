@@ -73,6 +73,14 @@ import {
 } from './lib/directEngine';
 import { startVoiceDictation, type DictationHandle } from './lib/speech';
 import {
+  dismissPwaInstallBanner,
+  getPwaInstallState,
+  subscribePwaInstallState,
+  triggerNativePwaInstall,
+  type PwaInstallState,
+} from './lib/pwaInstall';
+import { isLocalE2EMode } from './lib/firebase';
+import {
   BrandAppTile,
   BrandWordmark,
   IconAlert,
@@ -240,9 +248,19 @@ export function App() {
     nav: import('./types').NovelNavigation;
     mode: ModePair;
     titleId?: string;
+    tocKey: string;
   } | null>(null);
   const [inlineChapterQuery, setInlineChapterQuery] = useState('');
-  const [inlineTranslatedTitles, setInlineTranslatedTitles] = useState<Record<string, string>>({});
+  const [inlineTranslatedTitlesByKey, setInlineTranslatedTitlesByKey] = useState<
+    Record<string, Record<string, string>>
+  >({});
+  const [inlineChapterProgress, setInlineChapterProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
+  const [pwaState, setPwaState] = useState<PwaInstallState>(() => getPwaInstallState());
+  const [installGuideOpen, setInstallGuideOpen] = useState(false);
+  const prevPwaInstalledRef = useRef<boolean>(pwaState.isInstalled);
 
   /* Source bubble expand & inline edit */
   const [expandedBubbles, setExpandedBubbles] = useState<Record<string, boolean>>({});
@@ -368,6 +386,68 @@ export function App() {
       setAuthReady(true);
     });
   }, []);
+
+  useEffect(() => {
+    return subscribePwaInstallState((next) => {
+      if (!prevPwaInstalledRef.current && next.isInstalled) {
+        pushToast(STRINGS[settings.uiLang].installSuccessToast);
+      }
+      prevPwaInstalledRef.current = next.isInstalled;
+      setPwaState(next);
+    });
+  }, [pushToast, settings.uiLang]);
+
+  useEffect(() => {
+    if (!inlineChaptersNav?.nav.chapters || inlineChaptersNav.nav.chapters.length === 0) {
+      setInlineChapterProgress(null);
+      return;
+    }
+    let active = true;
+    const ctrl = new AbortController();
+    const key = `${inlineChaptersNav.tocKey}::${inlineChaptersNav.mode}`;
+    const total = inlineChaptersNav.nav.chapters.length;
+    setInlineChapterProgress({ done: 0, total });
+    translateChapterTitlesDirect({
+      chapters: inlineChaptersNav.nav.chapters,
+      mode: inlineChaptersNav.mode,
+      titleId: inlineChaptersNav.titleId,
+      tocKey: inlineChaptersNav.tocKey,
+      seriesTitle: inlineChaptersNav.nav.seriesTitle,
+      signal: ctrl.signal,
+      onProgress: (partialMap, doneCount, totalCount) => {
+        if (!active) return;
+        setInlineTranslatedTitlesByKey((prev) => ({ ...prev, [key]: partialMap }));
+        setInlineChapterProgress(
+          doneCount < totalCount ? { done: doneCount, total: totalCount } : null
+        );
+      },
+    })
+      .then((map) => {
+        if (active) {
+          setInlineTranslatedTitlesByKey((prev) => ({ ...prev, [key]: map }));
+          setInlineChapterProgress(null);
+        }
+      })
+      .catch(() => {
+        if (active) setInlineChapterProgress(null);
+      });
+    return () => {
+      active = false;
+      ctrl.abort();
+    };
+  }, [inlineChaptersNav]);
+
+  const handleInstallAppClick = useCallback(async () => {
+    setAccountMenuOpen(false);
+    if (pwaState.canNativePrompt) {
+      const outcome = await triggerNativePwaInstall();
+      if (outcome === 'unavailable') {
+        setInstallGuideOpen(true);
+      }
+      return;
+    }
+    setInstallGuideOpen(true);
+  }, [pwaState.canNativePrompt]);
 
   useEffect(() => {
     if (!user) return;
@@ -524,6 +604,8 @@ export function App() {
         setHistoryMenuTarget(null);
         setMobileTurnSheet(null);
         setMobileDrawerOpen(false);
+        setInlineChaptersNav(null);
+        setInstallGuideOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -2075,6 +2157,44 @@ export function App() {
           </div>
         )}
 
+        {!pwaState.isInstalled &&
+          !pwaState.isDismissed &&
+          (pwaState.canNativePrompt ||
+            pwaState.isIosSafari ||
+            pwaState.isMacSafari ||
+            !isLocalE2EMode()) && (
+            <section
+              className="pwa-install-banner"
+              role="region"
+              aria-label={strings.installBannerTitle}
+            >
+              <div className="pwa-install-banner-left">
+                <BrandAppTile size={34} />
+                <div className="pwa-install-banner-text">
+                  <div className="pwa-install-banner-title">{strings.installBannerTitle}</div>
+                  <div className="pwa-install-banner-desc">{strings.installBannerDesc}</div>
+                </div>
+              </div>
+              <div className="pwa-install-banner-actions">
+                <button
+                  type="button"
+                  className="btn-primary pressable"
+                  onClick={handleInstallAppClick}
+                >
+                  <IconDownload size={16} />
+                  {strings.installNowBtn}
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary pressable"
+                  onClick={dismissPwaInstallBanner}
+                >
+                  {strings.installLaterBtn}
+                </button>
+              </div>
+            </section>
+          )}
+
         {pathname === '/berkas' ? (
           <Suspense fallback={<div className="subpage-container"><div className="result-card">...</div></div>}>
             <MyFilesView
@@ -2393,19 +2513,12 @@ export function App() {
                               className="btn-secondary pressable"
                               onClick={() => {
                                 setInlineChapterQuery('');
-                                setInlineChaptersNav({ nav, mode: turn.mode, titleId: lp.titleId });
-                                if (nav.chapters && nav.chapters.length > 0) {
-                                  translateChapterTitlesDirect({
-                                    chapters: nav.chapters,
-                                    mode: turn.mode,
-                                    titleId: lp.titleId,
-                                    tocKey: nav.tocUrl || lp.url,
-                                  })
-                                    .then((m) =>
-                                      setInlineTranslatedTitles((prev) => ({ ...prev, ...m }))
-                                    )
-                                    .catch(() => {});
-                                }
+                                setInlineChaptersNav({
+                                  nav,
+                                  mode: turn.mode,
+                                  titleId: lp.titleId,
+                                  tocKey: nav.tocUrl || lp.url,
+                                });
                               }}
                             >
                               <IconBook size={16} />
@@ -2885,6 +2998,20 @@ export function App() {
                   {settings.uiLang === 'id' ? 'ID \u2192 EN' : 'EN \u2192 ID'}
                 </span>
               </button>
+
+              {!pwaState.isInstalled && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={handleInstallAppClick}
+                >
+                  <span className="menu-item-left">
+                    <IconDownload size={18} />
+                    {strings.installAppMenu}
+                  </span>
+                </button>
+              )}
 
               <button
                 type="button"
@@ -3394,74 +3521,145 @@ export function App() {
         )}
       </Suspense>
 
-      {inlineChaptersNav && (
-        <div className="scrim-backdrop" onClick={() => setInlineChaptersNav(null)}>
+      {inlineChaptersNav && (() => {
+        const inlineMap =
+          inlineTranslatedTitlesByKey[
+            `${inlineChaptersNav.tocKey}::${inlineChaptersNav.mode}`
+          ] || {};
+        const inlineSeriesTitle =
+          inlineMap.__seriesTitle__ || inlineChaptersNav.nav.seriesTitle || strings.chapterListBtn;
+        return (
+          <div className="scrim-backdrop" onClick={() => setInlineChaptersNav(null)}>
+            <div
+              className="modal-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="inline-chapters-title"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="modal-header">
+                <h2 id="inline-chapters-title" className="modal-title">
+                  {inlineSeriesTitle}
+                  {inlineChaptersNav.nav.chapters?.length
+                    ? ` (${inlineChaptersNav.nav.chapters.length})`
+                    : ''}
+                </h2>
+                <button
+                  type="button"
+                  className="icon-square-btn"
+                  aria-label={strings.closeLabel}
+                  onClick={() => setInlineChaptersNav(null)}
+                >
+                  <IconX size={18} />
+                </button>
+              </div>
+              <div className="modal-body">
+                {inlineChaptersNav.nav.chapters && inlineChaptersNav.nav.chapters.length > 6 && (
+                  <input
+                    type="search"
+                    className="field-input"
+                    placeholder={strings.searchChaptersPlaceholder}
+                    value={inlineChapterQuery}
+                    onChange={(e) => setInlineChapterQuery(e.target.value)}
+                  />
+                )}
+                {inlineChapterProgress &&
+                  inlineChapterProgress.done < inlineChapterProgress.total && (
+                    <div style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
+                      {strings.translatingChapters} ({inlineChapterProgress.done}/
+                      {inlineChapterProgress.total})
+                    </div>
+                  )}
+                {inlineChaptersNav.nav.chapters && inlineChaptersNav.nav.chapters.length > 0 ? (
+                  <div className="chapter-list-grid">
+                    {inlineChaptersNav.nav.chapters
+                      .filter((ch, idx) => {
+                        if (!deferredInlineChapterQuery.trim()) return true;
+                        const q = deferredInlineChapterQuery.trim().toLowerCase();
+                        const tDst = (inlineMap[ch.url] || ch.titleDst || '').toLowerCase();
+                        return (
+                          ch.title.toLowerCase().includes(q) ||
+                          tDst.includes(q) ||
+                          String(idx + 1).includes(q)
+                        );
+                      })
+                      .map((ch, idx) => (
+                        <button
+                          key={`${ch.url}_${idx}`}
+                          type="button"
+                          className={`chapter-list-item pressable ${ch.current ? 'is-current' : ''}`}
+                          onClick={() => {
+                            setInlineChaptersNav(null);
+                            handleSubmitLink(undefined, ch.url);
+                          }}
+                        >
+                          <span>{inlineMap[ch.url] || ch.titleDst || ch.title}</span>
+                          {ch.current && <span className="status-badge done">Aktif</span>}
+                        </button>
+                      ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
+                    {strings.noChaptersFound}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {installGuideOpen && (
+        <div className="scrim-backdrop" onClick={() => setInstallGuideOpen(false)}>
           <div
             className="modal-dialog"
             role="dialog"
             aria-modal="true"
-            aria-labelledby="inline-chapters-title"
+            aria-labelledby="install-guide-title"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="modal-header">
-              <h2 id="inline-chapters-title" className="modal-title">
-                {inlineChaptersNav.nav.seriesTitle || strings.chapterListBtn}
-                {inlineChaptersNav.nav.chapters?.length
-                  ? ` (${inlineChaptersNav.nav.chapters.length})`
-                  : ''}
-              </h2>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <BrandAppTile size={28} />
+                <h2 id="install-guide-title" className="modal-title">
+                  {strings.installGuideTitle}
+                </h2>
+              </div>
               <button
                 type="button"
                 className="icon-square-btn"
                 aria-label={strings.closeLabel}
-                onClick={() => setInlineChaptersNav(null)}
+                onClick={() => setInstallGuideOpen(false)}
               >
                 <IconX size={18} />
               </button>
             </div>
             <div className="modal-body">
-              {inlineChaptersNav.nav.chapters && inlineChaptersNav.nav.chapters.length > 6 && (
-                <input
-                  type="search"
-                  className="field-input"
-                  placeholder={strings.searchChaptersPlaceholder}
-                  value={inlineChapterQuery}
-                  onChange={(e) => setInlineChapterQuery(e.target.value)}
-                />
-              )}
-              {inlineChaptersNav.nav.chapters && inlineChaptersNav.nav.chapters.length > 0 ? (
-                <div className="chapter-list-grid">
-                  {inlineChaptersNav.nav.chapters
-                    .filter((ch, idx) => {
-                      if (!deferredInlineChapterQuery.trim()) return true;
-                      const q = deferredInlineChapterQuery.trim().toLowerCase();
-                      const tDst = (inlineTranslatedTitles[ch.url] || ch.titleDst || '').toLowerCase();
-                      return (
-                        ch.title.toLowerCase().includes(q) ||
-                        tDst.includes(q) ||
-                        String(idx + 1).includes(q)
-                      );
-                    })
-                    .map((ch, idx) => (
-                      <button
-                        key={`${ch.url}_${idx}`}
-                        type="button"
-                        className={`chapter-list-item pressable ${ch.current ? 'is-current' : ''}`}
-                        onClick={() => {
-                          setInlineChaptersNav(null);
-                          handleSubmitLink(undefined, ch.url);
-                        }}
-                      >
-                        <span>{inlineTranslatedTitles[ch.url] || ch.titleDst || ch.title}</span>
-                        {ch.current && <span className="status-badge done">Aktif</span>}
-                      </button>
-                    ))}
-                </div>
+              <p style={{ margin: 0, fontSize: '14px', color: 'var(--text-muted)' }}>
+                {strings.installBannerDesc}
+              </p>
+              {pwaState.isIosSafari ? (
+                <ol style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '15px' }}>
+                  <li>{strings.installGuideIosStep1}</li>
+                  <li>{strings.installGuideIosStep2}</li>
+                </ol>
+              ) : pwaState.isMacSafari ? (
+                <p style={{ margin: 0, fontSize: '15px' }}>{strings.installGuideMacSafariStep1}</p>
               ) : (
-                <div style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
-                  {strings.noChaptersFound}
-                </div>
+                <ol style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '15px' }}>
+                  <li>{strings.installGuideDesktopStep1}</li>
+                  <li>{strings.installGuideDesktopStep2}</li>
+                </ol>
               )}
+            </div>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="btn-primary pressable"
+                onClick={() => setInstallGuideOpen(false)}
+              >
+                {strings.closeLabel}
+              </button>
             </div>
           </div>
         </div>
