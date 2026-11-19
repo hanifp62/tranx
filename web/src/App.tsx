@@ -314,11 +314,16 @@ export function App() {
 
   useEffect(() => {
     if (!user) return;
+    let prevDefPair = '';
     const unsubs = [
       subscribeSettings((s) => {
         setSettings(s);
-        if (!activeCid) {
-          setActiveMode(buildModePair(s.defaultSource, s.defaultTarget));
+        const nextDefPair = `${s.defaultSource}-${s.defaultTarget}`;
+        if (nextDefPair !== prevDefPair) {
+          prevDefPair = nextDefPair;
+          if (!window.location.pathname.startsWith('/c/')) {
+            setActiveMode(buildModePair(s.defaultSource, s.defaultTarget));
+          }
         }
       }),
       subscribeConversations(setConversations),
@@ -327,7 +332,7 @@ export function App() {
       subscribeInbox(setInboxItems),
     ];
     return () => unsubs.forEach((u) => u());
-  }, [user, activeCid]);
+  }, [user]);
 
   useEffect(() => {
     if (!user || !activeCid) {

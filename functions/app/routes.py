@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import secrets
 import tempfile
 import time
@@ -64,12 +65,31 @@ class _RepoUsageAdapter:
         )
 
 
+DEFAULT_ALLOWED_ORIGINS = frozenset(
+    {
+        "https://tranx-hanif-id.web.app",
+        "https://tranx-hanif-id.firebaseapp.com",
+        "http://localhost:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:4173",
+    }
+)
+
+
+def _allowed_origins() -> frozenset[str]:
+    extra = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+    if not extra.strip():
+        return DEFAULT_ALLOWED_ORIGINS
+    custom = {o.strip().rstrip("/") for o in extra.split(",") if o.strip()}
+    return DEFAULT_ALLOWED_ORIGINS | custom
+
+
 def _extract_bearer_token() -> str:
     auth_header = request.headers.get("Authorization") or ""
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
-    query_token = request.args.get("token") or ""
-    return query_token.strip()
+    return ""
 
 
 def _ndjson_line(event: dict[str, Any]) -> str:
@@ -97,8 +117,15 @@ def create_flask_app(
 
     @app.after_request
     def _add_cors_and_security_headers(resp: Response) -> Response:
-        origin = request.headers.get("Origin") or "*"
-        resp.headers.setdefault("Access-Control-Allow-Origin", origin)
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = _allowed_origins()
+        if origin and origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+        else:
+            resp.headers.setdefault(
+                "Access-Control-Allow-Origin", "https://tranx-hanif-id.web.app"
+            )
+        resp.headers["Vary"] = "Origin"
         resp.headers.setdefault(
             "Access-Control-Allow-Headers", "Authorization, Content-Type, X-Inbox-Token"
         )
@@ -106,6 +133,7 @@ def create_flask_app(
             "Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"
         )
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
         return resp
 
     @app.errorhandler(AuthError)

@@ -121,8 +121,10 @@ export function isSingleStandaloneUrl(raw: string): boolean {
 
 export function normalizeWebUrl(raw: string): string {
   const trimmed = raw.trim();
-  if (!trimmed) throw new Error('Masukkan alamat tautan halaman web terlebih dahulu.');
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
+  if (!trimmed || trimmed.length > 2048) {
+    throw new Error('Masukkan alamat tautan halaman web yang sah (maks. 2.048 karakter).');
+  }
+  const withScheme = /^[a-z][a-z0-9+.-]*:/i.test(trimmed)
     ? trimmed
     : `https://${trimmed}`;
   let parsed: URL;
@@ -134,19 +136,32 @@ export function normalizeWebUrl(raw: string): string {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error('Hanya tautan http:// dan https:// yang diizinkan.');
   }
-  const host = parsed.hostname.toLowerCase();
+  if (parsed.username || parsed.password) {
+    throw new Error('Kredensial di dalam URL tidak diizinkan.');
+  }
+  if (parsed.port && parsed.port !== '80' && parsed.port !== '443') {
+    throw new Error('Hanya port standar 80 dan 443 yang diizinkan.');
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (
     !host ||
     host === 'localhost' ||
+    host === 'metadata.google.internal' ||
     host.endsWith('.local') ||
     host.endsWith('.internal') ||
+    /^0\./.test(host) ||
     /^127\./.test(host) ||
     /^10\./.test(host) ||
     /^192\.168\./.test(host) ||
     /^169\.254\./.test(host) ||
     /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host) ||
     host === '::1' ||
-    host === '[::1]'
+    host === '::' ||
+    host.startsWith('fc') ||
+    host.startsWith('fd') ||
+    host.startsWith('fe80:') ||
+    host.startsWith('::ffff:')
   ) {
     const err = new Error('Alamat jaringan internal atau privat ditolak demi keamanan.') as Error & {
       status?: number;
@@ -157,6 +172,14 @@ export function normalizeWebUrl(raw: string): string {
     throw err;
   }
   return parsed.toString();
+}
+
+export function toSafeHttpUrl(raw: string): string | null {
+  try {
+    return normalizeWebUrl(raw);
+  } catch {
+    return null;
+  }
 }
 
 function buildGlossaryPairs(
@@ -718,13 +741,20 @@ async function extractZipTextEntries(
   }
   if (eocdOffset < 0) throw new Error('Arsip dokumen rusak atau terenkripsi.');
 
+  const MAX_ZIP_ENTRIES = 1500;
+  const MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024;
   const totalEntries = view.getUint16(eocdOffset + 10, true);
+  if (totalEntries > MAX_ZIP_ENTRIES) {
+    throw new Error('Arsip dokumen memiliki terlalu banyak entri dan ditolak demi keamanan.');
+  }
   let cdOffset = view.getUint32(eocdOffset + 16, true);
+  let totalUncompressed = 0;
 
   for (let e = 0; e < totalEntries && cdOffset + 46 <= bytes.length; e += 1) {
     if (view.getUint32(cdOffset, true) !== 0x02014b50) break;
     const method = view.getUint16(cdOffset + 10, true);
     const compSize = view.getUint32(cdOffset + 20, true);
+    const uncompSize = view.getUint32(cdOffset + 24, true);
     const nameLen = view.getUint16(cdOffset + 28, true);
     const extraLen = view.getUint16(cdOffset + 30, true);
     const commentLen = view.getUint16(cdOffset + 32, true);
@@ -733,8 +763,11 @@ async function extractZipTextEntries(
     const name = decoder.decode(bytes.subarray(cdOffset + 46, cdOffset + 46 + nameLen));
     cdOffset += 46 + nameLen + extraLen + commentLen;
 
-    if (name.includes('..') || !predicate(name)) continue;
+    if (name.includes('..') || name.startsWith('/') || !predicate(name)) continue;
     if (localHeaderOffset + 30 > bytes.length) continue;
+    if (totalUncompressed + uncompSize > MAX_UNCOMPRESSED_BYTES) {
+      throw new Error('Ukuran isi dokumen melebihi batas aman 50 MB.');
+    }
 
     const lNameLen = view.getUint16(localHeaderOffset + 26, true);
     const lExtraLen = view.getUint16(localHeaderOffset + 28, true);
@@ -742,14 +775,39 @@ async function extractZipTextEntries(
     const rawSlice = bytes.subarray(dataStart, dataStart + compSize);
 
     if (method === 0) {
+      totalUncompressed += rawSlice.byteLength;
+      if (totalUncompressed > MAX_UNCOMPRESSED_BYTES) {
+        throw new Error('Ukuran isi dokumen melebihi batas aman 50 MB.');
+      }
       out.set(name, decoder.decode(rawSlice));
     } else if (method === 8 && typeof DecompressionStream !== 'undefined') {
       const ds = new DecompressionStream('deflate-raw');
       const writer = ds.writable.getWriter();
       writer.write(rawSlice);
       writer.close();
-      const decompBuf = await new Response(ds.readable).arrayBuffer();
-      out.set(name, decoder.decode(decompBuf));
+      const reader = ds.readable.getReader();
+      const chunks: Uint8Array[] = [];
+      let entryBytes = 0;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          entryBytes += value.byteLength;
+          totalUncompressed += value.byteLength;
+          if (totalUncompressed > MAX_UNCOMPRESSED_BYTES) {
+            await reader.cancel();
+            throw new Error('Ukuran isi dokumen melebihi batas aman 50 MB.');
+          }
+          chunks.push(value);
+        }
+      }
+      const merged = new Uint8Array(entryBytes);
+      let offset = 0;
+      for (const c of chunks) {
+        merged.set(c, offset);
+        offset += c.byteLength;
+      }
+      out.set(name, decoder.decode(merged));
     }
   }
   return out;

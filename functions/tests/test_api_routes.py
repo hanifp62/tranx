@@ -528,3 +528,33 @@ def test_bidirectional_and_autodetect_modes_id_ja_en() -> None:
     assert ev_auto_en[0]["detectedSource"] == "id"
     assert "Good morning" in ev_auto_en[-1]["fullDst"]
 
+
+def test_cors_origin_allowlist_and_query_token_rejected() -> None:
+    init_tranx_core()
+    repo = InMemoryRepository()
+    app = create_flask_app(repo, llm_transport=RouteFakeTransport())
+    client = app.test_client()
+
+    # 1. Evil cross-origin must never be reflected in Access-Control-Allow-Origin
+    r_evil = client.get(
+        "/v1/meta",
+        headers={**_auth_headers(), "Origin": "https://evil.attacker.example"},
+    )
+    assert r_evil.status_code == 200
+    assert r_evil.headers.get("Access-Control-Allow-Origin") == "https://tranx-hanif-id.web.app"
+    assert r_evil.headers.get("Vary") == "Origin"
+    assert r_evil.headers.get("X-Frame-Options") == "DENY"
+
+    # 2. Allowlisted production origin is reflected cleanly
+    r_good = client.get(
+        "/v1/meta",
+        headers={**_auth_headers(), "Origin": "https://tranx-hanif-id.web.app"},
+    )
+    assert r_good.status_code == 200
+    assert r_good.headers.get("Access-Control-Allow-Origin") == "https://tranx-hanif-id.web.app"
+
+    # 3. Query-string ?token=... bearer fallback must be rejected (401)
+    r_qtok = client.get("/v1/meta?token=valid-owner-token")
+    assert r_qtok.status_code == 401
+
+

@@ -16,6 +16,7 @@ import {
   fetchTranslatedWebHtml,
   mergeTitleGlossaries,
 } from '../lib/api';
+import { toSafeHttpUrl } from '../lib/directEngine';
 import {
   DEFAULT_STYLE,
   removeGlossaryEntry,
@@ -206,8 +207,13 @@ export function GlossaryView({
   onNavigate: (path: string) => void;
   onNotify: (msg: string) => void;
 }) {
-  const selectedId = activeTitleId || titles[0]?.id || '';
-  const selectedTitle = titles.find((t) => t.id === selectedId) || null;
+  const selectedId = activeTitleId || titles[0]?.id || 't_default';
+  const selectedTitle: TitleDoc = titles.find((t) => t.id === selectedId) || {
+    id: selectedId,
+    name: selectedId === 't_default' ? 'Kamus Utama' : 'Kamus Bacaan',
+    kind: 'lepas',
+    style: { ...DEFAULT_STYLE },
+  };
   const [entries, setEntries] = useState<Array<{ key: string; entry: GlossaryEntry }>>([]);
   const [newTitleName, setNewTitleName] = useState('');
   const [newTitleKind, setNewTitleKind] = useState<TitleKind>('novel');
@@ -293,9 +299,13 @@ export function GlossaryView({
 
   const handleMerge = async () => {
     if (!selectedId || !mergeTargetId || selectedId === mergeTargetId) return;
-    const res = await mergeTitleGlossaries(user, selectedId, mergeTargetId);
-    onNavigate(`/kamus/${mergeTargetId}`);
-    onNotify(`${res.merged} entri digabungkan ke judul tujuan`);
+    try {
+      const res = await mergeTitleGlossaries(user, selectedId, mergeTargetId);
+      onNavigate(`/kamus/${mergeTargetId}`);
+      onNotify(`${res.merged} entri digabungkan ke judul tujuan`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'Gagal menggabungkan daftar nama.');
+    }
   };
 
   return (
@@ -644,6 +654,7 @@ export function TranslatedWebViewer({
   const [htmlDoc, setHtmlDoc] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const safeExternalUrl = toSafeHttpUrl(url);
 
   useEffect(() => {
     let active = true;
@@ -745,15 +756,17 @@ export function TranslatedWebViewer({
               {strings.glossary}
             </button>
           )}
-          <a
-            href={url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="btn-secondary pressable"
-          >
-            <IconLink size={16} />
-            {strings.openOriginalSite}
-          </a>
+          {safeExternalUrl && (
+            <a
+              href={safeExternalUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn-secondary pressable"
+            >
+              <IconLink size={16} />
+              {strings.openOriginalSite}
+            </a>
+          )}
         </div>
       </div>
 
@@ -766,22 +779,24 @@ export function TranslatedWebViewer({
           <div className="result-card">
             <span className="status-badge error">Tidak dapat diterjemahkan langsung</span>
             <div>{errorMsg}</div>
-            <div>
-              <a
-                href={url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="btn-primary pressable"
-              >
-                {strings.openOriginalSite}
-              </a>
-            </div>
+            {safeExternalUrl && (
+              <div>
+                <a
+                  href={safeExternalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn-primary pressable"
+                >
+                  {strings.openOriginalSite}
+                </a>
+              </div>
+            )}
           </div>
         </div>
       ) : (
         <iframe
           title="Pembaca Halaman Terjemahan"
-          sandbox="allow-same-origin"
+          sandbox="allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
           srcDoc={htmlDoc}
           style={{
             flex: 1,

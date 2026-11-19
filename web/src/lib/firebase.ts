@@ -44,6 +44,7 @@ import type {
   InboxItem,
   JobDoc,
   ModePair,
+  SentencePair,
   SourceLang,
   TargetLang,
   TitleDoc,
@@ -1198,4 +1199,152 @@ export async function resolveStorageOutputUrl(storageOutputPath: string): Promis
   }
   const { storage } = ensureFirebase();
   return getDownloadURL(storageRef(storage, storageOutputPath));
+}
+
+export async function loadTurnMessageOnce(
+  cid: string,
+  mid: string
+): Promise<{ sentences?: SentencePair[]; text?: string; fileName?: string } | null> {
+  if (!cid || !mid) return null;
+  if (isLocalE2EMode()) {
+    const msg = getE2EStore().messages.get(cid)?.get(mid);
+    if (!msg) return null;
+    return { sentences: msg.sentences, text: msg.text, fileName: msg.fileName };
+  }
+  try {
+    const { db } = ensureFirebase();
+    const snap = await getDoc(doc(db, 'conversations', cid, 'messages', mid));
+    if (!snap.exists()) return null;
+    const r = snap.data();
+    const sentences = Array.isArray(r.sentences)
+      ? (r.sentences as SentencePair[])
+      : undefined;
+    return {
+      sentences,
+      text: typeof r.text === 'string' ? r.text : undefined,
+      fileName: typeof r.fileName === 'string' ? r.fileName : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function mergeTitleGlossariesDirect(
+  fromTitleId: string,
+  toTitleId: string
+): Promise<{ merged: number; conflicts: string[] }> {
+  if (!fromTitleId || !toTitleId || fromTitleId === toTitleId) {
+    return { merged: 0, conflicts: [] };
+  }
+  if (isLocalE2EMode()) {
+    const store = getE2EStore();
+    const src = store.glossaries.get(fromTitleId);
+    const dst = store.glossaries.get(toTitleId) ?? new Map();
+    let merged = 0;
+    const conflicts: string[] = [];
+    if (src) {
+      for (const [k, v] of src.entries()) {
+        if (!dst.has(k)) {
+          dst.set(k, v);
+          merged += 1;
+        } else {
+          conflicts.push(v.surface);
+        }
+      }
+    }
+    store.glossaries.set(toTitleId, dst);
+    const fromDoc = store.titles.get(fromTitleId);
+    if (fromDoc) fromDoc.mergedInto = toTitleId;
+    store.emit();
+    return { merged, conflicts };
+  }
+  const { db } = ensureFirebase();
+  const [srcSnap, dstSnap] = await Promise.all([
+    getDocs(collection(db, 'titles', fromTitleId, 'glossary')),
+    getDocs(collection(db, 'titles', toTitleId, 'glossary')),
+  ]);
+  const existingKeys = new Set(dstSnap.docs.map((d) => d.id));
+  let merged = 0;
+  const conflicts: string[] = [];
+  for (const d of srcSnap.docs) {
+    const raw = d.data();
+    if (existingKeys.has(d.id)) {
+      conflicts.push(String(raw.surface || d.id));
+      continue;
+    }
+    const entry = mapGlossaryDoc(raw);
+    await setDoc(doc(db, 'titles', toTitleId, 'glossary', d.id), {
+      ...entry,
+      confirmed: true,
+      source: 'user',
+      updatedAt: serverTimestamp(),
+    });
+    merged += 1;
+  }
+  const fromRef = doc(db, 'titles', fromTitleId);
+  const fromDocSnap = await getDoc(fromRef);
+  if (fromDocSnap.exists()) {
+    await updateDoc(fromRef, {
+      mergedInto: toTitleId.slice(0, 200),
+      updatedAt: serverTimestamp(),
+    });
+  }
+  return { merged, conflicts };
+}
+
+export async function exportFullBackupDirect(): Promise<Record<string, unknown>> {
+  if (isLocalE2EMode()) {
+    const store = getE2EStore();
+    const conversations: Record<string, unknown> = {};
+    for (const [cid, conv] of store.conversations.entries()) {
+      const msgs = Array.from(store.messages.get(cid)?.values() || []);
+      conversations[cid] = { ...conv, messages: msgs };
+    }
+    const titles: Record<string, unknown> = {};
+    for (const [tid, tdoc] of store.titles.entries()) {
+      const gloss = Object.fromEntries(store.glossaries.get(tid)?.entries() || []);
+      titles[tid] = { ...tdoc, glossary: gloss };
+    }
+    return {
+      version: '2.2',
+      exportedAt: new Date().toISOString(),
+      settings: store.settings,
+      conversations,
+      titles,
+      jobs: Object.fromEntries(store.jobs.entries()),
+    };
+  }
+  const { db } = ensureFirebase();
+  const [settingsSnap, convsSnap, titlesSnap, jobsSnap] = await Promise.all([
+    getDoc(doc(db, 'settings', 'app')),
+    getDocs(collection(db, 'conversations')),
+    getDocs(collection(db, 'titles')),
+    getDocs(collection(db, 'jobs')),
+  ]);
+  const conversations: Record<string, unknown> = {};
+  for (const c of convsSnap.docs) {
+    const msgsSnap = await getDocs(collection(db, 'conversations', c.id, 'messages'));
+    conversations[c.id] = {
+      ...c.data(),
+      messages: msgsSnap.docs.map((m) => ({ id: m.id, ...m.data() })),
+    };
+  }
+  const titles: Record<string, unknown> = {};
+  for (const t of titlesSnap.docs) {
+    const gSnap = await getDocs(collection(db, 'titles', t.id, 'glossary'));
+    const glossary: Record<string, unknown> = {};
+    for (const g of gSnap.docs) glossary[g.id] = g.data();
+    titles[t.id] = { ...t.data(), glossary };
+  }
+  const jobs: Record<string, unknown> = {};
+  for (const j of jobsSnap.docs) jobs[j.id] = j.data();
+
+  return {
+    version: '2.2',
+    exportedAt: new Date().toISOString(),
+    settings: settingsSnap.exists() ? settingsSnap.data() : DEFAULT_SETTINGS,
+    conversations,
+    titles,
+    jobs,
+  };
 }

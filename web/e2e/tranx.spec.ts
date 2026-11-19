@@ -455,4 +455,160 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.getByRole('button', { name: 'Bahasa sumber: Jepang' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Bahasa tujuan: Indonesia' })).toBeVisible();
   });
+
+  test('Claude-BugHunter Security & Complete Menu Readiness Gate: XSS/javascript: URI/SSRF defense + all remaining menus (Cari, Ganti nama, Hapus, Pintasan, Bantuan, Pelajari, Berkas export, Kamus merge, Cadangan JSON)', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // 1. Security: /web?url=javascript:alert(91234) must NEVER render <a href="javascript:..."> or execute script
+    await page.goto('/web?e2e=1&url=javascript%3Awindow.__xss%3D91234');
+    await expect(page.getByText('Tidak dapat diterjemahkan langsung')).toBeVisible();
+    await expect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
+    const xssAfterJsUrl = await page.evaluate(
+      () => (window as unknown as { __xss?: number }).__xss
+    );
+    expect(xssAfterJsUrl).toBeUndefined();
+
+    // 2. Security: /web?url=http://169.254.169.254/latest/meta-data/ SSRF metadata block
+    await page.goto('/web?e2e=1&url=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data%2F');
+    await expect(page.getByText(/Alamat jaringan internal atau privat ditolak/i)).toBeVisible();
+    await expect(page.locator('a[href*="169.254.169.254"]')).toHaveCount(0);
+
+    // 3. Security: Valid /web viewer isolates iframe without allow-same-origin
+    await page.goto('/web?e2e=1&url=https%3A%2F%2Fwww.aozora.gr.jp%2Fcards%2F1.html');
+    const iframeSandbox = await page
+      .locator('iframe[title="Pembaca Halaman Terjemahan"]')
+      .getAttribute('sandbox');
+    expect(iframeSandbox || '').not.toContain('allow-same-origin');
+    await page.getByRole('button', { name: 'Kembali' }).click();
+
+    // 4. Security: Stored/DOM XSS canary in chat, Ganti nama, and Glossary surface stays inert text
+    const canary = '<script>window.__xss=91234</script><img src=x onerror="window.__xss=91234">';
+    await page.locator('textarea.composer-textarea').fill(canary);
+    await page.locator('textarea.composer-textarea').press('Enter');
+    await expect(page.getByRole('main')).toContainText('<script>window.__xss=91234</script>');
+    expect(
+      await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)
+    ).toBeUndefined();
+
+    // 5. Menu readiness: Sidebar Cari, Lipat panel samping + Menu expand, Ganti nama, Hapus
+    await page.getByRole('button', { name: 'Cari' }).click();
+    const searchInput = page.getByPlaceholder('Cari judul atau isi bacaan...');
+    await searchInput.fill('Kyoto');
+    await expect(
+      page.getByRole('button', { name: 'Catatan Dialog Stasiun Kyoto', exact: true })
+    ).toBeVisible();
+    await searchInput.fill('zzz-tidak-ada-999');
+    await expect(
+      page.getByText('Tidak ada percakapan yang cocok dengan kata kunci tersebut.')
+    ).toBeVisible();
+    await searchInput.fill('');
+
+    await page
+      .getByRole('button', { name: /Menu riwayat Catatan Dialog Stasiun Kyoto/i })
+      .click();
+    await page.getByRole('menuitem', { name: 'Ganti nama' }).click();
+    const renameInput = page.getByRole('dialog').locator('input.field-input');
+    await renameInput.fill('Catatan Stasiun Kyoto Baru');
+    await page.getByRole('dialog').getByRole('button', { name: 'Simpan' }).click();
+    await expect(
+      page.getByRole('button', { name: 'Catatan Stasiun Kyoto Baru', exact: true })
+    ).toBeVisible();
+
+    await page
+      .getByRole('button', { name: /Menu riwayat Catatan Stasiun Kyoto Baru/i })
+      .click();
+    await page.getByRole('menuitem', { name: 'Hapus' }).click();
+    await expect(
+      page.getByRole('button', { name: 'Catatan Stasiun Kyoto Baru', exact: true })
+    ).toHaveCount(0);
+
+    await page.getByRole('button', { name: 'Lipat panel samping' }).click();
+    await page.getByRole('button', { name: 'Menu', exact: true }).click();
+
+    // 6. Menu readiness: Lainnya -> Pintasan keyboard, Berkas saya (upload + .txt/.html download), Daftar nama (Buat judul + Gabungkan judul)
+    await page.getByRole('button', { name: 'Lainnya' }).click();
+    await page.getByRole('menuitem', { name: 'Pintasan keyboard' }).click();
+    await expect(page.getByRole('heading', { name: 'Pintasan keyboard' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    await page.getByRole('button', { name: 'Lainnya' }).click();
+    await page.getByRole('menuitem', { name: 'Berkas saya' }).click();
+    await page.getByRole('button', { name: 'Terjemahkan dokumen pertama' }).click();
+    await page.locator('input[type="file"][accept*=".epub"]').setInputFiles({
+      name: 'adegan-01.srt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('1\n00:00:01,000 --> 00:00:03,000\n千早は走った。\n'),
+    });
+    await page.getByRole('button', { name: 'Kirim' }).click();
+    await expect(page.getByRole('button', { name: 'Baca berdampingan' })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Lainnya' }).click();
+    await page.getByRole('menuitem', { name: 'Berkas saya' }).click();
+    await expect(page.getByRole('main').getByText('adegan-01.srt')).toBeVisible();
+    const txtDownloadPromise = page.waitForEvent('download');
+    await page.getByRole('button', { name: '.txt' }).click();
+    const txtDownload = await txtDownloadPromise;
+    expect(txtDownload.suggestedFilename()).toContain('.txt');
+
+    await page.getByRole('button', { name: 'Lainnya' }).click();
+    await page.getByRole('menuitem', { name: 'Daftar nama' }).click();
+    await page
+      .getByPlaceholder('Contoh: Rashomon atau Bab Manga...')
+      .fill('Seri Kyoto Musim Hujan');
+    await page.getByRole('button', { name: 'Buat judul' }).click();
+    await page.getByPlaceholder('Contoh: 鴉羽').fill('美咲');
+    await page.getByPlaceholder('Contoh: Karasuba').first().fill('Misaki');
+    await page.getByRole('button', { name: 'Kunci ejaan nama' }).click();
+    await expect(page.getByText('美咲')).toBeVisible();
+
+    await page
+      .getByLabel('Pilih judul tujuan penggabungan')
+      .selectOption({ label: 'Rashomon' });
+    await page.getByRole('button', { name: 'Gabungkan judul' }).click();
+    await expect(page.getByText(/entri digabungkan ke judul tujuan/)).toBeVisible();
+    await expect(page.getByText('美咲')).toBeVisible();
+    await page.getByRole('button', { name: 'Kembali ke ruang baca' }).click();
+
+    // 7. Menu readiness: Account menu -> Bantuan, Pelajari lebih lanjut, Setelan -> Data -> Unduh cadangan JSON
+    await page.locator('.account-row-btn').click();
+    await page.getByRole('menuitem', { name: 'Bantuan' }).click();
+    await expect(page.getByRole('heading', { name: 'Bantuan' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    await page.locator('.account-row-btn').click();
+    await page.getByRole('menuitem', { name: 'Pelajari lebih lanjut' }).click();
+    await expect(page.getByRole('heading', { name: 'Pelajari lebih lanjut' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    await page.locator('.account-row-btn').click();
+    await page.getByRole('menuitem', { name: /Setelan/ }).click();
+    await page.getByRole('tab', { name: 'Data' }).click();
+    const backupDownloadPromise = page.waitForEvent('download');
+    await page.getByRole('button', { name: 'Unduh cadangan JSON' }).click();
+    const backupDownload = await backupDownloadPromise;
+    expect(backupDownload.suggestedFilename()).toMatch(/^tranx-backup-.*\.json$/);
+    const backupPath = await backupDownload.path();
+    expect(backupPath).not.toBeNull();
+    await page.keyboard.press('Escape');
+
+    // 8. Verify Baru preserves manually chosen language pair (Indonesia -> Jepang)
+    await page.getByRole('button', { name: 'Baru' }).click();
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Indonesia' }).click();
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Jepang' }).click();
+    await page.getByRole('button', { name: 'Baru' }).click();
+    await expect(page.getByRole('button', { name: 'Bahasa sumber: Indonesia' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Bahasa tujuan: Jepang' })).toBeVisible();
+
+    expect(consoleErrors).toEqual([]);
+  });
 });

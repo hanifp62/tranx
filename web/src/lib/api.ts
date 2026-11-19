@@ -1,8 +1,11 @@
 import {
   deleteConversationDirect,
+  exportFullBackupDirect,
   getE2EStore,
   getOwnerGeminiKey,
   isLocalE2EMode,
+  loadTurnMessageOnce,
+  mergeTitleGlossariesDirect,
   saveTurnMessageDirect,
   setOwnerGeminiKey,
   uploadDocumentToCloudStorage,
@@ -90,7 +93,6 @@ let cloudReachableState: { ok: boolean; checkedAt: number } | null = null;
 async function isCloudBackendAvailable(): Promise<boolean> {
   if (isLocalE2EMode() && !isDirectE2ETest()) return false;
   const base = getApiBaseUrl();
-  if (!base) return false;
   if (cloudReachableState && Date.now() - cloudReachableState.checkedAt < 120000) {
     return cloudReachableState.ok;
   }
@@ -98,7 +100,8 @@ async function isCloudBackendAvailable(): Promise<boolean> {
   const timer = window.setTimeout(() => ctrl.abort(), 2200);
   try {
     const r = await fetch(`${base}/v1/healthz`, { method: 'GET', signal: ctrl.signal });
-    const ok = r.status === 204 || r.ok;
+    const ctype = (r.headers.get('content-type') || '').toLowerCase();
+    const ok = r.status === 204 || (r.ok && !ctype.includes('text/html'));
     cloudReachableState = { ok, checkedAt: Date.now() };
     return ok;
   } catch {
@@ -841,12 +844,21 @@ export async function downloadExportedTurn(params: {
   fallbackText?: string;
 }): Promise<{ blob: Blob; filename: string }> {
   if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
+    let fallbackSentences = params.fallbackSentences;
+    let fallbackText = params.fallbackText;
+    if (!fallbackSentences && !fallbackText) {
+      const stored = await loadTurnMessageOnce(params.cid, params.mid);
+      if (stored) {
+        fallbackSentences = stored.sentences;
+        fallbackText = stored.text;
+      }
+    }
     return buildDirectExportBlob({
       cid: params.cid,
       mid: params.mid,
       fmt: params.fmt,
-      fallbackSentences: params.fallbackSentences,
-      fallbackText: params.fallbackText,
+      fallbackSentences,
+      fallbackText,
       bilingual: params.bilingual,
       theme: params.theme,
     });
@@ -1115,35 +1127,23 @@ export async function mergeTitleGlossaries(
   fromTitleId: string,
   toTitleId: string
 ): Promise<{ merged: number; conflicts: string[] }> {
-  if (isLocalE2EMode()) {
-    const store = getE2EStore();
-    const src = store.glossaries.get(fromTitleId);
-    const dst = store.glossaries.get(toTitleId) ?? new Map();
-    let merged = 0;
-    if (src) {
-      for (const [k, v] of src.entries()) {
-        if (!dst.has(k)) {
-          dst.set(k, v);
-          merged += 1;
-        }
-      }
-    }
-    store.glossaries.set(toTitleId, dst);
-    const fromDoc = store.titles.get(fromTitleId);
-    if (fromDoc) fromDoc.mergedInto = toTitleId;
-    store.emit();
-    return { merged, conflicts: [] };
+  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
+    return mergeTitleGlossariesDirect(fromTitleId, toTitleId);
   }
-  const resp = await fetch(`${getApiBaseUrl()}/v1/titles:merge`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(await authHeaders(user)),
-    },
-    body: JSON.stringify({ fromTitleId, toTitleId }),
-  });
-  if (!resp.ok) throw await parseErrorResponse(resp);
-  return resp.json();
+  try {
+    const resp = await fetch(`${getApiBaseUrl()}/v1/titles:merge`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(await authHeaders(user)),
+      },
+      body: JSON.stringify({ fromTitleId, toTitleId }),
+    });
+    if (resp.ok) return resp.json();
+  } catch {
+    cloudReachableState = { ok: false, checkedAt: Date.now() };
+  }
+  return mergeTitleGlossariesDirect(fromTitleId, toTitleId);
 }
 
 export async function downloadFullBackup(
@@ -1151,22 +1151,20 @@ export async function downloadFullBackup(
   fallbackData?: Record<string, unknown>
 ): Promise<Blob> {
   if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
-    const payload = JSON.stringify(
-      {
-        version: '2.2',
-        exportedAt: new Date().toISOString(),
-        ...(fallbackData || {}),
-      },
-      null,
-      2
-    );
+    const directSnapshot = fallbackData || (await exportFullBackupDirect());
+    const payload = JSON.stringify(directSnapshot, null, 2);
     return new Blob([payload], { type: 'application/json' });
   }
-  const resp = await fetch(`${getApiBaseUrl()}/v1/backup`, {
-    headers: await authHeaders(user),
-  });
-  if (!resp.ok) throw await parseErrorResponse(resp);
-  return resp.blob();
+  try {
+    const resp = await fetch(`${getApiBaseUrl()}/v1/backup`, {
+      headers: await authHeaders(user),
+    });
+    if (resp.ok) return resp.blob();
+  } catch {
+    cloudReachableState = { ok: false, checkedAt: Date.now() };
+  }
+  const directSnapshot = fallbackData || (await exportFullBackupDirect());
+  return new Blob([JSON.stringify(directSnapshot, null, 2)], { type: 'application/json' });
 }
 
 export async function deleteConversationRemote(
