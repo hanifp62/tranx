@@ -72,7 +72,7 @@ cd tranx
 cp web/.env.example web/.env.local
 ```
 
-Populate `web/.env.local` with your Firebase Web SDK project values. Never commit `.env.local` or `.env.production` files.
+Populate `web/.env.local` with your Firebase Web SDK project values for local development only. On Firebase Hosting, production builds omit `VITE_FIREBASE_API_KEY` completely and load Firebase Web SDK client configuration at runtime via same-origin `/__/firebase/init.json` so zero API keys are ever baked into static `web/dist/assets/*.js` bundles. Never commit `.env.local` or `.env.production` files.
 
 ### 2. Install Dependencies
 
@@ -99,7 +99,7 @@ Every change should pass all four checks before merging or deploying:
 # 1. Verify translator.py MD5 purity, 52 vendor SHA-256 files, 32/32 selftests, AST & secret hygiene
 npm run verify:integrity
 
-# 2. Run backend unit and HTTP contract tests (29 tests)
+# 2. Run backend unit and HTTP contract tests (30 tests)
 npm run test:backend
 
 # 3. Typecheck and build production PWA bundle

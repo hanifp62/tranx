@@ -25,5 +25,9 @@
     "typescript": "~5.8.3",
     "vite": "^6.3.5",
     "vite-plugin-pwa": "^1.0.1"
+  },
+  "overrides": {
+    "@grpc/grpc-js": "^1.13.6",
+    "serialize-javascript": "^7.1.3"
   }
 }

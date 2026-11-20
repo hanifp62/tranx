@@ -4,6 +4,16 @@ All notable changes to `tranX` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-11-20
+
+### Security
+- Removed baked Firebase Web SDK API keys from static `web/dist/assets/*.js` bundles by bootstrapping runtime config from Firebase Hosting's reserved `/__/firebase/init.json` (`cache: 'no-store'`), and added `/^\/__\//` to Workbox `navigateFallbackDenylist`.
+- Hardened CI (`web-build-and-pwa`) to fail builds if any `AIza...` key or `.map` sourcemap appears in `web/dist/assets/`.
+- Fixed backend `X-Forwarded-For` rate-limit bypass by reading rightmost GFE-appended peer IP, added a global `/v1/auth:pair` rate-limit bucket across all IPs, fixed active 6-digit pair-code lockout after 5 wrong guesses across both `InMemoryRepository` and `FirestoreRepository`, sanitized `verify_owner_token` 401 error messages, and disabled `localhost` CORS origins when `K_SERVICE` is set in production.
+- Eliminated the last `.innerHTML` sink in `web/src/lib/directEngine.ts` (replaced with safe DOM node construction) and hardened client + server HTML sanitizers against `meta[http-equiv="set-cookie"]`, non-stylesheet `<link>` tags, `formaction`, `xlink:href`, and unsafe CSS directives.
+- Hardened Firebase Hosting headers (`firebase.json`): added `Cache-Control: no-cache` for `/` and `/web`, removed cleartext `http:` from CSP `img-src`, scoped jsDelivr `script-src`/`connect-src` to `https://cdn.jsdelivr.net/npm/`, added `upgrade-insecure-requests`, and added `X-Permitted-Cross-Domain-Policies: none`.
+- Patched all 8 npm dependency advisories (`@grpc/grpc-js`, `serialize-javascript`, `glob`/`minimatch`) to `0 vulnerabilities` via `npm audit fix` and lockfile overrides in `web/package.json`.
+
 ## [2.2.0] - 2026-11-19
 
 ### Added

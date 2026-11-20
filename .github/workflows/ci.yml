@@ -61,10 +61,11 @@ jobs:
       - name: Typecheck and build production PWA bundle
         run: npm run build --prefix web
 
-      - name: Validate PWA build artifacts
+      - name: Validate PWA build artifacts and zero baked API keys
         run: |
           node -e "
             const fs = require('node:fs');
+            const path = require('node:path');
             const manifest = JSON.parse(fs.readFileSync('web/dist/manifest.webmanifest', 'utf8'));
             if (manifest.display !== 'standalone') throw new Error('Expected standalone display');
             if (manifest.id !== '/') throw new Error('Expected manifest id /');
@@ -74,7 +75,20 @@ jobs:
             for (const f of ['web/dist/sw.js', 'web/dist/pwa-capture.js', 'web/dist/registerSW.js']) {
               if (!fs.existsSync(f)) throw new Error('Missing build artifact: ' + f);
             }
-            console.log('PWA artifacts verified:', manifest.name, manifest.display);
+            const assetsDir = 'web/dist/assets';
+            const keyRx = new RegExp('AIza' + '[0-9A-Za-z_-]{35}');
+            for (const file of fs.readdirSync(assetsDir)) {
+              if (file.endsWith('.map')) {
+                throw new Error('Unexpected sourcemap in production build: ' + file);
+              }
+              if (file.endsWith('.js')) {
+                const body = fs.readFileSync(path.join(assetsDir, file), 'utf8');
+                if (keyRx.test(body)) {
+                  throw new Error('Baked Google/Firebase API key found in static JS bundle: ' + file);
+                }
+              }
+            }
+            console.log('PWA artifacts & zero-baked-key bundle check verified:', manifest.name, manifest.display);
           "
 
   security-and-hygiene:
