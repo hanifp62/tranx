@@ -1,5 +1,6 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { bootstrapFirebaseConfig, isLocalE2EMode } from './lib/firebase';
 import { initPwaInstallCapture } from './lib/pwaInstall';
 import './styles/tokens.css';
 import './styles/app.css';
@@ -43,8 +44,16 @@ if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
   }
 }
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>
-);
+function mountApp() {
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <App />
+    </StrictMode>
+  );
+}
+
+if (isLocalE2EMode()) {
+  mountApp();
+} else {
+  bootstrapFirebaseConfig().finally(mountApp);
+}

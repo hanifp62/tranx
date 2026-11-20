@@ -126,7 +126,7 @@ export default defineConfig({
         globPatterns: ['**/*.{js,css,html,svg,png}'],
         globIgnores: ['**/pdf.worker*', '**/worker.min*'],
         navigateFallback: '/index.html',
-        navigateFallbackDenylist: [/^\/v1\//],
+        navigateFallbackDenylist: [/^\/v1\//, /^\/__\//],
         runtimeCaching: [
           {
             urlPattern: ({ sameOrigin, url }) =>

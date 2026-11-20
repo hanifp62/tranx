@@ -4070,17 +4070,36 @@ async function buildTranslatedSiteHtmlDirect(params: {
     // Remove all executable/embedded/redirect tags AND JS-only loading curtains that stay white without JS
     doc
       .querySelectorAll(
-        'script, noscript, iframe, frame, frameset, object, embed, applet, base, meta[http-equiv="refresh"], meta[http-equiv="Content-Security-Policy"], [id*="preloader"], [class*="preloader"], .page-loader, #loading-screen, .loading-overlay'
+        'script, noscript, iframe, frame, frameset, object, embed, applet, base, meta[http-equiv="refresh" i], meta[http-equiv="content-security-policy" i], meta[http-equiv="set-cookie" i], [id*="preloader"], [class*="preloader"], .page-loader, #loading-screen, .loading-overlay'
       )
       .forEach((el) => el.remove());
 
     // Sanitize attributes and rewrite every safe <a href> into tranX auto-translating /web links
     const allElements = Array.from(doc.querySelectorAll('*'));
     for (const el of allElements) {
+      if (el.tagName === 'STYLE') {
+        const cssText = el.textContent || '';
+        el.textContent = cssText
+          .replace(/@import[^;]+;?/gi, '')
+          .replace(/expression\s*\([^)]*\)/gi, '')
+          .replace(/url\s*\(\s*['"]?\s*(?:javascript|vbscript|data\s*:\s*text\/html|data\s*:\s*image\/svg)[^)]*\)/gi, 'none');
+        continue;
+      }
+
       for (const attr of Array.from(el.attributes)) {
         const name = attr.name.toLowerCase();
-        if (name.startsWith('on') || name === 'srcdoc') {
+        if (name.startsWith('on') || name === 'srcdoc' || name === 'formaction') {
           el.removeAttribute(attr.name);
+          continue;
+        }
+        if (name === 'style') {
+          if (
+            /expression\s*\(|javascript\s*:|vbscript\s*:|@import|url\s*\(\s*['"]?\s*(?:javascript|vbscript|data\s*:\s*text\/html|data\s*:\s*image\/svg)/i.test(
+              attr.value
+            )
+          ) {
+            el.removeAttribute(attr.name);
+          }
           continue;
         }
         if (
@@ -4113,12 +4132,17 @@ async function buildTranslatedSiteHtmlDirect(params: {
           el.removeAttribute('href');
         }
       } else if (el.tagName === 'LINK') {
+        const relTokens = (el.getAttribute('rel') || '').toLowerCase().split(/\s+/).filter(Boolean);
+        if (!relTokens.includes('stylesheet')) {
+          el.remove();
+          continue;
+        }
         const rawHref = el.getAttribute('href') || '';
         const safeAbs = resolveSafeSiblingUrl(rawHref, article.url);
         if (safeAbs) {
           el.setAttribute('href', safeAbs);
         } else {
-          el.removeAttribute('href');
+          el.remove();
         }
       } else if (
         el.tagName === 'IMG' ||
@@ -4310,10 +4334,31 @@ async function buildTranslatedSiteHtmlDirect(params: {
       if (doc.title) {
         doc.title = translatedHeading;
       }
-      if (navButtonsHtml && doc.body) {
-        const navWrap = doc.createElement('div');
-        navWrap.innerHTML = navButtonsHtml;
-        doc.body.appendChild(navWrap);
+      if ((nav.prevUrl || nav.nextUrl || nav.tocUrl) && doc.body) {
+        const navBar = doc.createElement('div');
+        navBar.setAttribute('class', 'tranx-site-nav-bar');
+        navBar.setAttribute(
+          'style',
+          'position:sticky;bottom:0;z-index:9999;background:#141917;color:#FAFBFA;padding:12px 16px;display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;border-top:1px solid #2B3230;font-family:Inter,-apple-system,sans-serif;font-size:14px;'
+        );
+        const appendNavLink = (targetUrl: string, label: string, primary: boolean) => {
+          const a = doc.createElement('a');
+          a.setAttribute('href', buildTranxWebHref(targetUrl, mode, 'site', params.titleId));
+          a.setAttribute('target', '_top');
+          a.setAttribute('rel', 'noopener noreferrer');
+          a.setAttribute(
+            'style',
+            primary
+              ? 'background:#17695B;color:#FFFFFF;text-decoration:none;padding:8px 16px;border-radius:10px;font-weight:600;'
+              : 'color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;'
+          );
+          a.textContent = label;
+          navBar.appendChild(a);
+        };
+        if (nav.prevUrl) appendNavLink(nav.prevUrl, `← ${navLabels.prev}`, false);
+        if (nav.tocUrl) appendNavLink(nav.tocUrl, navLabels.toc, false);
+        if (nav.nextUrl) appendNavLink(nav.nextUrl, `${navLabels.next} →`, true);
+        doc.body.appendChild(navBar);
       }
 
       const serialized = `<!doctype html>\n${doc.documentElement.outerHTML}`;

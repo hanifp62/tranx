@@ -111,6 +111,62 @@ export function isLocalE2EMode(): boolean {
   );
 }
 
+export interface RuntimeFirebaseConfig {
+  apiKey: string;
+  authDomain: string;
+  projectId: string;
+  storageBucket: string;
+  messagingSenderId: string;
+  appId: string;
+}
+
+let runtimeFirebaseConfig: Partial<RuntimeFirebaseConfig> | null = null;
+let firebaseBootstrapPromise: Promise<void> | null = null;
+
+/**
+ * Loads Firebase Hosting's official same-origin runtime config (/__/firebase/init.json)
+ * before Firebase initializes, avoiding baking VITE_FIREBASE_API_KEY into static JS bundles.
+ * Falls back transparently to VITE_FIREBASE_* env vars for local dev / self-hosted setups.
+ */
+export function bootstrapFirebaseConfig(): Promise<void> {
+  if (typeof window === 'undefined' || isLocalE2EMode()) {
+    return Promise.resolve();
+  }
+  if (import.meta.env.VITE_FIREBASE_API_KEY) {
+    return Promise.resolve();
+  }
+  if (firebaseBootstrapPromise) return firebaseBootstrapPromise;
+  firebaseBootstrapPromise = (async () => {
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 4000);
+    try {
+      const resp = await fetch('/__/firebase/init.json', {
+        method: 'GET',
+        cache: 'no-store',
+        credentials: 'same-origin',
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) return;
+      const data = (await resp.json()) as Partial<RuntimeFirebaseConfig>;
+      if (data && typeof data.apiKey === 'string' && data.apiKey.trim()) {
+        runtimeFirebaseConfig = {
+          apiKey: data.apiKey.trim(),
+          authDomain: String(data.authDomain || '').trim(),
+          projectId: String(data.projectId || '').trim(),
+          storageBucket: String(data.storageBucket || '').trim(),
+          messagingSenderId: String(data.messagingSenderId || '').trim(),
+          appId: String(data.appId || '').trim(),
+        };
+      }
+    } catch {
+      // Non-Firebase-Hosting dev/preview falls back to VITE_FIREBASE_* env vars
+    } finally {
+      window.clearTimeout(timer);
+    }
+  })();
+  return firebaseBootstrapPromise;
+}
+
 let fbApp: FirebaseApp | null = null;
 let fbAuth: Auth | null = null;
 let fbDb: Firestore | null = null;
@@ -123,14 +179,18 @@ export function ensureFirebase(): {
   storage: FirebaseStorage;
 } {
   if (!fbApp) {
+    const rt = runtimeFirebaseConfig;
     fbApp = initializeApp({
-      apiKey: import.meta.env.VITE_FIREBASE_API_KEY || 'demo-key',
-      authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || 'localhost',
-      projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || 'tranx-hanif-id',
+      apiKey: rt?.apiKey || import.meta.env.VITE_FIREBASE_API_KEY || 'demo-key',
+      authDomain: rt?.authDomain || import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || 'localhost',
+      projectId: rt?.projectId || import.meta.env.VITE_FIREBASE_PROJECT_ID || 'tranx-hanif-id',
       storageBucket:
-        import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || 'tranx-hanif-id.firebasestorage.app',
-      messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '0',
-      appId: import.meta.env.VITE_FIREBASE_APP_ID || '1:0:web:0',
+        rt?.storageBucket ||
+        import.meta.env.VITE_FIREBASE_STORAGE_BUCKET ||
+        'tranx-hanif-id.firebasestorage.app',
+      messagingSenderId:
+        rt?.messagingSenderId || import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '0',
+      appId: rt?.appId || import.meta.env.VITE_FIREBASE_APP_ID || '1:0:web:0',
     });
     fbAuth = getAuth(fbApp);
     fbDb = initializeFirestore(fbApp, {
