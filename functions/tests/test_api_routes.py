@@ -71,9 +71,9 @@ def _auth_headers(token: str = "valid-owner-token") -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_auth_guard_enforces_single_owner() -> None:
+def test_auth_guard_and_multi_tenant_isolation(monkeypatch: Any) -> None:
     init_tranx_core()
-    repo = InMemoryRepository()
+    repo = InMemoryRepository(env_api_key=None)
     app = create_flask_app(repo, llm_transport=RouteFakeTransport())
     client = app.test_client()
 
@@ -81,8 +81,14 @@ def test_auth_guard_enforces_single_owner() -> None:
     assert client.options("/v1/chat").status_code == 204
     assert client.get("/v1/meta").status_code == 401
     assert client.get("/v1/meta", headers=_auth_headers("anon-token")).status_code == 403
-    assert client.get("/v1/meta", headers=_auth_headers("stranger-token")).status_code == 403
+    assert client.get("/v1/meta", headers=_auth_headers("unverified-token")).status_code == 403
 
+    # Optional self-hosted allowlist restricts unlisted accounts when ALLOWED_EMAILS is configured
+    monkeypatch.setenv("ALLOWED_EMAILS", "user1@example.com")
+    assert client.get("/v1/meta", headers=_auth_headers("stranger-token")).status_code == 403
+    monkeypatch.delenv("ALLOWED_EMAILS", raising=False)
+
+    # General multi-account mode: BOTH User A and User B authenticate cleanly
     r_owner = client.get("/v1/meta", headers=_auth_headers("valid-owner-token"))
     assert r_owner.status_code == 200
     meta = r_owner.get_json()
@@ -102,6 +108,43 @@ def test_auth_guard_enforces_single_owner() -> None:
 
     r_paired = client.get("/v1/meta", headers=_auth_headers("valid-paired-token"))
     assert r_paired.status_code == 200
+
+    # Strict horizontal anti-IDOR isolation between User A and User B
+    assert (
+        client.post(
+            "/v1/engine:key",
+            json={"apiKey": "user-a-private-key"},
+            headers=_auth_headers("valid-owner-token"),
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/v1/chat",
+            json={"cid": "c_private_a", "clientMsgId": "m_a1", "mode": "ja-id", "text": "おはようございます。"},
+            headers=_auth_headers("valid-owner-token"),
+        ).status_code
+        == 200
+    )
+
+    # User B must NOT see User A's API key, conversations, messages, or exports
+    meta_b = client.get("/v1/meta", headers=_auth_headers("valid-user-b-token")).get_json()
+    assert meta_b["keyStatus"] == {"configured": False, "source": "missing"}
+    backup_b = json.loads(
+        client.get("/v1/backup", headers=_auth_headers("valid-user-b-token")).data.decode("utf-8")
+    )
+    assert "c_private_a" not in backup_b["conversations"]
+    exp_b = client.get(
+        "/v1/messages/m_a1_r/export?cid=c_private_a&fmt=html",
+        headers=_auth_headers("valid-user-b-token"),
+    )
+    assert exp_b.status_code == 400
+    # User B calling DELETE on User A's cid must NEVER delete User A's conversation
+    assert client.delete("/v1/conversations/c_private_a", headers=_auth_headers("valid-user-b-token")).status_code == 204
+    backup_a = json.loads(
+        client.get("/v1/backup", headers=_auth_headers("valid-owner-token")).data.decode("utf-8")
+    )
+    assert "c_private_a" in backup_a["conversations"]
 
 
 def test_engine_key_vault_and_engine_check() -> None:
@@ -432,7 +475,7 @@ def test_pairing_inbox_merge_backup_and_cascade_delete() -> None:
     backup_res = client.get("/v1/backup", headers=_auth_headers())
     assert backup_res.status_code == 200
     backup_json = json.loads(backup_res.data.decode("utf-8"))
-    assert backup_json["version"] == "2.1"
+    assert backup_json["version"] == "2.2"
     assert "t_dst" in backup_json["glossaries"]
 
     repo.ensure_conversation("c_del", title="Hapus", title_id="t_dst", mode="ja-id")

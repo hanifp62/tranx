@@ -1,11 +1,14 @@
-"""Repository layer isolating Firebase Admin SDK (Auth, Firestore, Storage) with a full InMemoryRepository twin."""
+"""Repository layer isolating Firebase Admin SDK (Auth, Firestore, Storage) with a full multi-tenant InMemoryRepository twin."""
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import hashlib
+import os
 import secrets
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
@@ -23,7 +26,30 @@ from tranx_core import (
     glossary_entry_to_dict,
 )
 
-OWNER_EMAIL = "hanifp633@gmail.com"
+CURRENT_USER_UID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tranx_current_uid", default="owner-1"
+)
+
+
+def get_current_uid() -> str:
+    return CURRENT_USER_UID.get()
+
+
+@contextlib.contextmanager
+def scoped_user_uid(uid: str) -> Iterator[None]:
+    tok = CURRENT_USER_UID.set(uid)
+    try:
+        yield
+    finally:
+        CURRENT_USER_UID.reset(tok)
+
+
+def _allowed_emails_from_env() -> frozenset[str] | None:
+    raw = (os.environ.get("ALLOWED_EMAILS") or "").strip()
+    if not raw:
+        return None
+    items = frozenset(e.strip().lower() for e in raw.split(",") if e.strip())
+    return items or None
 
 
 class AuthError(Exception):
@@ -82,15 +108,12 @@ class Repository(Protocol):
     def export_backup(self) -> dict[str, Any]: ...
 
 
-class InMemoryRepository:
-    """Complete deterministic in-memory repository for unit and contract tests."""
-
-    def __init__(self, *, env_api_key: str | None = "test-llm-key") -> None:
+class _InMemoryUserState:
+    def __init__(self) -> None:
         self.cache_store = InMemoryCacheStore()
         self.glossary_backend = InMemoryGlossaryBackend()
-        self._usage = InMemoryUsageTracker()
-        self._env_api_key = env_api_key
-        self._vault_api_key: str | None = None
+        self.usage = InMemoryUsageTracker()
+        self.vault_api_key: str | None = None
         self.settings_raw: dict[str, Any] = AppSettings().to_firestore_dict()
         self.engine_status: dict[str, Any] = {}
         self.titles: dict[str, dict[str, Any]] = {}
@@ -98,50 +121,154 @@ class InMemoryRepository:
         self.messages: dict[str, dict[str, dict[str, Any]]] = {}
         self.paras: dict[tuple[str, str], dict[int, dict[str, Any]]] = {}
         self.jobs: dict[str, dict[str, Any]] = {}
+        self.inbox_items: dict[str, dict[str, Any]] = {}
+
+
+class _TenantInMemoryCacheStore:
+    def __init__(self, repo: InMemoryRepository) -> None:
+        self._repo = repo
+
+    def get(self, key: str) -> str | None:
+        return self._repo._state().cache_store.get(key)
+
+    def put_many(self, rows: Sequence[tuple[str, str, str, str, str]]) -> None:
+        self._repo._state().cache_store.put_many(rows)
+
+
+class _TenantInMemoryGlossaryBackend:
+    def __init__(self, repo: InMemoryRepository) -> None:
+        self._repo = repo
+
+    def set_title(self, title_id: str, name: str) -> None:
+        self._repo._state().glossary_backend.set_title(title_id, name)
+
+    def load_entries(self, title_id: str) -> tuple[str, list[dict[str, Any]]]:
+        return self._repo._state().glossary_backend.load_entries(title_id)
+
+    def commit_mutations(
+        self,
+        title_id: str,
+        upserts: dict[str, dict[str, Any]],
+        removals: set[str],
+    ) -> None:
+        self._repo._state().glossary_backend.commit_mutations(title_id, upserts, removals)
+
+
+class InMemoryRepository:
+    """Complete deterministic multi-tenant in-memory repository for unit and contract tests."""
+
+    def __init__(self, *, env_api_key: str | None = "test-llm-key") -> None:
+        self._env_api_key = env_api_key
+        self._users: dict[str, _InMemoryUserState] = {}
+        self.cache_store: CacheStore = _TenantInMemoryCacheStore(self)
+        self.glossary_backend: Any = _TenantInMemoryGlossaryBackend(self)
         self.blobs: dict[str, tuple[bytes, str]] = {}
         self.pair_codes: dict[str, dict[str, Any]] = {}
         self._pair_failed_attempts: int = 0
         self.inbox_tokens: dict[str, dict[str, Any]] = {}
-        self.inbox_items: dict[str, dict[str, Any]] = {}
         self.revoked_uids: set[str] = set()
 
+    def _state(self, uid: str | None = None) -> _InMemoryUserState:
+        target = uid or get_current_uid()
+        st = self._users.get(target)
+        if st is None:
+            st = _InMemoryUserState()
+            self._users[target] = st
+        return st
+
+    @property
+    def settings_raw(self) -> dict[str, Any]:
+        return self._state().settings_raw
+
+    @settings_raw.setter
+    def settings_raw(self, value: dict[str, Any]) -> None:
+        self._state().settings_raw = value
+
+    @property
+    def engine_status(self) -> dict[str, Any]:
+        return self._state().engine_status
+
+    @property
+    def titles(self) -> dict[str, dict[str, Any]]:
+        return self._state().titles
+
+    @property
+    def conversations(self) -> dict[str, dict[str, Any]]:
+        return self._state().conversations
+
+    @property
+    def messages(self) -> dict[str, dict[str, dict[str, Any]]]:
+        return self._state().messages
+
+    @property
+    def paras(self) -> dict[tuple[str, str], dict[int, dict[str, Any]]]:
+        return self._state().paras
+
+    @property
+    def jobs(self) -> dict[str, dict[str, Any]]:
+        return self._state().jobs
+
+    @property
+    def inbox_items(self) -> dict[str, dict[str, Any]]:
+        return self._state().inbox_items
+
     def verify_owner_token(self, token: str) -> dict[str, Any]:
+        allowlist = _allowed_emails_from_env()
         if token == "valid-owner-token":
-            return {"uid": "owner-1", "email": OWNER_EMAIL, "email_verified": True}
+            email = "user1@example.com"
+            if allowlist is not None and email not in allowlist:
+                raise AuthError(403, "ACCOUNT_RESTRICTED", "Akun tidak terdaftar dalam daftar izin.")
+            CURRENT_USER_UID.set("owner-1")
+            return {"uid": "owner-1", "email": email, "email_verified": True}
         if token == "valid-paired-token":
-            return {"uid": "owner-1", "owner": True}
+            CURRENT_USER_UID.set("owner-1")
+            return {"uid": "owner-1", "paired": True}
+        if token == "valid-user-b-token":
+            email = "user2@example.com"
+            if allowlist is not None and email not in allowlist:
+                raise AuthError(403, "ACCOUNT_RESTRICTED", "Akun tidak terdaftar dalam daftar izin.")
+            CURRENT_USER_UID.set("user-b")
+            return {"uid": "user-b", "email": email, "email_verified": True}
         if token == "anon-token":
             raise AuthError(403, "ANONYMOUS_FORBIDDEN", "Login anonim tidak diizinkan.")
+        if token == "unverified-token":
+            raise AuthError(403, "EMAIL_UNVERIFIED", "Email akun Google belum terverifikasi.")
         if token == "stranger-token":
-            raise AuthError(403, "NOT_OWNER", "Akun ini bukan pemilik tranX.")
+            email = "stranger@example.com"
+            if allowlist is not None and email not in allowlist:
+                raise AuthError(403, "ACCOUNT_RESTRICTED", "Akun tidak terdaftar dalam daftar izin.")
+            CURRENT_USER_UID.set("stranger-1")
+            return {"uid": "stranger-1", "email": email, "email_verified": True}
         raise AuthError(401, "UNAUTHENTICATED", "Token sesi tidak sah atau kedaluwarsa.")
 
     def get_api_key(self) -> tuple[str | None, str]:
+        st = self._state()
+        if st.vault_api_key:
+            return st.vault_api_key, "vault"
         if self._env_api_key:
             return self._env_api_key, "env"
-        if self._vault_api_key:
-            return self._vault_api_key, "vault"
         return None, "missing"
 
     def set_vault_api_key(self, api_key: str) -> None:
-        self._vault_api_key = api_key.strip() or None
+        self._state().vault_api_key = api_key.strip() or None
 
     def get_settings(self) -> AppSettings:
-        return AppSettings.from_dict(self.settings_raw)
+        return AppSettings.from_dict(self._state().settings_raw)
 
     def save_settings(self, patch: dict[str, Any]) -> AppSettings:
-        merged = {**self.settings_raw, **patch}
+        st = self._state()
+        merged = {**st.settings_raw, **patch}
         validated = AppSettings.from_dict(merged)
-        self.settings_raw = validated.to_firestore_dict()
+        st.settings_raw = validated.to_firestore_dict()
         return validated
 
     def update_engine_status(self, statuses: dict[str, Any]) -> None:
-        self.engine_status = dict(statuses)
+        self._state().engine_status = dict(statuses)
 
     def check_and_record_usage(
         self, *, model: str, chars: int, calls: int, char_cap: int, call_cap: int
     ) -> None:
-        self._usage.check_and_record(
+        self._state().usage.check_and_record(
             model=model,
             chars=chars,
             calls=calls,
@@ -150,31 +277,33 @@ class InMemoryRepository:
         )
 
     def get_usage_today(self) -> dict[str, Any]:
-        return self._usage.snapshot()
+        return self._state().usage.snapshot()
 
     def ensure_title(
         self, title_id: str | None, fallback_name: str, kind: str = "lepas"
     ) -> tuple[str, str, TitleStyle]:
+        st = self._state()
         tid = (title_id or "").strip() or f"t_{secrets.token_hex(6)}"
-        existing = self.titles.get(tid)
+        existing = st.titles.get(tid)
         if existing is None:
             name = (fallback_name or "Percakapan").strip()[:200]
             style = TitleStyle()
-            self.titles[tid] = {
+            st.titles[tid] = {
                 "name": name,
                 "kind": kind,
                 "auto": title_id is None,
                 "sources": [],
                 "style": style.to_dict(),
             }
-            self.glossary_backend.set_title(tid, name)
+            st.glossary_backend.set_title(tid, name)
             return tid, name, style
         style = TitleStyle.from_dict(existing.get("style"))
         return tid, str(existing.get("name") or fallback_name), style
 
     def merge_titles(self, from_id: str, to_id: str) -> dict[str, Any]:
-        _, src_entries = self.glossary_backend.load_entries(from_id)
-        _, dst_entries = self.glossary_backend.load_entries(to_id)
+        st = self._state()
+        _, src_entries = st.glossary_backend.load_entries(from_id)
+        _, dst_entries = st.glossary_backend.load_entries(to_id)
         dst_by_surface = {r["surface"]: r for r in dst_entries}
         upserts: dict[str, dict[str, Any]] = {}
         conflicts: list[str] = []
@@ -192,10 +321,10 @@ class InMemoryRepository:
             upserts[doc_id] = glossary_entry_to_dict(entry)
             merged += 1
         if upserts:
-            self.glossary_backend.commit_mutations(to_id, upserts, set())
-        if from_id in self.titles:
-            self.titles[from_id]["mergedInto"] = to_id
-        for conv in self.conversations.values():
+            st.glossary_backend.commit_mutations(to_id, upserts, set())
+        if from_id in st.titles:
+            st.titles[from_id]["mergedInto"] = to_id
+        for conv in st.conversations.values():
             if conv.get("titleId") == from_id:
                 conv["titleId"] = to_id
         return {"merged": merged, "conflicts": conflicts}
@@ -210,10 +339,11 @@ class InMemoryRepository:
         active_tab: str = "teks",
         preview: str = "",
     ) -> None:
+        st = self._state()
         now_iso = datetime.now(timezone.utc).isoformat()
-        existing = self.conversations.get(cid)
+        existing = st.conversations.get(cid)
         if existing is None:
-            self.conversations[cid] = {
+            st.conversations[cid] = {
                 "title": title[:160],
                 "titleId": title_id,
                 "mode": mode,
@@ -232,31 +362,34 @@ class InMemoryRepository:
             existing["updatedAt"] = now_iso
 
     def save_message(self, cid: str, mid: str, payload: dict[str, Any]) -> None:
-        bucket = self.messages.setdefault(cid, {})
+        st = self._state()
+        bucket = st.messages.setdefault(cid, {})
         existing = bucket.get(mid, {})
         bucket[mid] = {**existing, **payload}
 
     def get_message(self, cid: str, mid: str) -> dict[str, Any] | None:
-        return self.messages.get(cid, {}).get(mid)
+        return self._state().messages.get(cid, {}).get(mid)
 
     def save_para(self, cid: str, mid: str, idx: int, payload: dict[str, Any]) -> None:
-        self.paras.setdefault((cid, mid), {})[idx] = dict(payload)
+        self._state().paras.setdefault((cid, mid), {})[idx] = dict(payload)
 
     def list_paras(self, cid: str, mid: str) -> dict[int, dict[str, Any]]:
-        return dict(self.paras.get((cid, mid), {}))
+        return dict(self._state().paras.get((cid, mid), {}))
 
     def delete_conversation_cascade(self, cid: str) -> None:
-        self.conversations.pop(cid, None)
-        msgs = self.messages.pop(cid, {})
+        st = self._state()
+        st.conversations.pop(cid, None)
+        msgs = st.messages.pop(cid, {})
         for mid in msgs:
-            self.paras.pop((cid, mid), None)
+            st.paras.pop((cid, mid), None)
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
-        return self.jobs.get(job_id)
+        return self._state().jobs.get(job_id)
 
     def save_job(self, job_id: str, payload: dict[str, Any]) -> None:
-        existing = self.jobs.get(job_id, {})
-        self.jobs[job_id] = {**existing, **payload}
+        st = self._state()
+        existing = st.jobs.get(job_id, {})
+        st.jobs[job_id] = {**existing, **payload}
 
     def read_storage_blob(self, storage_path: str) -> bytes:
         item = self.blobs.get(storage_path)
@@ -272,8 +405,8 @@ class InMemoryRepository:
     def create_pair_code(self, owner_uid: str) -> dict[str, Any]:
         code = f"{secrets.randbelow(900000) + 100000:06d}"
         expires_at = time.time() + 120.0
-        self.pair_codes.clear()
-        self._pair_failed_attempts = 0
+        for stale_code in [k for k, v in self.pair_codes.items() if v.get("uid") == owner_uid]:
+            self.pair_codes.pop(stale_code, None)
         self.pair_codes[code] = {
             "uid": owner_uid,
             "expiresAt": expires_at,
@@ -288,17 +421,18 @@ class InMemoryRepository:
         clean = (code or "").strip()
         record = self.pair_codes.get(clean)
         if record is None:
-            if self.pair_codes:
-                self._pair_failed_attempts += 1
-                if self._pair_failed_attempts >= 5:
-                    self.pair_codes.clear()
-                    self._pair_failed_attempts = 0
+            expired_codes = []
+            for active_code, rec in list(self.pair_codes.items()):
+                rec["attempts"] = int(rec.get("attempts", 0)) + 1
+                if rec["attempts"] >= 5:
+                    expired_codes.append(active_code)
+            for c in expired_codes:
+                self.pair_codes.pop(c, None)
             raise AuthError(401, "INVALID_PAIR_CODE", "Kode pasangan tidak ditemukan atau sudah dipakai.")
         if time.time() > record["expiresAt"]:
             self.pair_codes.pop(clean, None)
             raise AuthError(401, "PAIR_CODE_EXPIRED", "Kode pasangan sudah kedaluwarsa.")
         self.pair_codes.pop(clean, None)
-        self._pair_failed_attempts = 0
         return f"custom-token-for-{record['uid']}"
 
     def revoke_all_sessions(self, owner_uid: str) -> None:
@@ -309,6 +443,7 @@ class InMemoryRepository:
         raw_secret = f"txi_{secrets.token_urlsafe(24)}"
         digest = hashlib.sha256(raw_secret.encode("utf-8")).hexdigest()
         self.inbox_tokens[token_id] = {
+            "uid": get_current_uid(),
             "hash": digest,
             "windowHour": "",
             "windowCount": 0,
@@ -335,8 +470,9 @@ class InMemoryRepository:
             raise AuthError(429, "INBOX_RATE_LIMIT", "Batas 30 kiriman Pintasan per jam tercapai.")
         matched_rec["windowCount"] += 1
 
+        target_uid = str(matched_rec.get("uid") or get_current_uid())
         inbox_id = f"item_{secrets.token_hex(6)}"
-        self.inbox_items[inbox_id] = {
+        self._state(target_uid).inbox_items[inbox_id] = {
             "text": str(item.get("text") or "")[:60000],
             "url": str(item.get("url") or "")[:2048] or None,
             "title": str(item.get("title") or "")[:200] or None,
@@ -346,30 +482,34 @@ class InMemoryRepository:
         return inbox_id
 
     def delete_inbox_item(self, inbox_id: str) -> None:
-        self.inbox_items.pop(inbox_id, None)
+        self._state().inbox_items.pop(inbox_id, None)
 
     def export_backup(self) -> dict[str, Any]:
+        st = self._state()
         glossaries = {}
-        for tid in self.titles:
-            _, entries = self.glossary_backend.load_entries(tid)
+        for tid in st.titles:
+            _, entries = st.glossary_backend.load_entries(tid)
             glossaries[tid] = entries
         return {
-            "version": "2.1",
+            "version": "2.2",
             "exportedAt": datetime.now(timezone.utc).isoformat(),
-            "settings": self.settings_raw,
-            "titles": self.titles,
+            "settings": st.settings_raw,
+            "titles": st.titles,
             "glossaries": glossaries,
-            "conversations": self.conversations,
-            "messages": self.messages,
+            "conversations": st.conversations,
+            "messages": st.messages,
         }
 
 
 class _FirestoreCacheStore:
     def __init__(self, db: Any) -> None:
-        self._col = db.collection("cacheEntries")
+        self._db = db
+
+    def _col(self) -> Any:
+        return self._db.collection("users").document(get_current_uid()).collection("cacheEntries")
 
     def get(self, key: str) -> str | None:
-        snap = self._col.document(key).get()
+        snap = self._col().document(key).get()
         if not snap.exists:
             return None
         data = snap.to_dict() or {}
@@ -379,10 +519,11 @@ class _FirestoreCacheStore:
     def put_many(self, rows: Sequence[tuple[str, str, str, str, str]]) -> None:
         if not rows:
             return
-        batch = self._col._client.batch()
+        col = self._col()
+        batch = self._db.batch()
         now = datetime.now(timezone.utc)
         for key, engine, src, tgt, value in rows[:400]:
-            ref = self._col.document(key)
+            ref = col.document(key)
             batch.set(
                 ref,
                 {
@@ -400,12 +541,16 @@ class _FirestoreGlossaryBackend:
     def __init__(self, db: Any) -> None:
         self._db = db
 
+    def _titles_col(self) -> Any:
+        return self._db.collection("users").document(get_current_uid()).collection("titles")
+
     def load_entries(self, title_id: str) -> tuple[str, list[dict[str, Any]]]:
-        t_snap = self._db.collection("titles").document(title_id).get()
+        t_col = self._titles_col()
+        t_snap = t_col.document(title_id).get()
         title_name = title_id
         if t_snap.exists:
             title_name = str((t_snap.to_dict() or {}).get("name") or title_id)
-        docs = self._db.collection("titles").document(title_id).collection("glossary").stream()
+        docs = t_col.document(title_id).collection("glossary").stream()
         rows = [d.to_dict() for d in docs if d.exists]
         return title_name, rows
 
@@ -417,7 +562,8 @@ class _FirestoreGlossaryBackend:
     ) -> None:
         from google.cloud import firestore as gc_fs
 
-        col = self._db.collection("titles").document(title_id).collection("glossary")
+        t_col = self._titles_col()
+        col = t_col.document(title_id).collection("glossary")
         now = datetime.now(timezone.utc)
 
         @gc_fs.transactional
@@ -443,7 +589,7 @@ class _FirestoreGlossaryBackend:
                         continue
                 transaction.set(col.document(doc_id), {**incoming, "updatedAt": now})
             transaction.set(
-                self._db.collection("titles").document(title_id),
+                t_col.document(title_id),
                 {"updatedAt": now},
                 merge=True,
             )
@@ -452,7 +598,7 @@ class _FirestoreGlossaryBackend:
 
 
 class FirestoreRepository:
-    """Production Firebase Admin repository (Auth + Firestore + Cloud Storage)."""
+    """Production multi-tenant Firebase Admin repository isolated under /users/{uid}/..."""
 
     def __init__(self, *, env_api_key_getter=lambda: None) -> None:
         from firebase_admin import auth as fb_auth
@@ -466,6 +612,9 @@ class FirestoreRepository:
         self.cache_store = _FirestoreCacheStore(self._db)
         self.glossary_backend = _FirestoreGlossaryBackend(self._db)
 
+    def _user_root(self, uid: str | None = None) -> Any:
+        return self._db.collection("users").document(uid or get_current_uid())
+
     def verify_owner_token(self, token: str) -> dict[str, Any]:
         if not token:
             raise AuthError(401, "UNAUTHENTICATED", "Header Authorization Bearer wajib disertakan.")
@@ -478,62 +627,61 @@ class FirestoreRepository:
         if firebase_claim.get("sign_in_provider") == "anonymous":
             raise AuthError(403, "ANONYMOUS_FORBIDDEN", "Login anonim ditolak.")
 
-        is_verified_email = (
-            decoded.get("email") == OWNER_EMAIL and decoded.get("email_verified") is True
-        )
-        is_paired_owner = decoded.get("owner") is True
-        if not (is_verified_email or is_paired_owner):
-            raise AuthError(403, "NOT_OWNER", "Akses ditolak: bukan akun pemilik.")
+        is_paired = decoded.get("paired") is True or decoded.get("owner") is True
+        is_verified_email = decoded.get("email_verified") is True
+        if not (is_verified_email or is_paired):
+            raise AuthError(403, "EMAIL_UNVERIFIED", "Email akun Google belum terverifikasi.")
+
+        allowlist = _allowed_emails_from_env()
+        if allowlist is not None and not is_paired:
+            email_val = str(decoded.get("email") or "").strip().lower()
+            if email_val not in allowlist:
+                raise AuthError(403, "ACCOUNT_RESTRICTED", "Akun tidak terdaftar dalam daftar izin.")
 
         uid = str(decoded["uid"])
-        owner_ref = self._db.collection("settings").document("owner")
-        owner_snap = owner_ref.get()
-        if not owner_snap.exists:
-            owner_ref.set(
-                {
-                    "uid": uid,
-                    "email": OWNER_EMAIL,
-                    "lockedAt": datetime.now(timezone.utc),
-                }
-            )
-        else:
-            locked_uid = (owner_snap.to_dict() or {}).get("uid")
-            if locked_uid and locked_uid != uid:
-                raise AuthError(403, "UID_MISMATCH", "UID tidak cocok dengan pemilik terdaftar.")
+        CURRENT_USER_UID.set(uid)
         return decoded
 
     def get_api_key(self) -> tuple[str | None, str]:
+        root = self._user_root()
+        # 1. Per-user BYOK secret stored in /users/{uid}/settings/secrets or /users/{uid}/serverSecrets/llm
+        sec_snap = root.collection("settings").document("secrets").get()
+        if sec_snap.exists:
+            val = (sec_snap.to_dict() or {}).get("geminiApiKey")
+            if isinstance(val, str) and val.strip():
+                return val.strip(), "vault"
+        vault_snap = root.collection("serverSecrets").document("llm").get()
+        if vault_snap.exists:
+            val = (vault_snap.to_dict() or {}).get("apiKey")
+            if isinstance(val, str) and val.strip():
+                return val.strip(), "vault"
+        # 2. Optional server-level fallback key if configured by deployer
         env_key = self._env_key_getter()
         if env_key:
             return env_key, "env"
-        snap = self._db.collection("serverSecrets").document("llm").get()
-        if snap.exists:
-            val = (snap.to_dict() or {}).get("apiKey")
-            if isinstance(val, str) and val.strip():
-                return val.strip(), "vault"
         return None, "missing"
 
     def set_vault_api_key(self, api_key: str) -> None:
         clean = api_key.strip()
-        ref = self._db.collection("serverSecrets").document("llm")
+        ref = self._user_root().collection("serverSecrets").document("llm")
         if clean:
             ref.set({"apiKey": clean, "updatedAt": datetime.now(timezone.utc)})
         else:
             ref.delete()
 
     def get_settings(self) -> AppSettings:
-        snap = self._db.collection("settings").document("app").get()
+        snap = self._user_root().collection("settings").document("app").get()
         return AppSettings.from_dict(snap.to_dict() if snap.exists else None)
 
     def save_settings(self, patch: dict[str, Any]) -> AppSettings:
         cur = self.get_settings().to_firestore_dict()
         validated = AppSettings.from_dict({**cur, **patch})
         data = {**validated.to_firestore_dict(), "updatedAt": datetime.now(timezone.utc)}
-        self._db.collection("settings").document("app").set(data, merge=True)
+        self._user_root().collection("settings").document("app").set(data, merge=True)
         return validated
 
     def update_engine_status(self, statuses: dict[str, Any]) -> None:
-        self._db.collection("settings").document("engineStatus").set(
+        self._user_root().collection("settings").document("engineStatus").set(
             {"byModel": statuses, "updatedAt": datetime.now(timezone.utc)}
         )
 
@@ -543,7 +691,7 @@ class FirestoreRepository:
         from google.cloud import firestore as gc_fs
 
         day_key = InMemoryUsageTracker.today_key()
-        ref = self._db.collection("usage").document(day_key)
+        ref = self._user_root().collection("usage").document(day_key)
 
         @gc_fs.transactional
         def _txn(transaction: Any) -> None:
@@ -577,7 +725,7 @@ class FirestoreRepository:
 
     def get_usage_today(self) -> dict[str, Any]:
         day_key = InMemoryUsageTracker.today_key()
-        snap = self._db.collection("usage").document(day_key).get()
+        snap = self._user_root().collection("usage").document(day_key).get()
         cur = snap.to_dict() if snap.exists else {"chars": 0, "calls": 0, "byModel": {}}
         return {
             "day": day_key,
@@ -590,7 +738,7 @@ class FirestoreRepository:
         self, title_id: str | None, fallback_name: str, kind: str = "lepas"
     ) -> tuple[str, str, TitleStyle]:
         tid = (title_id or "").strip() or f"t_{secrets.token_hex(6)}"
-        ref = self._db.collection("titles").document(tid)
+        ref = self._user_root().collection("titles").document(tid)
         snap = ref.get()
         now = datetime.now(timezone.utc)
         if not snap.exists:
@@ -633,10 +781,11 @@ class FirestoreRepository:
         if upserts:
             self.glossary_backend.commit_mutations(to_id, upserts, set())
         now = datetime.now(timezone.utc)
-        self._db.collection("titles").document(from_id).set(
+        root = self._user_root()
+        root.collection("titles").document(from_id).set(
             {"mergedInto": to_id, "updatedAt": now}, merge=True
         )
-        for conv in self._db.collection("conversations").where("titleId", "==", from_id).stream():
+        for conv in root.collection("conversations").where("titleId", "==", from_id).stream():
             conv.reference.update({"titleId": to_id, "updatedAt": now})
         return {"merged": merged, "conflicts": conflicts}
 
@@ -650,7 +799,7 @@ class FirestoreRepository:
         active_tab: str = "teks",
         preview: str = "",
     ) -> None:
-        ref = self._db.collection("conversations").document(cid)
+        ref = self._user_root().collection("conversations").document(cid)
         snap = ref.get()
         now = datetime.now(timezone.utc)
         if not snap.exists:
@@ -679,7 +828,13 @@ class FirestoreRepository:
 
     def save_message(self, cid: str, mid: str, payload: dict[str, Any]) -> None:
         now = datetime.now(timezone.utc)
-        ref = self._db.collection("conversations").document(cid).collection("messages").document(mid)
+        ref = (
+            self._user_root()
+            .collection("conversations")
+            .document(cid)
+            .collection("messages")
+            .document(mid)
+        )
         data = {**payload, "updatedAt": now}
         if "createdAt" not in data:
             data["createdAt"] = now
@@ -687,7 +842,8 @@ class FirestoreRepository:
 
     def get_message(self, cid: str, mid: str) -> dict[str, Any] | None:
         snap = (
-            self._db.collection("conversations")
+            self._user_root()
+            .collection("conversations")
             .document(cid)
             .collection("messages")
             .document(mid)
@@ -698,7 +854,8 @@ class FirestoreRepository:
     def save_para(self, cid: str, mid: str, idx: int, payload: dict[str, Any]) -> None:
         key = f"{idx:04d}"
         ref = (
-            self._db.collection("conversations")
+            self._user_root()
+            .collection("conversations")
             .document(cid)
             .collection("messages")
             .document(mid)
@@ -709,7 +866,8 @@ class FirestoreRepository:
 
     def list_paras(self, cid: str, mid: str) -> dict[int, dict[str, Any]]:
         col = (
-            self._db.collection("conversations")
+            self._user_root()
+            .collection("conversations")
             .document(cid)
             .collection("messages")
             .document(mid)
@@ -724,7 +882,7 @@ class FirestoreRepository:
         return out
 
     def delete_conversation_cascade(self, cid: str) -> None:
-        conv_ref = self._db.collection("conversations").document(cid)
+        conv_ref = self._user_root().collection("conversations").document(cid)
         for msg_doc in conv_ref.collection("messages").stream():
             for para_doc in msg_doc.reference.collection("paras").stream():
                 para_doc.reference.delete()
@@ -732,7 +890,7 @@ class FirestoreRepository:
         conv_ref.delete()
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
-        snap = self._db.collection("jobs").document(job_id).get()
+        snap = self._user_root().collection("jobs").document(job_id).get()
         return snap.to_dict() if snap.exists else None
 
     def save_job(self, job_id: str, payload: dict[str, Any]) -> None:
@@ -742,7 +900,7 @@ class FirestoreRepository:
             "updatedAt": now,
             "expireAt": now + timedelta(days=7),
         }
-        self._db.collection("jobs").document(job_id).set(data, merge=True)
+        self._user_root().collection("jobs").document(job_id).set(data, merge=True)
 
     def read_storage_blob(self, storage_path: str) -> bytes:
         bucket = self._storage.bucket()
@@ -761,8 +919,8 @@ class FirestoreRepository:
     def create_pair_code(self, owner_uid: str) -> dict[str, Any]:
         code = f"{secrets.randbelow(900000) + 100000:06d}"
         expires = datetime.now(timezone.utc) + timedelta(seconds=120)
-        # Keep only one active pairing code at a time and reset failed attempt counter
-        for stale in self._db.collection("pairCodes").stream():
+        # Keep only one active pairing code per user at a time
+        for stale in self._db.collection("pairCodes").where("uid", "==", owner_uid).stream():
             stale.reference.delete()
         self._db.collection("pairCodes").document(code).set(
             {
@@ -797,7 +955,7 @@ class FirestoreRepository:
             ref.delete()
             raise AuthError(401, "PAIR_CODE_EXPIRED", "Kode pasangan sudah kedaluwarsa.")
         ref.delete()
-        custom_bytes = self._auth.create_custom_token(str(rec["uid"]), {"owner": True})
+        custom_bytes = self._auth.create_custom_token(str(rec["uid"]), {"paired": True})
         return custom_bytes.decode("utf-8") if isinstance(custom_bytes, bytes) else str(custom_bytes)
 
     def revoke_all_sessions(self, owner_uid: str) -> None:
@@ -809,6 +967,7 @@ class FirestoreRepository:
         digest = hashlib.sha256(raw_secret.encode("utf-8")).hexdigest()
         self._db.collection("inboxTokens").document(token_id).set(
             {
+                "uid": get_current_uid(),
                 "hash": digest,
                 "windowHour": "",
                 "windowCount": 0,
@@ -831,6 +990,9 @@ class FirestoreRepository:
             raise AuthError(401, "INVALID_INBOX_TOKEN", "Token Pintasan tidak sah.")
 
         rec = matched_doc.to_dict() or {}
+        target_uid = str(rec.get("uid") or "").strip()
+        if not target_uid:
+            raise AuthError(401, "INVALID_INBOX_TOKEN", "Token Pintasan tidak terikat ke akun.")
         hour_key = datetime.now(timezone.utc).strftime("%Y%m%d%H")
         count = int(rec.get("windowCount", 0)) if rec.get("windowHour") == hour_key else 0
         if count >= 30:
@@ -838,7 +1000,7 @@ class FirestoreRepository:
         matched_doc.reference.update({"windowHour": hour_key, "windowCount": count + 1})
 
         now = datetime.now(timezone.utc)
-        inbox_ref = self._db.collection("inbox").document()
+        inbox_ref = self._user_root(target_uid).collection("inbox").document()
         inbox_ref.set(
             {
                 "text": str(item.get("text") or "")[:60000],
@@ -852,22 +1014,23 @@ class FirestoreRepository:
         return inbox_ref.id
 
     def delete_inbox_item(self, inbox_id: str) -> None:
-        self._db.collection("inbox").document(inbox_id).delete()
+        self._user_root().collection("inbox").document(inbox_id).delete()
 
     def export_backup(self) -> dict[str, Any]:
+        root = self._user_root()
         titles_out: dict[str, Any] = {}
         glossaries_out: dict[str, Any] = {}
-        for tdoc in self._db.collection("titles").stream():
+        for tdoc in root.collection("titles").stream():
             titles_out[tdoc.id] = _json_safe(tdoc.to_dict() or {})
             _, entries = self.glossary_backend.load_entries(tdoc.id)
             glossaries_out[tdoc.id] = [_json_safe(e) for e in entries]
 
         convs_out: dict[str, Any] = {}
-        for cdoc in self._db.collection("conversations").stream():
+        for cdoc in root.collection("conversations").stream():
             convs_out[cdoc.id] = _json_safe(cdoc.to_dict() or {})
 
         return {
-            "version": "2.1",
+            "version": "2.2",
             "exportedAt": datetime.now(timezone.utc).isoformat(),
             "settings": self.get_settings().to_firestore_dict(),
             "titles": titles_out,

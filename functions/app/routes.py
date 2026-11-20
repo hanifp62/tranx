@@ -50,7 +50,7 @@ from tranx_core import (
     translate_web_page,
 )
 
-from .store import AuthError, Repository
+from .store import AuthError, CURRENT_USER_UID, Repository, get_current_uid, scoped_user_uid
 
 MAX_STORAGE_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 MAX_HTTP_PAYLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
@@ -163,12 +163,16 @@ def create_flask_app(
 ) -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_HTTP_PAYLOAD_BYTES
-    shared_cache = LayeredTranslationCache(repo.cache_store)
+    shared_cache = LayeredTranslationCache(repo.cache_store, namespace_fn=get_current_uid)
     usage_adapter = _RepoUsageAdapter(repo)
     rate_limiter = _SlidingWindowRateLimiter(
         default_rpm=rate_limit_rpm,
         auth_rpm=auth_rate_limit_rpm,
     )
+
+    @app.teardown_request
+    def _reset_user_context(_exc: Any = None) -> None:
+        CURRENT_USER_UID.set("owner-1")
 
     @app.before_request
     def _handle_options_and_rate_limit() -> Any:
@@ -286,6 +290,10 @@ def create_flask_app(
     def _require_owner() -> dict[str, Any]:
         return repo.verify_owner_token(_extract_bearer_token())
 
+    def _bind_stream(uid: str, gen: Any) -> Any:
+        with scoped_user_uid(uid):
+            yield from gen
+
     @app.get("/v1/healthz")
     def healthz() -> tuple[str, int]:
         return "", 204
@@ -358,7 +366,8 @@ def create_flask_app(
 
     @app.post("/v1/chat")
     def post_chat() -> Response:
-        _require_owner()
+        claims = _require_owner()
+        user_uid = str(claims["uid"])
         body = request.get_json(silent=True) or {}
         cid = str(body.get("cid") or f"c_{secrets.token_hex(6)}").strip()
         user_mid = str(body.get("clientMsgId") or f"m_{secrets.token_hex(6)}_u").strip()
@@ -471,7 +480,7 @@ def create_flask_app(
                 )
 
         return Response(
-            stream_with_context(_generate()),
+            stream_with_context(_bind_stream(user_uid, _generate())),
             mimetype="application/x-ndjson",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -606,7 +615,8 @@ def create_flask_app(
 
     @app.post("/v1/translate")
     def post_translate_long() -> Response:
-        _require_owner()
+        claims = _require_owner()
+        user_uid = str(claims["uid"])
         body = request.get_json(silent=True) or {}
         cid = str(body.get("cid") or f"c_{secrets.token_hex(6)}").strip()
         mid = str(body.get("clientMsgId") or f"doc_{secrets.token_hex(6)}").strip()
@@ -694,14 +704,15 @@ def create_flask_app(
             )
 
         return Response(
-            stream_with_context(_stream()),
+            stream_with_context(_bind_stream(user_uid, _stream())),
             mimetype="application/x-ndjson",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.post("/v1/translate:resume")
     def post_translate_resume() -> Response:
-        _require_owner()
+        claims = _require_owner()
+        user_uid = str(claims["uid"])
         body = request.get_json(silent=True) or {}
         cid = str(body.get("cid") or "").strip()
         mid = str(body.get("mid") or "").strip()
@@ -766,7 +777,7 @@ def create_flask_app(
             repo.save_message(cid, mid, {"done": done_paras, "state": final_state})
 
         return Response(
-            stream_with_context(_stream()),
+            stream_with_context(_bind_stream(user_uid, _stream())),
             mimetype="application/x-ndjson",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1012,6 +1023,26 @@ def process_uploaded_document_blob(
         return {"skipped": True, "reason": "not_uploads_prefix"}
 
     uid, job_id, file_name = parts[1], parts[2], "/".join(parts[3:])
+    with scoped_user_uid(uid):
+        return _process_uploaded_document_blob_scoped(
+            repo,
+            uid=uid,
+            job_id=job_id,
+            file_name=file_name,
+            object_name=object_name,
+            llm_transport=llm_transport,
+        )
+
+
+def _process_uploaded_document_blob_scoped(
+    repo: Repository,
+    *,
+    uid: str,
+    job_id: str,
+    file_name: str,
+    object_name: str,
+    llm_transport: Any = None,
+) -> dict[str, Any]:
     job = repo.get_job(job_id) or {}
     cid = str(job.get("cid") or f"c_{job_id}")
     mid = str(job.get("mid") or f"m_{job_id}")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 from jptrans.cache import TranslationCache
@@ -39,25 +39,33 @@ class LayeredTranslationCache(TranslationCache):
         store: CacheStore | None = None,
         *,
         max_memory_entries: int = 2048,
+        namespace_fn: Callable[[], str] | None = None,
     ) -> None:
         super().__init__(None)
         self._store = store
         self._max_entries = max(max_memory_entries, 64)
+        self._namespace_fn = namespace_fn
         self._lru: OrderedDict[str, str] = OrderedDict()
         self._lru_lock = threading.Lock()
 
+    def _mem_key(self, key: str) -> str:
+        if self._namespace_fn is None:
+            return key
+        return f"{self._namespace_fn()}:{key}"
+
     def get(self, key: str) -> str | None:
+        mkey = self._mem_key(key)
         with self._lru_lock:
-            if key in self._lru:
-                self._lru.move_to_end(key)
+            if mkey in self._lru:
+                self._lru.move_to_end(mkey)
                 self._hits += 1
-                return self._lru[key]
+                return self._lru[mkey]
 
         if self._store is not None:
             persisted = self._store.get(key)
             if persisted is not None:
                 with self._lru_lock:
-                    self._put_lru(key, persisted)
+                    self._put_lru(mkey, persisted)
                     self._hits += 1
                 return persisted
 
@@ -70,7 +78,7 @@ class LayeredTranslationCache(TranslationCache):
             return
         with self._lru_lock:
             for key, _engine, _src, _tgt, value in rows:
-                self._put_lru(key, value)
+                self._put_lru(self._mem_key(key), value)
         if self._store is not None:
             self._store.put_many(rows)
 

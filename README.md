@@ -48,9 +48,9 @@ tranx/
 │   ├── workflows/ci.yml           # Automated integrity, pytest, web build & secret hygiene CI
 │   └── PULL_REQUEST_TEMPLATE.md   # Pull request verification checklist
 ├── firebase.json                  # Hosting headers (CSP/HSTS/COOP/CORP), rewrites, Firestore, Auth
-├── firestore.rules                # Single-owner Cloud Firestore security rules
+├── firestore.rules                # Per-user isolated multi-account Cloud Firestore security rules
 ├── firestore.indexes.json         # Composite indexes for pinned history and TTL cleanup
-├── storage.rules                  # Single-owner Cloud Storage rules (50 MB upload cap)
+├── storage.rules                  # Per-user isolated Cloud Storage rules (50 MB upload cap)
 ├── SECURITY.md                    # Security architecture and vulnerability reporting policy
 ├── CHANGELOG.md                   # Structured release history
 └── LICENSE                        # MIT License
@@ -124,7 +124,7 @@ firebase deploy --only firestore,hosting --project <your-firebase-project-id>
 firebase deploy --only functions,storage --project <your-firebase-project-id>
 ```
 
-Optional Gemini API keys can be configured inside the app under **Settings -> Advanced** and are stored exclusively in the owner's Firestore `/settings/secrets` document rather than browser `localStorage`.
+Optional Gemini API keys can be configured inside the app under **Settings -> Advanced** and are stored strictly inside each user's isolated Firestore `/users/{uid}/settings/secrets` document rather than browser `localStorage`. Any verified Google account can sign in across multiple devices with complete tenant isolation; self-hosters who want private allowlist mode can optionally set `VITE_ALLOWED_EMAILS` / `ALLOWED_EMAILS`.
 
 ## License
 

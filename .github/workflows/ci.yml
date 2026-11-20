@@ -109,6 +109,8 @@ jobs:
               ('openai_key', re.compile('sk-' + r'[A-Za-z0-9]{20,}')),
               ('private_key', re.compile('-----BEGIN [A-Z ]*' + 'PRIVATE KEY-----')),
               ('aws_key', re.compile('AKIA' + r'[0-9A-Z]{16}')),
+              ('hardcoded_login_hint', re.compile(r'login_hint\s*[:=]')),
+              ('personal_gmail_pii', re.compile(r'[A-Za-z0-9._%+-]+@gmail\.com')),
           ]
           local_path = re.compile(r'/Users/[A-Za-z0-9_.-]+/')
           failures = []

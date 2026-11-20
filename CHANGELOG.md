@@ -4,6 +4,14 @@ All notable changes to `tranX` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-11-20
+
+### Security & Multi-Account Isolation
+- Converted `tranX` from hardcoded single-owner authentication to a general multi-account, cross-device architecture with strict per-user isolation under `/users/{uid}/...` across Cloud Firestore (`firestore.rules`), Cloud Storage (`storage.rules`), frontend (`web/src/lib/firebase.ts`), and backend (`functions/app/store.py`, `functions/app/routes.py`, `functions/tranx_core/cache.py`).
+- Removed all hardcoded personal email PII (`login_hint`, owner email locks, `mailto:` creator address, and hardcoded fallback display names) from client, backend, rules, and `firebase.json`, and added CI guards against personal Gmail PII and `login_hint` leaks.
+- Fixed Google Sign-In popup/redirect flow by removing `login_hint`, adding `getRedirectResult()` completion on startup, adding an in-flight sign-in mutex against duplicate popups, handling `auth/popup-closed-by-user` cleanly without redirect loops, and clearing per-user in-memory caches on sign-out or account switch.
+- Added backend multi-tenant horizontal anti-IDOR isolation tests covering User A vs User B across conversations, exports, backups, and BYOK API keys, plus optional `ALLOWED_EMAILS` env allowlist support for private self-hosted deployments.
+
 ## [2.2.1] - 2026-11-20
 
 ### Security
