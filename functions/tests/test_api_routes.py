@@ -680,5 +680,106 @@ def test_sliding_window_rate_limit_and_cloudfront_403_block_detection() -> None:
     assert r_429.get_json()["error"]["code"] == "RATE_LIMITED"
 
 
+def test_security_hardening_xff_spoof_pair_lockout_prod_cors_and_meta_strip(monkeypatch: Any) -> None:
+    """Verify rightmost XFF anti-spoof, global auth:pair bucket, 5-attempt lockout, prod CORS, and HTML sanitizer."""
+    init_tranx_core()
+    repo = InMemoryRepository()
+
+    def _tricky_html_fetcher(url: str) -> FetchedPage:
+        return FetchedPage(
+            final_url=url,
+            host="example.jp",
+            content_type="text/html",
+            text=(
+                '<html><head><title>Uji</title>'
+                '<meta http-equiv="Set-Cookie" content="sid=evil">'
+                '<link rel="preload" href="https://tracker.example/x.js">'
+                '<link rel="stylesheet" href="https://example.jp/style.css">'
+                '</head><body>'
+                '<svg><a xlink:href="javascript:alert(1)">x</a></svg>'
+                '<p>おはようございます。</p></body></html>'
+            ),
+        )
+
+    app = create_flask_app(
+        repo,
+        llm_transport=RouteFakeTransport(),
+        web_fetcher=_tricky_html_fetcher,
+        rate_limit_rpm=3,
+        auth_rate_limit_rpm=10,
+    )
+    client = app.test_client()
+
+    # 1. Rotating leftmost spoofed X-Forwarded-For IPs MUST NOT bypass rate limit on same rightmost GFE peer IP
+    for spoof_idx in range(3):
+        r = client.get(
+            "/v1/meta",
+            headers={**_auth_headers(), "X-Forwarded-For": f"10.9.8.{spoof_idx}, 203.0.113.50"},
+        )
+        assert r.status_code == 200
+    r_blocked = client.get(
+        "/v1/meta",
+        headers={**_auth_headers(), "X-Forwarded-For": "10.9.8.99, 203.0.113.50"},
+    )
+    assert r_blocked.status_code == 429
+
+    # 2. 5 wrong guesses MUST invalidate an active 6-digit pairing code even if the right code is tried on attempt 6
+    code = client.post(
+        "/v1/auth:pairCode",
+        headers={**_auth_headers(), "X-Forwarded-For": "198.51.100.1"},
+    ).get_json()["code"]
+    wrong_code = "999999" if code != "999999" else "888888"
+    for i in range(5):
+        bad = client.post(
+            "/v1/auth:pair",
+            json={"code": wrong_code},
+            headers={"X-Forwarded-For": f"198.51.100.{10 + i}"},
+        )
+        assert bad.status_code == 401
+    # Active code must now be invalidated (401 even with the previously valid code)
+    locked = client.post(
+        "/v1/auth:pair",
+        json={"code": code},
+        headers={"X-Forwarded-For": "198.51.100.99"},
+    )
+    assert locked.status_code == 401
+
+    # 3. Global /v1/auth:pair rate limit triggers 429 across distinct IPs combined (auth_rate_limit_rpm=10; 6 used above)
+    for i in range(4):
+        client.post(
+            "/v1/auth:pair",
+            json={"code": "123456"},
+            headers={"X-Forwarded-For": f"198.51.100.{20 + i}"},
+        )
+    r_global_429 = client.post(
+        "/v1/auth:pair",
+        json={"code": "123456"},
+        headers={"X-Forwarded-For": "198.51.100.250"},
+    )
+    assert r_global_429.status_code == 429
+
+    # 4. Production Cloud Functions (K_SERVICE set) MUST NOT reflect http://localhost:5173 in CORS header
+    monkeypatch.setenv("K_SERVICE", "tranx-api")
+    r_local_origin = client.get(
+        "/v1/meta",
+        headers={**_auth_headers(), "Origin": "http://localhost:5173", "X-Forwarded-For": "203.0.113.77"},
+    )
+    assert r_local_origin.status_code == 200
+    assert r_local_origin.headers.get("Access-Control-Allow-Origin") == "https://tranx-hanif-id.web.app"
+
+    # 5. Sanitizer strips meta[http-equiv=Set-Cookie], non-stylesheet <link>, and xlink:href javascript:
+    r_san = client.get(
+        "/v1/web?url=https://example.jp/clean&mode=ja-id",
+        headers={**_auth_headers(), "X-Forwarded-For": "203.0.113.78"},
+    )
+    assert r_san.status_code == 200
+    html = r_san.data.decode("utf-8")
+    assert "set-cookie" not in html.lower()
+    assert "tracker.example" not in html.lower()
+    assert "javascript:" not in html.lower()
+    assert "style.css" in html
+
+
+
 
 

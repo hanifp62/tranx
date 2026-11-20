@@ -100,6 +100,7 @@ class InMemoryRepository:
         self.jobs: dict[str, dict[str, Any]] = {}
         self.blobs: dict[str, tuple[bytes, str]] = {}
         self.pair_codes: dict[str, dict[str, Any]] = {}
+        self._pair_failed_attempts: int = 0
         self.inbox_tokens: dict[str, dict[str, Any]] = {}
         self.inbox_items: dict[str, dict[str, Any]] = {}
         self.revoked_uids: set[str] = set()
@@ -271,6 +272,8 @@ class InMemoryRepository:
     def create_pair_code(self, owner_uid: str) -> dict[str, Any]:
         code = f"{secrets.randbelow(900000) + 100000:06d}"
         expires_at = time.time() + 120.0
+        self.pair_codes.clear()
+        self._pair_failed_attempts = 0
         self.pair_codes[code] = {
             "uid": owner_uid,
             "expiresAt": expires_at,
@@ -285,12 +288,17 @@ class InMemoryRepository:
         clean = (code or "").strip()
         record = self.pair_codes.get(clean)
         if record is None:
+            if self.pair_codes:
+                self._pair_failed_attempts += 1
+                if self._pair_failed_attempts >= 5:
+                    self.pair_codes.clear()
+                    self._pair_failed_attempts = 0
             raise AuthError(401, "INVALID_PAIR_CODE", "Kode pasangan tidak ditemukan atau sudah dipakai.")
-        record["attempts"] += 1
-        if record["attempts"] > 5 or time.time() > record["expiresAt"]:
+        if time.time() > record["expiresAt"]:
             self.pair_codes.pop(clean, None)
             raise AuthError(401, "PAIR_CODE_EXPIRED", "Kode pasangan sudah kedaluwarsa.")
         self.pair_codes.pop(clean, None)
+        self._pair_failed_attempts = 0
         return f"custom-token-for-{record['uid']}"
 
     def revoke_all_sessions(self, owner_uid: str) -> None:
@@ -464,7 +472,7 @@ class FirestoreRepository:
         try:
             decoded = self._auth.verify_id_token(token, check_revoked=True)
         except Exception as exc:
-            raise AuthError(401, "INVALID_TOKEN", f"Token sesi tidak sah: {exc}") from exc
+            raise AuthError(401, "INVALID_TOKEN", "Token sesi tidak sah atau kedaluwarsa.") from exc
 
         firebase_claim = decoded.get("firebase") or {}
         if firebase_claim.get("sign_in_provider") == "anonymous":
@@ -753,6 +761,9 @@ class FirestoreRepository:
     def create_pair_code(self, owner_uid: str) -> dict[str, Any]:
         code = f"{secrets.randbelow(900000) + 100000:06d}"
         expires = datetime.now(timezone.utc) + timedelta(seconds=120)
+        # Keep only one active pairing code at a time and reset failed attempt counter
+        for stale in self._db.collection("pairCodes").stream():
+            stale.reference.delete()
         self._db.collection("pairCodes").document(code).set(
             {
                 "uid": owner_uid,
@@ -769,12 +780,20 @@ class FirestoreRepository:
         ref = self._db.collection("pairCodes").document(clean)
         snap = ref.get()
         if not snap.exists:
+            # Count wrong guesses against active codes and invalidate after 5 failed attempts
+            for active in self._db.collection("pairCodes").stream():
+                data = active.to_dict() or {}
+                next_attempts = int(data.get("attempts", 0)) + 1
+                if next_attempts >= 5:
+                    active.reference.delete()
+                else:
+                    active.reference.update({"attempts": next_attempts})
             raise AuthError(401, "INVALID_PAIR_CODE", "Kode pasangan salah atau sudah dipakai.")
         rec = snap.to_dict() or {}
-        attempts = int(rec.get("attempts", 0)) + 1
+        attempts = int(rec.get("attempts", 0))
         expires_at = rec.get("expiresAt")
         now = datetime.now(timezone.utc)
-        if attempts > 5 or (expires_at and now > expires_at):
+        if attempts >= 5 or (expires_at and now > expires_at):
             ref.delete()
             raise AuthError(401, "PAIR_CODE_EXPIRED", "Kode pasangan sudah kedaluwarsa.")
         ref.delete()

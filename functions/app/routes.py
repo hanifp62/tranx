@@ -68,24 +68,44 @@ class _RepoUsageAdapter:
         )
 
 
-DEFAULT_ALLOWED_ORIGINS = frozenset(
+PROD_ALLOWED_ORIGINS = frozenset(
     {
         "https://tranx-hanif-id.web.app",
         "https://tranx-hanif-id.firebaseapp.com",
+    }
+)
+LOCAL_DEV_ORIGINS = frozenset(
+    {
         "http://localhost:5173",
         "http://localhost:4173",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:4173",
     }
 )
+DEFAULT_ALLOWED_ORIGINS = PROD_ALLOWED_ORIGINS | LOCAL_DEV_ORIGINS
 
 
 def _allowed_origins() -> frozenset[str]:
+    base = PROD_ALLOWED_ORIGINS if os.environ.get("K_SERVICE") else DEFAULT_ALLOWED_ORIGINS
     extra = os.environ.get("CORS_ALLOWED_ORIGINS", "")
     if not extra.strip():
-        return DEFAULT_ALLOWED_ORIGINS
+        return base
     custom = {o.strip().rstrip("/") for o in extra.split(",") if o.strip()}
-    return DEFAULT_ALLOWED_ORIGINS | custom
+    return base | custom
+
+
+def _extract_client_ip() -> str:
+    """Extract client IP safely without trusting attacker-spoofed leftmost X-Forwarded-For entries.
+
+    Behind Google Front End (Cloud Run / Cloud Functions Gen-2), the verified peer IP is appended
+    at the rightmost position of X-Forwarded-For. Reading index [-1] defeats header-rotation bypasses.
+    """
+    xff = (request.headers.get("X-Forwarded-For") or "").strip()
+    if xff:
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
+    return (request.remote_addr or "unknown").strip() or "unknown"
 
 
 def _extract_bearer_token() -> str:
@@ -156,14 +176,20 @@ def create_flask_app(
             return "", 204
         if request.path == "/v1/healthz":
             return None
-        client_ip = (
-            (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-            or request.remote_addr
-            or "unknown"
-        )
+        client_ip = _extract_client_ip()
         is_auth_ep = request.path.startswith("/v1/auth:pair")
         bucket_key = f"{'auth' if is_auth_ep else 'api'}:{client_ip}"
         allowed, remaining, limit, retry_after = rate_limiter.check(bucket_key, is_auth=is_auth_ep)
+        # Single-owner defense: enforce a global rate limit on /v1/auth:pair across all IPs combined
+        # so distributed brute-force against a 6-digit pairing code is impossible.
+        if allowed and request.path == "/v1/auth:pair":
+            g_allowed, g_remaining, g_limit, g_retry = rate_limiter.check(
+                "global:auth:pair", is_auth=True
+            )
+            if not g_allowed:
+                allowed, remaining, limit, retry_after = False, 0, g_limit, g_retry
+            else:
+                remaining = min(remaining, g_remaining)
         request.environ["tranx.rl_limit"] = str(limit)
         request.environ["tranx.rl_remaining"] = str(remaining)
         if not allowed:

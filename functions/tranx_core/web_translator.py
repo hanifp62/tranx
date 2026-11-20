@@ -125,8 +125,8 @@ def validate_and_resolve_url(
     if parts.username or parts.password:
         raise SSRFBlockedError("Kredensial di dalam URL tidak diizinkan")
 
-    host = (parts.hostname or "").strip().lower()
-    if not host or host in ("localhost", "metadata.google.internal") or host.endswith(".local") or host.endswith(".internal"):
+    host = (parts.hostname or "").strip().lower().rstrip(".")
+    if not host or host in ("localhost", "metadata.google.internal", "metadata") or host.endswith(".local") or host.endswith(".internal"):
         raise SSRFBlockedError(f"Host tidak diizinkan: {host!r}")
 
     try:
@@ -280,8 +280,14 @@ def sanitize_soup(soup: BeautifulSoup, final_url: str, rewrite_link_fn: Callable
 
     for meta in soup.find_all("meta"):
         http_equiv = (meta.get("http-equiv") or "").lower()
-        if http_equiv in ("refresh", "content-security-policy"):
+        if http_equiv in ("refresh", "content-security-policy", "set-cookie"):
             meta.decompose()
+
+    for link in soup.find_all("link"):
+        rel_val = link.get("rel")
+        rels = [r.lower() for r in (rel_val if isinstance(rel_val, list) else [str(rel_val or "")])]
+        if "stylesheet" not in rels:
+            link.decompose()
 
     for tag in soup.find_all(True):
         if not isinstance(tag, Tag):
@@ -293,7 +299,7 @@ def sanitize_soup(soup: BeautifulSoup, final_url: str, rewrite_link_fn: Callable
             if low.startswith("on") or low == "srcdoc":
                 del tag.attrs[attr]
                 continue
-            if low in ("href", "src", "action", "formaction"):
+            if low in ("href", "src", "action", "formaction", "xlink:href", "poster"):
                 normalized_scheme = re.sub(r"[\x00-\x20]+", "", val_str).lower()
                 if normalized_scheme.startswith(
                     (
