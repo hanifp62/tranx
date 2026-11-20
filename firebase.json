@@ -155,14 +155,5 @@
         "destination": "/index.html"
       }
     ]
-  },
-  "auth": {
-    "providers": {
-      "anonymous": false,
-      "googleSignIn": {
-        "oAuthBrandDisplayName": "tranX",
-        "supportEmail": "hanifp633@gmail.com"
-      }
-    }
   }
 }

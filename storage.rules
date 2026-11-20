@@ -1,18 +1,21 @@
 rules_version = '2';
 
-// Cloud Storage security rules for tranX (single-owner 50 MB upload gate + read-only output artifacts).
+// Cloud Storage security rules for tranX (per-user isolated 50 MB upload gate + read-only output artifacts).
 service firebase.storage {
   match /b/{bucket}/o {
 
-    function isOwner() {
+    function isVerifiedUser(uid) {
       return request.auth != null
+        && request.auth.uid == uid
         && request.auth.token.firebase.sign_in_provider != 'anonymous'
         && (
           (
-            'email' in request.auth.token
-            && request.auth.token.email == 'hanifp633@gmail.com'
-            && 'email_verified' in request.auth.token
+            'email_verified' in request.auth.token
             && request.auth.token.email_verified == true
+          )
+          || (
+            'paired' in request.auth.token
+            && request.auth.token.paired == true
           )
           || (
             'owner' in request.auth.token
@@ -22,16 +25,15 @@ service firebase.storage {
     }
 
     match /uploads/{uid}/{jobId}/{fileName} {
-      allow read, delete: if isOwner() && request.auth.uid == uid;
-      allow create, update: if isOwner()
-        && request.auth.uid == uid
+      allow read, delete: if isVerifiedUser(uid);
+      allow create, update: if isVerifiedUser(uid)
         && request.resource != null
         && request.resource.size > 0
         && request.resource.size <= 50 * 1024 * 1024;
     }
 
     match /outputs/{uid}/{jobId}/{fileName} {
-      allow read: if isOwner() && request.auth.uid == uid;
+      allow read: if isVerifiedUser(uid);
       allow write: if false;
     }
 

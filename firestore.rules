@@ -1,19 +1,22 @@
 rules_version = '2';
 
-// Assumed data model for tranX (single-owner cross-device translator):
-// - settings/owner: Admin-SDK-managed owner bootstrap record; owner read-only.
-// - settings/app: Owner-editable limits, LLM preferences, defaultSource/defaultTarget, UI language, and theme.
-// - settings/secrets: Owner-only cross-device Gemini API key storage (no localStorage exposure).
-// - settings/engineStatus: Admin-SDK-managed engine availability snapshot; owner read-only.
-// - titles/{titleId}: Work metadata (name, kind) and optional rendering style map.
-// - titles/{titleId}/glossary/{key}: User-confirmed glossary entries (surface, kind, renders, glosses).
-// - conversations/{cid}: Multilingual thread metadata (mode across ja/id/en/auto, detectedSource, preview) managed by owner.
-// - conversations/{cid}/messages/{mid} and paras/{paraId}: Translation turns and paragraph chunks readable and writable by owner.
-// - jobs/{jobId}: Async or client-direct document/image jobs managed by owner (<= 50 MiB).
-// - usage/{dayId} and inbox/{inboxId}: Admin-SDK-written quota counters and inbox captures; owner read-only.
-// - metrics/{metricId}: Append-only owner telemetry records.
-// - devices/{deviceId}: Paired or active owner devices managed by owner.
-// - pairCodes/{code}, inboxTokens/{tokenId}, cacheEntries/{hash}: Admin-SDK-only state; no client access.
+// Assumed data model for tranX (multi-account, multi-device per-user isolated translator):
+// Every client-accessible document is scoped under /users/{uid}/... and restricted to the verified owner of {uid}.
+// - users/{uid}: Container path only; no direct client read or write.
+// - users/{uid}/settings/app: User-editable limits, LLM preferences, defaultSource/defaultTarget, UI language, and theme.
+// - users/{uid}/settings/secrets: Per-user cross-device Gemini API key storage (no localStorage exposure).
+// - users/{uid}/settings/engineStatus: Admin-SDK-managed engine availability snapshot; user read-only.
+// - users/{uid}/titles/{titleId}: Work metadata (name, kind) and optional rendering style map.
+// - users/{uid}/titles/{titleId}/glossary/{key}: User-confirmed glossary entries (surface, kind, renders, glosses).
+// - users/{uid}/conversations/{cid}: Multilingual thread metadata (mode across ja/id/en/auto, detectedSource, preview).
+// - users/{uid}/conversations/{cid}/messages/{mid} and paras/{paraId}: Translation turns and paragraph chunks.
+// - users/{uid}/jobs/{jobId}: Async or client-direct document/image jobs (<= 50 MiB).
+// - users/{uid}/usage/{dayId} and inbox/{inboxId}: Admin-SDK-written quota counters and inbox captures; user read-only.
+// - users/{uid}/metrics/{metricId}: Append-only user telemetry records.
+// - users/{uid}/devices/{deviceId}: Paired or active devices belonging to the user.
+// - users/{uid}/serverSecrets/{docId} and users/{uid}/cacheEntries/{hash}: Admin-SDK-only per-user state; no client access.
+// - Root pairCodes/{code}, inboxTokens/{tokenId}, cacheEntries/{hash}, serverSecrets/{docId}: Admin-SDK-only state; no client access.
+// - Legacy single-owner root collections and any unlisted paths fall through to default deny.
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -22,15 +25,18 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function isOwner() {
+    function isVerifiedUser(uid) {
       return isAuthenticated()
+        && request.auth.uid == uid
         && request.auth.token.firebase.sign_in_provider != 'anonymous'
         && (
           (
-            'email' in request.auth.token
-            && request.auth.token.email == 'hanifp633@gmail.com'
-            && 'email_verified' in request.auth.token
+            'email_verified' in request.auth.token
             && request.auth.token.email_verified == true
+          )
+          || (
+            'paired' in request.auth.token
+            && request.auth.token.paired == true
           )
           || (
             'owner' in request.auth.token
@@ -304,115 +310,122 @@ service cloud.firestore {
         && isOptionalBoundedString(data, 'userAgent', 1000);
     }
 
-    // Written exclusively by Admin SDK on first owner login.
-    match /settings/owner {
-      allow read: if isOwner();
-      allow write: if false;
-    }
+    match /users/{uid} {
+      allow read, write: if false;
 
-    match /settings/app {
-      allow read: if isOwner();
-      allow create, update: if isOwner() && isValidAppSettings(request.resource.data);
-      allow delete: if false;
-    }
-
-    // Cross-device owner API key storage; accessible only to the verified owner.
-    match /settings/secrets {
-      allow read, delete: if isOwner();
-      allow create, update: if isOwner() && isValidSecrets(request.resource.data);
-    }
-
-    // Engine availability snapshots are maintained by Admin SDK.
-    match /settings/engineStatus {
-      allow read: if isOwner();
-      allow write: if false;
-    }
-
-    match /titles/{titleId} {
-      allow read, delete: if isOwner();
-      allow create: if isOwner() && isValidTitle(request.resource.data);
-      allow update: if isOwner()
-        && isValidTitle(request.resource.data)
-        && isCreatedAtUnchanged();
-
-      match /glossary/{key} {
-        allow read, delete: if isOwner();
-        allow create, update: if isOwner() && isValidGlossaryEntry(request.resource.data);
+      match /settings/app {
+        allow read: if isVerifiedUser(uid);
+        allow create, update: if isVerifiedUser(uid) && isValidAppSettings(request.resource.data);
+        allow delete: if false;
       }
-    }
 
-    match /conversations/{cid} {
-      allow read, delete: if isOwner();
-      allow create: if isOwner()
-        && hasOnlyAllowedFields(request.resource.data, [
-          'title',
-          'titleId',
-          'mode',
-          'detectedSource',
-          'activeTab',
-          'pinned',
-          'pinnedAt',
-          'preview',
-          'createdAt',
-          'updatedAt'
-        ])
-        && isValidConversationFields(request.resource.data);
-      allow update: if isOwner()
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'title',
-          'titleId',
-          'mode',
-          'detectedSource',
-          'activeTab',
-          'pinned',
-          'pinnedAt',
-          'preview',
-          'updatedAt'
-        ])
-        && isValidConversationFields(request.resource.data);
+      // Cross-device per-user API key storage; accessible only to the verified user.
+      match /settings/secrets {
+        allow read, delete: if isVerifiedUser(uid);
+        allow create, update: if isVerifiedUser(uid) && isValidSecrets(request.resource.data);
+      }
 
-      match /messages/{mid} {
-        allow read, delete: if isOwner();
-        allow create, update: if isOwner() && isValidMessage(request.resource.data);
+      // Engine availability snapshots are maintained by Admin SDK.
+      match /settings/engineStatus {
+        allow read: if isVerifiedUser(uid);
+        allow write: if false;
+      }
 
-        match /paras/{paraId} {
-          allow read, delete: if isOwner();
-          allow create, update: if isOwner() && isValidPara(request.resource.data);
+      match /titles/{titleId} {
+        allow read, delete: if isVerifiedUser(uid);
+        allow create: if isVerifiedUser(uid) && isValidTitle(request.resource.data);
+        allow update: if isVerifiedUser(uid)
+          && isValidTitle(request.resource.data)
+          && isCreatedAtUnchanged();
+
+        match /glossary/{key} {
+          allow read, delete: if isVerifiedUser(uid);
+          allow create, update: if isVerifiedUser(uid) && isValidGlossaryEntry(request.resource.data);
         }
       }
+
+      match /conversations/{cid} {
+        allow read, delete: if isVerifiedUser(uid);
+        allow create: if isVerifiedUser(uid)
+          && hasOnlyAllowedFields(request.resource.data, [
+            'title',
+            'titleId',
+            'mode',
+            'detectedSource',
+            'activeTab',
+            'pinned',
+            'pinnedAt',
+            'preview',
+            'createdAt',
+            'updatedAt'
+          ])
+          && isValidConversationFields(request.resource.data);
+        allow update: if isVerifiedUser(uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'title',
+            'titleId',
+            'mode',
+            'detectedSource',
+            'activeTab',
+            'pinned',
+            'pinnedAt',
+            'preview',
+            'updatedAt'
+          ])
+          && isValidConversationFields(request.resource.data);
+
+        match /messages/{mid} {
+          allow read, delete: if isVerifiedUser(uid);
+          allow create, update: if isVerifiedUser(uid) && isValidMessage(request.resource.data);
+
+          match /paras/{paraId} {
+            allow read, delete: if isVerifiedUser(uid);
+            allow create, update: if isVerifiedUser(uid) && isValidPara(request.resource.data);
+          }
+        }
+      }
+
+      match /jobs/{jobId} {
+        allow read, delete: if isVerifiedUser(uid);
+        allow create: if isVerifiedUser(uid) && isValidJobCreate(request.resource.data);
+        allow update: if isVerifiedUser(uid) && isValidJobUpdate(resource.data, request.resource.data);
+      }
+
+      match /usage/{dayId} {
+        allow read: if isVerifiedUser(uid);
+        allow write: if false;
+      }
+
+      match /inbox/{inboxId} {
+        allow read: if isVerifiedUser(uid);
+        allow write: if false;
+      }
+
+      match /metrics/{metricId} {
+        allow read: if isVerifiedUser(uid);
+        allow create: if isVerifiedUser(uid) && isValidMetric(request.resource.data);
+        allow update, delete: if false;
+      }
+
+      match /devices/{deviceId} {
+        allow read, delete: if isVerifiedUser(uid);
+        allow create: if isVerifiedUser(uid) && isValidDevice(request.resource.data);
+        allow update: if isVerifiedUser(uid)
+          && isValidDevice(request.resource.data)
+          && isCreatedAtUnchanged();
+      }
+
+      // Per-user server secrets and translation cache are Admin SDK only.
+      match /serverSecrets/{docId} {
+        allow read, write: if false;
+      }
+
+      match /cacheEntries/{hash} {
+        allow read, write: if false;
+      }
     }
 
-    match /jobs/{jobId} {
-      allow read, delete: if isOwner();
-      allow create: if isOwner() && isValidJobCreate(request.resource.data);
-      allow update: if isOwner() && isValidJobUpdate(resource.data, request.resource.data);
-    }
-
-    match /usage/{dayId} {
-      allow read: if isOwner();
-      allow write: if false;
-    }
-
-    match /inbox/{inboxId} {
-      allow read: if isOwner();
-      allow write: if false;
-    }
-
-    match /metrics/{metricId} {
-      allow read: if isOwner();
-      allow create: if isOwner() && isValidMetric(request.resource.data);
-      allow update, delete: if false;
-    }
-
-    match /devices/{deviceId} {
-      allow read, delete: if isOwner();
-      allow create: if isOwner() && isValidDevice(request.resource.data);
-      allow update: if isOwner()
-        && isValidDevice(request.resource.data)
-        && isCreatedAtUnchanged();
-    }
-
-    // Internal pairing, webhook token, and translation cache collections are Admin SDK only.
+    // Internal pairing, webhook token, translation cache, and server secrets collections are Admin SDK only.
     match /pairCodes/{code} {
       allow read, write: if false;
     }
@@ -422,6 +435,10 @@ service cloud.firestore {
     }
 
     match /cacheEntries/{hash} {
+      allow read, write: if false;
+    }
+
+    match /serverSecrets/{docId} {
       allow read, write: if false;
     }
 
