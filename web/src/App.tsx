@@ -29,7 +29,7 @@ import {
   DEFAULT_SETTINGS,
   dismissInboxItemBridge,
   loginWithCustomPairToken,
-  loginWithGoogleOwner,
+  loginWithGoogle,
   logoutSession,
   normalizeModePair,
   processDocumentSubmission,
@@ -1235,7 +1235,7 @@ export function App() {
             <BrandWordmark />
           </div>
 
-          {authError === 'NOT_OWNER' && (
+          {authError && (
             <div
               role="alert"
               style={{
@@ -1259,11 +1259,12 @@ export function App() {
                 type="button"
                 className="btn-primary pressable"
                 style={{ width: '100%', minHeight: '44px' }}
-                onClick={() =>
-                  loginWithGoogleOwner().catch((err) =>
+                onClick={() => {
+                  setPairError(null);
+                  void loginWithGoogle().catch((err) =>
                     setPairError(err instanceof Error ? err.message : 'Gagal masuk.')
-                  )
-                }
+                  );
+                }}
               >
                 {strings.loginWithGoogle}
               </button>
@@ -2148,10 +2149,12 @@ export function App() {
             }}
           >
             <span className="account-avatar">
-              {(user.displayName || user.email || 'H').slice(0, 1).toUpperCase()}
+              {(user.displayName || user.email || 'U').slice(0, 1).toUpperCase()}
             </span>
             <span className="account-meta">
-              <div className="account-name">{user.displayName || 'Hanif'}</div>
+              <div className="account-name">
+                {user.displayName || user.email?.split('@')[0] || 'Account'}
+              </div>
               <div className="account-email">{user.email}</div>
             </span>
             <IconDots size={17} />
@@ -3117,7 +3120,9 @@ export function App() {
               <a
                 role="menuitem"
                 className="menu-item-btn"
-                href="mailto:hanifp633@gmail.com?subject=Masukan%20tranX"
+                href="https://github.com/hanifp62/tranx/issues"
+                target="_blank"
+                rel="noopener noreferrer"
                 onClick={() => setAccountMenuOpen(false)}
               >
                 <span className="menu-item-left">
@@ -3448,7 +3453,9 @@ export function App() {
             </button>
             <a
               className="sheet-row-btn"
-              href="mailto:hanifp633@gmail.com?subject=Masukan%20tranX"
+              href="https://github.com/hanifp62/tranx/issues"
+              target="_blank"
+              rel="noopener noreferrer"
               onClick={() => {
                 setAccountMenuOpen(false);
                 setMobileDrawerOpen(false);

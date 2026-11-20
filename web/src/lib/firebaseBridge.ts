@@ -2,7 +2,7 @@ export {
   DEFAULT_SETTINGS,
   DEFAULT_STYLE,
   loginWithCustomPairToken,
-  loginWithGoogleOwner,
+  loginWithGoogle,
   logoutSession,
   normalizeModePair,
   renameConversationTitle,

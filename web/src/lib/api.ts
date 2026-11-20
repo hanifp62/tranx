@@ -1300,7 +1300,7 @@ export async function redeemPairCodeRequest(code: string): Promise<string> {
     throw new ApiClientError(
       503,
       'CLOUD_FN_REQUIRED',
-      'Layanan kode pasangan belum aktif. Silakan masuk langsung menggunakan akun Google pemilik.'
+      'Layanan kode pasangan belum aktif. Silakan masuk langsung menggunakan akun Google Anda.'
     );
   }
   const resp = await fetch(`${getApiBaseUrl()}/v1/auth:pair`, {

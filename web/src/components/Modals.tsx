@@ -277,9 +277,11 @@ export function InfoModal({
                 terkunci per judul karya, dan bacaan serif <em>Charter</em>.
               </div>
               <div>
-                <strong>Privasi pemilik tunggal:</strong> seluruh aturan akses Cloud Firestore,
-                Cloud Storage, dan HTTP memverifikasi akun pemilik tunggal serta tidak menyimpan
-                kunci API model di penyimpanan peramban.
+                <strong>Privasi terisolasi per akun:</strong> setiap akun Google terverifikasi
+                mendapatkan ruang data Cloud Firestore dan Cloud Storage terpisah (
+                <code>/users/&lt;uid&gt;</code>) sehingga riwayat, glosarium, dan kunci Gemini
+                opsional Anda tidak pernah dapat diakses akun lain atau disimpan di{' '}
+                <code>localStorage</code>.
               </div>
             </>
           )}

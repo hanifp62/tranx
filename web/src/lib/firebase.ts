@@ -2,6 +2,7 @@ import { initializeApp, type FirebaseApp } from 'firebase/app';
 import {
   GoogleAuthProvider,
   getAuth,
+  getRedirectResult,
   onAuthStateChanged,
   signInWithCustomToken,
   signInWithPopup,
@@ -54,7 +55,17 @@ import type {
   WorkTab,
 } from '../types';
 
-export const OWNER_EMAIL = import.meta.env.VITE_OWNER_EMAIL || 'hanifp633@gmail.com';
+const DEMO_E2E_EMAIL = 'reader@example.com';
+
+const ALLOWED_EMAIL_SET: ReadonlySet<string> | null = (() => {
+  const raw = String(import.meta.env.VITE_ALLOWED_EMAILS || '').trim();
+  if (!raw) return null;
+  const items = raw
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return items.length > 0 ? new Set(items) : null;
+})();
 
 export const VALID_MODES: ReadonlySet<string> = new Set<ModePair>([
   'auto-id',
@@ -171,6 +182,29 @@ let fbApp: FirebaseApp | null = null;
 let fbAuth: Auth | null = null;
 let fbDb: Firestore | null = null;
 let fbStorage: FirebaseStorage | null = null;
+let activeAuthUid: string | null = null;
+let redirectResultChecked = false;
+let googleSignInInFlight: Promise<void> | null = null;
+
+function getActiveUid(): string | null {
+  return fbAuth?.currentUser?.uid || activeAuthUid;
+}
+
+function requireActiveUid(): string {
+  const uid = getActiveUid();
+  if (!uid) {
+    throw new Error('Sesi masuk tidak aktif. Silakan masuk dengan akun Google Anda.');
+  }
+  return uid;
+}
+
+function userDoc(db: Firestore, pathSegment: string, ...segments: string[]) {
+  return doc(db, 'users', requireActiveUid(), pathSegment, ...segments);
+}
+
+function userCollection(db: Firestore, pathSegment: string, ...segments: string[]) {
+  return collection(db, 'users', requireActiveUid(), pathSegment, ...segments);
+}
 
 export function ensureFirebase(): {
   app: FirebaseApp;
@@ -257,9 +291,9 @@ export function glossaryKeyForSurface(surface: string): string {
 
 class LocalE2EStore {
   user: AuthSessionUser | null = {
-    uid: 'owner-1',
-    email: OWNER_EMAIL,
-    displayName: 'Hanif Priyambodo',
+    uid: 'demo-user-1',
+    email: DEMO_E2E_EMAIL,
+    displayName: 'Demo Reader',
     getIdToken: async () => 'valid-owner-token',
   };
   settings: AppSettingsDoc = { ...DEFAULT_SETTINGS };
@@ -397,20 +431,50 @@ export function subscribeAuth(
     return store.subscribe(() => onChange(store.user, null));
   }
   const { auth } = ensureFirebase();
+  if (!redirectResultChecked) {
+    redirectResultChecked = true;
+    void getRedirectResult(auth).catch(() => {
+      // Redirect errors surface cleanly through auth state / retry UI without stalling boot
+    });
+  }
   return onAuthStateChanged(auth, async (fbUser: User | null) => {
     if (!fbUser) {
+      activeAuthUid = null;
+      geminiKeyCache = null;
+      glossaryEntriesCache.clear();
       onChange(null, null);
       return;
     }
-    const tokenRes = await fbUser.getIdTokenResult();
-    const isPaired = tokenRes.claims.owner === true;
-    const isVerifiedOwner =
-      fbUser.email?.toLowerCase() === OWNER_EMAIL.toLowerCase() && fbUser.emailVerified;
-    if (!isPaired && !isVerifiedOwner) {
+    if (fbUser.isAnonymous) {
+      activeAuthUid = null;
       await signOut(auth);
-      onChange(null, 'NOT_OWNER');
+      onChange(null, 'ACCOUNT_RESTRICTED');
       return;
     }
+    const tokenRes = await fbUser.getIdTokenResult();
+    const isPaired = tokenRes.claims.paired === true || tokenRes.claims.owner === true;
+    const isVerifiedEmail = fbUser.emailVerified === true;
+    if (!isPaired && !isVerifiedEmail) {
+      activeAuthUid = null;
+      await signOut(auth);
+      onChange(null, 'ACCOUNT_RESTRICTED');
+      return;
+    }
+    if (
+      ALLOWED_EMAIL_SET &&
+      !isPaired &&
+      (!fbUser.email || !ALLOWED_EMAIL_SET.has(fbUser.email.toLowerCase()))
+    ) {
+      activeAuthUid = null;
+      await signOut(auth);
+      onChange(null, 'ACCOUNT_RESTRICTED');
+      return;
+    }
+    if (activeAuthUid && activeAuthUid !== fbUser.uid) {
+      geminiKeyCache = null;
+      glossaryEntriesCache.clear();
+    }
+    activeAuthUid = fbUser.uid;
     onChange(
       {
         uid: fbUser.uid,
@@ -423,40 +487,54 @@ export function subscribeAuth(
   });
 }
 
-export async function loginWithGoogleOwner(): Promise<void> {
+export async function loginWithGoogle(): Promise<void> {
   if (isLocalE2EMode()) {
     const store = getE2EStore();
     store.user = {
-      uid: 'owner-1',
-      email: OWNER_EMAIL,
-      displayName: 'Hanif Priyambodo',
+      uid: 'demo-user-1',
+      email: DEMO_E2E_EMAIL,
+      displayName: 'Demo Reader',
       getIdToken: async () => 'valid-owner-token',
     };
     store.emit();
     return;
   }
+  if (googleSignInInFlight) {
+    return googleSignInInFlight;
+  }
   const { auth } = ensureFirebase();
   const provider = new GoogleAuthProvider();
-  provider.setCustomParameters({ login_hint: OWNER_EMAIL, prompt: 'select_account' });
-  try {
-    await signInWithPopup(auth, provider);
-  } catch (err: unknown) {
-    const code = (err as { code?: string })?.code || '';
-    if (code === 'auth/popup-blocked') {
-      await signInWithRedirect(auth, provider);
-      return;
+  provider.setCustomParameters({ prompt: 'select_account' });
+  googleSignInInFlight = (async () => {
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (err: unknown) {
+      const code = (err as { code?: string })?.code || '';
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        return;
+      }
+      if (
+        code === 'auth/popup-blocked' ||
+        code === 'auth/operation-not-supported-in-this-environment'
+      ) {
+        await signInWithRedirect(auth, provider);
+        return;
+      }
+      throw err;
+    } finally {
+      googleSignInInFlight = null;
     }
-    throw err;
-  }
+  })();
+  return googleSignInInFlight;
 }
 
 export async function loginWithCustomPairToken(customToken: string): Promise<void> {
   if (isLocalE2EMode()) {
     const store = getE2EStore();
     store.user = {
-      uid: 'owner-1',
-      email: OWNER_EMAIL,
-      displayName: 'Perangkat Terpasang',
+      uid: 'demo-user-1',
+      email: DEMO_E2E_EMAIL,
+      displayName: 'Paired Device',
       getIdToken: async () => 'valid-paired-token',
     };
     store.emit();
@@ -474,6 +552,7 @@ export async function logoutSession(): Promise<void> {
     return;
   }
   const { auth } = ensureFirebase();
+  activeAuthUid = null;
   geminiKeyCache = null;
   glossaryEntriesCache.clear();
   await signOut(auth);
@@ -484,9 +563,13 @@ export function subscribeSettings(onData: (settings: AppSettingsDoc) => void): (
     const store = getE2EStore();
     return store.subscribe(() => onData({ ...store.settings }));
   }
+  if (!getActiveUid()) {
+    onData({ ...DEFAULT_SETTINGS });
+    return () => {};
+  }
   const { db } = ensureFirebase();
   return onSnapshot(
-    doc(db, 'settings', 'app'),
+    userDoc(db, 'settings', 'app'),
     (snap) => {
       if (!snap.exists()) {
         onData({ ...DEFAULT_SETTINGS });
@@ -526,7 +609,7 @@ export async function updateAppSettings(patch: Partial<AppSettingsDoc>): Promise
   }
   const { db } = ensureFirebase();
   await setDoc(
-    doc(db, 'settings', 'app'),
+    userDoc(db, 'settings', 'app'),
     { ...patch, updatedAt: serverTimestamp() },
     { merge: true }
   );
@@ -540,6 +623,7 @@ export async function getOwnerGeminiKey(): Promise<string> {
   if (isLocalE2EMode()) {
     return getE2EStore().geminiKey;
   }
+  if (!getActiveUid()) return '';
   if (geminiKeyCache && Date.now() - geminiKeyCache.checkedAt < GEMINI_KEY_CACHE_TTL_MS) {
     return geminiKeyCache.value;
   }
@@ -547,7 +631,7 @@ export async function getOwnerGeminiKey(): Promise<string> {
   geminiKeyInFlight = (async () => {
     try {
       const { db } = ensureFirebase();
-      const snap = await getDoc(doc(db, 'settings', 'secrets'));
+      const snap = await getDoc(userDoc(db, 'settings', 'secrets'));
       const val = snap.exists() ? String(snap.data().geminiApiKey || '').trim() : '';
       geminiKeyCache = { value: val, checkedAt: Date.now() };
       return val;
@@ -567,7 +651,7 @@ export async function setOwnerGeminiKey(apiKey: string): Promise<void> {
     return;
   }
   const { db } = ensureFirebase();
-  const ref = doc(db, 'settings', 'secrets');
+  const ref = userDoc(db, 'settings', 'secrets');
   geminiKeyCache = { value: clean.slice(0, 512), checkedAt: Date.now() };
   if (!clean) {
     await deleteDoc(ref).catch(() => {});
@@ -591,8 +675,12 @@ export function subscribeConversations(
       onData(list);
     });
   }
+  if (!getActiveUid()) {
+    onData([]);
+    return () => {};
+  }
   const { db } = ensureFirebase();
-  const q = query(collection(db, 'conversations'), orderBy('updatedAt', 'desc'));
+  const q = query(userCollection(db, 'conversations'), orderBy('updatedAt', 'desc'));
   return onSnapshot(
     q,
     (snap) => {
@@ -656,7 +744,7 @@ export async function upsertConversationMeta(
     return;
   }
   const { db } = ensureFirebase();
-  const ref = doc(db, 'conversations', cid);
+  const ref = userDoc(db, 'conversations', cid);
   const snap = await getDoc(ref);
   if (!snap.exists()) {
     await setDoc(ref, {
@@ -709,7 +797,7 @@ export async function saveTurnMessageDirect(
     return;
   }
   const { db } = ensureFirebase();
-  const ref = doc(db, 'conversations', cid, 'messages', mid);
+  const ref = userDoc(db, 'conversations', cid, 'messages', mid);
   const snap = await getDoc(ref);
   const cleanPayload: Record<string, unknown> = {
     role: turn.role,
@@ -770,16 +858,16 @@ export async function deleteConversationDirect(cid: string): Promise<void> {
     return;
   }
   const { db } = ensureFirebase();
-  const msgCol = collection(db, 'conversations', cid, 'messages');
+  const msgCol = userCollection(db, 'conversations', cid, 'messages');
   const msgs = await getDocs(msgCol);
   for (const m of msgs.docs) {
-    const paras = await getDocs(collection(db, 'conversations', cid, 'messages', m.id, 'paras'));
+    const paras = await getDocs(userCollection(db, 'conversations', cid, 'messages', m.id, 'paras'));
     for (const p of paras.docs) {
       await deleteDoc(p.ref).catch(() => {});
     }
     await deleteDoc(m.ref).catch(() => {});
   }
-  await deleteDoc(doc(db, 'conversations', cid));
+  await deleteDoc(userDoc(db, 'conversations', cid));
 }
 
 export async function toggleConversationPin(
@@ -798,7 +886,7 @@ export async function toggleConversationPin(
     return;
   }
   const { db } = ensureFirebase();
-  await updateDoc(doc(db, 'conversations', conv.id), {
+  await updateDoc(userDoc(db, 'conversations', conv.id), {
     pinned,
     pinnedAt: pinned ? serverTimestamp() : null,
     updatedAt: serverTimestamp(),
@@ -819,7 +907,7 @@ export async function renameConversationTitle(cid: string, title: string): Promi
     return;
   }
   const { db } = ensureFirebase();
-  await updateDoc(doc(db, 'conversations', cid), {
+  await updateDoc(userDoc(db, 'conversations', cid), {
     title: clean,
     updatedAt: serverTimestamp(),
   });
@@ -843,9 +931,13 @@ export function subscribeMessages(
       onData(list);
     });
   }
+  if (!getActiveUid()) {
+    onData([]);
+    return () => {};
+  }
   const { db } = ensureFirebase();
   const q = query(
-    collection(db, 'conversations', cid, 'messages'),
+    userCollection(db, 'conversations', cid, 'messages'),
     orderBy('createdAt', 'asc')
   );
   return onSnapshot(
@@ -894,9 +986,13 @@ export function subscribeTitles(onData: (titles: TitleDoc[]) => void): () => voi
       onData(Array.from(store.titles.values()).filter((t) => !t.mergedInto));
     });
   }
+  if (!getActiveUid()) {
+    onData([]);
+    return () => {};
+  }
   const { db } = ensureFirebase();
   return onSnapshot(
-    collection(db, 'titles'),
+    userCollection(db, 'titles'),
     (snap) => {
       const out: TitleDoc[] = [];
       for (const d of snap.docs) {
@@ -932,7 +1028,7 @@ export async function saveTitleDoc(
     return;
   }
   const { db } = ensureFirebase();
-  const ref = doc(db, 'titles', titleId);
+  const ref = userDoc(db, 'titles', titleId);
   const snap = await getDoc(ref);
   await setDoc(
     ref,
@@ -1004,14 +1100,15 @@ export async function loadGlossaryEntriesOnce(titleId?: string): Promise<Glossar
 
   const task = (async (): Promise<GlossaryEntry[]> => {
     try {
+      if (!getActiveUid()) return [];
       const { db } = ensureFirebase();
       const bySurface = new Map<string, GlossaryEntry>();
 
       // Parallelize title glossary + default glossary in a single round-trip
       const [primarySnap, defSnap] = await Promise.all([
-        titleId ? getDocs(collection(db, 'titles', titleId, 'glossary')) : Promise.resolve(null),
+        titleId ? getDocs(userCollection(db, 'titles', titleId, 'glossary')) : Promise.resolve(null),
         titleId !== 't_default'
-          ? getDocs(collection(db, 'titles', 't_default', 'glossary'))
+          ? getDocs(userCollection(db, 'titles', 't_default', 'glossary'))
           : Promise.resolve(null),
       ]);
 
@@ -1030,14 +1127,14 @@ export async function loadGlossaryEntriesOnce(titleId?: string): Promise<Glossar
         }
       }
       if (bySurface.size === 0) {
-        const titlesSnap = await getDocs(collection(db, 'titles'));
+        const titlesSnap = await getDocs(userCollection(db, 'titles'));
         const extraIds = titlesSnap.docs
           .slice(0, 5)
           .map((tDoc) => tDoc.id)
           .filter((id) => id !== titleId && id !== 't_default');
         if (extraIds.length > 0) {
           const extraSnaps = await Promise.all(
-            extraIds.map((id) => getDocs(collection(db, 'titles', id, 'glossary')))
+            extraIds.map((id) => getDocs(userCollection(db, 'titles', id, 'glossary')))
           );
           for (const gSnap of extraSnaps) {
             for (const d of gSnap.docs) {
@@ -1082,9 +1179,13 @@ export function subscribeGlossary(
       onData(Array.from(g.entries()).map(([key, entry]) => ({ key, entry })));
     });
   }
+  if (!getActiveUid()) {
+    onData([]);
+    return () => {};
+  }
   const { db } = ensureFirebase();
   return onSnapshot(
-    collection(db, 'titles', titleId, 'glossary'),
+    userCollection(db, 'titles', titleId, 'glossary'),
     (snap) => {
       const rows = snap.docs.map((d) => {
         const r = d.data();
@@ -1152,7 +1253,7 @@ export async function upsertUserGlossaryEntry(
     return;
   }
   const { db } = ensureFirebase();
-  const titleRef = doc(db, 'titles', titleId);
+  const titleRef = userDoc(db, 'titles', titleId);
   const titleSnap = await getDoc(titleRef);
   if (!titleSnap.exists()) {
     await setDoc(titleRef, {
@@ -1163,7 +1264,7 @@ export async function upsertUserGlossaryEntry(
       updatedAt: serverTimestamp(),
     });
   }
-  await setDoc(doc(db, 'titles', titleId, 'glossary', key), {
+  await setDoc(userDoc(db, 'titles', titleId, 'glossary', key), {
     ...fullEntry,
     updatedAt: serverTimestamp(),
   });
@@ -1178,7 +1279,7 @@ export async function removeGlossaryEntry(titleId: string, key: string): Promise
     return;
   }
   const { db } = ensureFirebase();
-  await deleteDoc(doc(db, 'titles', titleId, 'glossary', key));
+  await deleteDoc(userDoc(db, 'titles', titleId, 'glossary', key));
   glossaryEntriesCache.clear();
 }
 
@@ -1189,9 +1290,13 @@ export function subscribeJobs(onData: (jobs: JobDoc[]) => void): () => void {
       onData(Array.from(store.jobs.values()).sort((a, b) => b.updatedAt - a.updatedAt));
     });
   }
+  if (!getActiveUid()) {
+    onData([]);
+    return () => {};
+  }
   const { db } = ensureFirebase();
   return onSnapshot(
-    collection(db, 'jobs'),
+    userCollection(db, 'jobs'),
     (snap) => {
       const list: JobDoc[] = snap.docs
         .map((d) => {
@@ -1228,7 +1333,7 @@ export async function saveDirectJobRecord(job: JobDoc): Promise<void> {
     return;
   }
   const { db } = ensureFirebase();
-  const ref = doc(db, 'jobs', job.id);
+  const ref = userDoc(db, 'jobs', job.id);
   const snap = await getDoc(ref);
   if (!snap.exists()) {
     await setDoc(ref, {
@@ -1258,9 +1363,13 @@ export function subscribeInbox(onData: (items: InboxItem[]) => void): () => void
     const store = getE2EStore();
     return store.subscribe(() => onData(Array.from(store.inbox.values())));
   }
+  if (!getActiveUid()) {
+    onData([]);
+    return () => {};
+  }
   const { db } = ensureFirebase();
   return onSnapshot(
-    collection(db, 'inbox'),
+    userCollection(db, 'inbox'),
     (snap) => {
       onData(
         snap.docs.map((d) => {
@@ -1291,8 +1400,9 @@ export async function uploadDocumentToCloudStorage(params: {
   const jobId = `job_${Date.now().toString(36)}`;
   const storagePath = `uploads/${params.uid}/${jobId}/${params.file.name}`;
   const { db, storage } = ensureFirebase();
+  const jobRef = doc(db, 'users', params.uid, 'jobs', jobId);
 
-  await setDoc(doc(db, 'jobs', jobId), {
+  await setDoc(jobRef, {
     state: 'uploading',
     fileSize: Math.max(1, params.file.size),
     fileName: params.file.name.slice(0, 500),
@@ -1321,7 +1431,7 @@ export async function uploadDocumentToCloudStorage(params: {
     );
   });
 
-  await updateDoc(doc(db, 'jobs', jobId), {
+  await updateDoc(jobRef, {
     state: 'queued',
     updatedAt: serverTimestamp(),
   });
@@ -1340,7 +1450,7 @@ export async function requestStopJob(jobId: string): Promise<void> {
     return;
   }
   const { db } = ensureFirebase();
-  await updateDoc(doc(db, 'jobs', jobId), {
+  await updateDoc(userDoc(db, 'jobs', jobId), {
     state: 'stopped',
     updatedAt: serverTimestamp(),
   });
@@ -1368,8 +1478,9 @@ export async function loadTurnMessageOnce(
     return { sentences: msg.sentences, text: msg.text, fileName: msg.fileName };
   }
   try {
+    if (!getActiveUid()) return null;
     const { db } = ensureFirebase();
-    const snap = await getDoc(doc(db, 'conversations', cid, 'messages', mid));
+    const snap = await getDoc(userDoc(db, 'conversations', cid, 'messages', mid));
     if (!snap.exists()) return null;
     const r = snap.data();
     const sentences = Array.isArray(r.sentences)
@@ -1416,8 +1527,8 @@ export async function mergeTitleGlossariesDirect(
   }
   const { db } = ensureFirebase();
   const [srcSnap, dstSnap] = await Promise.all([
-    getDocs(collection(db, 'titles', fromTitleId, 'glossary')),
-    getDocs(collection(db, 'titles', toTitleId, 'glossary')),
+    getDocs(userCollection(db, 'titles', fromTitleId, 'glossary')),
+    getDocs(userCollection(db, 'titles', toTitleId, 'glossary')),
   ]);
   const existingKeys = new Set(dstSnap.docs.map((d) => d.id));
   let merged = 0;
@@ -1429,7 +1540,7 @@ export async function mergeTitleGlossariesDirect(
       continue;
     }
     const entry = mapGlossaryDoc(raw);
-    await setDoc(doc(db, 'titles', toTitleId, 'glossary', d.id), {
+    await setDoc(userDoc(db, 'titles', toTitleId, 'glossary', d.id), {
       ...entry,
       confirmed: true,
       source: 'user',
@@ -1437,7 +1548,7 @@ export async function mergeTitleGlossariesDirect(
     });
     merged += 1;
   }
-  const fromRef = doc(db, 'titles', fromTitleId);
+  const fromRef = userDoc(db, 'titles', fromTitleId);
   const fromDocSnap = await getDoc(fromRef);
   if (fromDocSnap.exists()) {
     await updateDoc(fromRef, {
@@ -1473,14 +1584,14 @@ export async function exportFullBackupDirect(): Promise<Record<string, unknown>>
   }
   const { db } = ensureFirebase();
   const [settingsSnap, convsSnap, titlesSnap, jobsSnap] = await Promise.all([
-    getDoc(doc(db, 'settings', 'app')),
-    getDocs(collection(db, 'conversations')),
-    getDocs(collection(db, 'titles')),
-    getDocs(collection(db, 'jobs')),
+    getDoc(userDoc(db, 'settings', 'app')),
+    getDocs(userCollection(db, 'conversations')),
+    getDocs(userCollection(db, 'titles')),
+    getDocs(userCollection(db, 'jobs')),
   ]);
   const conversations: Record<string, unknown> = {};
   for (const c of convsSnap.docs) {
-    const msgsSnap = await getDocs(collection(db, 'conversations', c.id, 'messages'));
+    const msgsSnap = await getDocs(userCollection(db, 'conversations', c.id, 'messages'));
     conversations[c.id] = {
       ...c.data(),
       messages: msgsSnap.docs.map((m) => ({ id: m.id, ...m.data() })),
@@ -1488,7 +1599,7 @@ export async function exportFullBackupDirect(): Promise<Record<string, unknown>>
   }
   const titles: Record<string, unknown> = {};
   for (const t of titlesSnap.docs) {
-    const gSnap = await getDocs(collection(db, 'titles', t.id, 'glossary'));
+    const gSnap = await getDocs(userCollection(db, 'titles', t.id, 'glossary'));
     const glossary: Record<string, unknown> = {};
     for (const g of gSnap.docs) glossary[g.id] = g.data();
     titles[t.id] = { ...t.data(), glossary };
