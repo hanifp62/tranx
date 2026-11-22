@@ -72,8 +72,12 @@ jobs:
             if (manifest.share_target?.enctype !== 'application/x-www-form-urlencoded') {
               throw new Error('Missing share_target.enctype');
             }
-            for (const f of ['web/dist/sw.js', 'web/dist/pwa-capture.js', 'web/dist/registerSW.js']) {
+            for (const f of ['web/dist/sw.js', 'web/dist/pwa-capture.js', 'web/dist/registerSW.js', 'web/dist/404.html', 'web/dist/.well-known/security.txt']) {
               if (!fs.existsSync(f)) throw new Error('Missing build artifact: ' + f);
+            }
+            const indexHtml = fs.readFileSync('web/dist/index.html', 'utf8');
+            if (/modulepreload[^>]+(?:firebase-db|directEngine)/i.test(indexHtml)) {
+              throw new Error('Heavy lazy chunk leaked into index.html modulepreload');
             }
             const assetsDir = 'web/dist/assets';
             const keyRx = new RegExp('AIza' + '[0-9A-Za-z_-]{35}');
@@ -90,6 +94,9 @@ jobs:
             }
             console.log('PWA artifacts & zero-baked-key bundle check verified:', manifest.name, manifest.display);
           "
+
+      - name: Production dependency vulnerability audit
+        run: npm audit --prefix web --omit=dev --audit-level=high
 
   security-and-hygiene:
     name: Secret & Path Hygiene Guard
@@ -117,7 +124,8 @@ jobs:
           for rel in tracked:
               if rel in ('translator.py', 'web/package-lock.json', '.github/workflows/ci.yml', 'tools/verify_integrity.py'):
                   continue
-              text = open(rel, 'r', encoding='utf-8', errors='ignore').read()
+              with open(rel, 'r', encoding='utf-8', errors='ignore') as fh:
+                  text = fh.read()
               for label, rx in secret_patterns:
                   if rx.search(text):
                       failures.append(f'{rel}: matched {label}')

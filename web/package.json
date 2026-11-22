@@ -1,7 +1,7 @@
 {
   "name": "tranx-web",
   "private": true,
-  "version": "2.2.0",
+  "version": "2.5.1",
   "type": "module",
   "scripts": {
     "dev": "vite --port 5173",

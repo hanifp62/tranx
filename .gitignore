@@ -3,7 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
 .venv/
 venv/
@@ -24,6 +27,7 @@ web/test-results/
 
 # Firebase, local secrets & credentials
 .firebase/
+functions/.firebase/
 firebase-debug.log
 firestore-debug.log
 ui-debug.log
@@ -47,10 +51,13 @@ web/.env.local
 *serviceAccount*.json
 credentials*.json
 
-# Editors & OS metadata
+# Editors, backups & OS metadata
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 *.swp
 *.swo
+*.bak
+*.orig
+*.tmp
