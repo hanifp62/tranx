@@ -27,9 +27,15 @@ service firebase.storage {
     match /uploads/{uid}/{jobId}/{fileName} {
       allow read, delete: if isVerifiedUser(uid);
       allow create, update: if isVerifiedUser(uid)
+        && jobId.matches('^[A-Za-z0-9_-]{1,128}$')
+        && fileName.matches('(?i)^[A-Za-z0-9._-]{1,255}\\.(txt|md|epub|pdf|docx|srt|vtt|ass|ssa|html|htm|xhtml|png|jpg|jpeg|webp)$')
         && request.resource != null
         && request.resource.size > 0
-        && request.resource.size <= 50 * 1024 * 1024;
+        && request.resource.size <= 50 * 1024 * 1024
+        && (
+          request.resource.contentType == null
+          || request.resource.contentType.matches('(?i)^(text/(plain|markdown|html|vtt|srt|x-ssa)|application/(pdf|epub\\+zip|xhtml\\+xml|vnd\\.openxmlformats-officedocument\\.wordprocessingml\\.document|x-subrip|octet-stream)|image/(png|jpeg|jpg|webp))(\\s*;.*)?$')
+        );
     }
 
     match /outputs/{uid}/{jobId}/{fileName} {

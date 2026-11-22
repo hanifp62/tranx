@@ -27,7 +27,9 @@
     "public": "web/dist",
     "ignore": [
       "firebase.json",
-      "**/.*",
+      "**/.DS_Store",
+      "**/.git/**",
+      "**/.env*",
       "**/node_modules/**"
     ],
     "headers": [
@@ -60,7 +62,7 @@
           },
           {
             "key": "Permissions-Policy",
-            "value": "microphone=(self), camera=(self), geolocation=(), payment=(), usb=()"
+            "value": "microphone=(self), camera=(self), geolocation=(), payment=(), usb=(), accelerometer=(), gyroscope=(), magnetometer=(), midi=(), serial=()"
           },
           {
             "key": "X-Permitted-Cross-Domain-Policies",
@@ -68,7 +70,7 @@
           },
           {
             "key": "Content-Security-Policy",
-            "value": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob: https://apis.google.com https://www.gstatic.com https://cdn.jsdelivr.net/npm/; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; media-src 'self' blob: data:; connect-src 'self' data: blob: https://*.googleapis.com https://clients5.google.com https://r.jina.ai https://api.allorigins.win https://api.codetabs.com https://cdn.jsdelivr.net/npm/ https://tessdata.projectnaptha.com https://api.mymemory.translated.net https://*.firebaseio.com https://*.firebasestorage.app https://*.cloudfunctions.net https://*.a.run.app wss://*.firebaseio.com; frame-src 'self' blob: data: https://*.firebaseapp.com https://accounts.google.com https://*.cloudfunctions.net https://*.a.run.app; frame-ancestors 'none'; form-action 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; upgrade-insecure-requests"
+            "value": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob: https://apis.google.com https://www.gstatic.com https://cdn.jsdelivr.net/npm/; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https://fonts.gstatic.com; media-src 'self' blob: data:; connect-src 'self' data: blob: https://*.googleapis.com https://fonts.gstatic.com https://clients5.google.com https://r.jina.ai https://api.allorigins.win https://api.codetabs.com https://cdn.jsdelivr.net/npm/ https://tessdata.projectnaptha.com https://api.mymemory.translated.net https://tranx-hanif-id.firebaseio.com https://tranx-hanif-id.firebasestorage.app https://asia-southeast2-tranx-hanif-id.cloudfunctions.net wss://tranx-hanif-id.firebaseio.com; frame-src 'self' blob: https://tranx-hanif-id.firebaseapp.com https://accounts.google.com; frame-ancestors 'none'; form-action 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; upgrade-insecure-requests"
           }
         ]
       },
@@ -140,6 +142,28 @@
         ]
       },
       {
+        "source": "/404.html",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "no-cache"
+          }
+        ]
+      },
+      {
+        "source": "/.well-known/security.txt",
+        "headers": [
+          {
+            "key": "Content-Type",
+            "value": "text/plain; charset=utf-8"
+          },
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=86400"
+          }
+        ]
+      },
+      {
         "source": "/assets/**",
         "headers": [
           {
@@ -151,7 +175,47 @@
     ],
     "rewrites": [
       {
-        "source": "**",
+        "source": "/masuk",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/masuk/kode",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/berkas",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/kamus",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/kamus/*",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/c/*",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/c/*/m/*/baca",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/web",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/share",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/open",
+        "destination": "/index.html"
+      },
+      {
+        "source": "/r/**",
         "destination": "/index.html"
       }
     ]

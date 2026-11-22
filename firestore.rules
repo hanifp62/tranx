@@ -1,22 +1,24 @@
 rules_version = '2';
 
 // Assumed data model for tranX (multi-account, multi-device per-user isolated translator):
-// Every client-accessible document is scoped under /users/{uid}/... and restricted to the verified owner of {uid}.
+// Every client-accessible document is scoped under /users/{uid}/... and restricted to the verified, non-revoked owner of {uid}.
 // - users/{uid}: Container path only; no direct client read or write.
-// - users/{uid}/settings/app: User-editable limits, LLM preferences, defaultSource/defaultTarget, UI language, and theme.
-// - users/{uid}/settings/secrets: Per-user cross-device Gemini API key storage (no localStorage exposure).
+// - users/{uid}/settings/app: User-editable limits, LLM preferences, defaultSource/defaultTarget, UI language, theme, translationTone, and ebookPrefs.
+// - users/{uid}/settings/secrets: Legacy per-user cross-device Gemini API key storage (no localStorage exposure).
 // - users/{uid}/settings/engineStatus: Admin-SDK-managed engine availability snapshot; user read-only.
-// - users/{uid}/titles/{titleId}: Work metadata (name, kind) and optional rendering style map.
-// - users/{uid}/titles/{titleId}/glossary/{key}: User-confirmed glossary entries (surface, kind, renders, glosses).
-// - users/{uid}/conversations/{cid}: Multilingual thread metadata (mode across ja/id/en/auto, detectedSource, preview).
-// - users/{uid}/conversations/{cid}/messages/{mid} and paras/{paraId}: Translation turns and paragraph chunks.
-// - users/{uid}/jobs/{jobId}: Async or client-direct document/image jobs (<= 50 MiB).
-// - users/{uid}/usage/{dayId} and inbox/{inboxId}: Admin-SDK-written quota counters and inbox captures; user read-only.
-// - users/{uid}/metrics/{metricId}: Append-only user telemetry records.
-// - users/{uid}/devices/{deviceId}: Paired or active devices belonging to the user.
-// - users/{uid}/serverSecrets/{docId} and users/{uid}/cacheEntries/{hash}: Admin-SDK-only per-user state; no client access.
+// - users/{uid}/titles/{titleId}: Work metadata (name, kind, optional style map, notes, description, mergedInto, backend auto/sources).
+// - users/{uid}/titles/{titleId}/glossary/{key}: User-confirmed glossary entries (surface, kind, renders, glosses, aliases).
+// - users/{uid}/conversations/{cid}: Multilingual thread metadata (mode across ja/id/en/auto, detectedSource, activeTab, pinned, preview).
+// - users/{uid}/conversations/{cid}/messages/{mid} and paras/{paraId}: Translation turns (text, long, image, document, link) and paragraph chunks.
+// - users/{uid}/jobs/{jobId}: Async or client-direct document/image jobs (<= 50 MiB, storage paths scoped to {uid}).
+// - users/{uid}/usage/{dayId}: Admin-SDK-written quota counters; user read-only.
+// - users/{uid}/inbox/{inboxId}: Admin-SDK-written inbox captures; verified user can read and delete (no client create/update).
+// - users/{uid}/metrics/{metricId}: Append-only user telemetry records with strict schema allowlist.
+// - users/{uid}/devices/{deviceId}: Paired or active device metadata records belonging to the user.
+// - users/{uid}/serverSecrets/{docId}: Admin-SDK-only secrets (llm vault key, session.revokedBefore epoch seconds); no client access.
+// - users/{uid}/cacheEntries/{hash}: Admin-SDK-only per-user translation cache; no client access.
 // - Root pairCodes/{code}, inboxTokens/{tokenId}, cacheEntries/{hash}, serverSecrets/{docId}: Admin-SDK-only state; no client access.
-// - Legacy single-owner root collections and any unlisted paths fall through to default deny.
+// - Any unlisted path falls through to default deny.
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -25,9 +27,35 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function isOwner(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    // Allows access if no valid revocation epoch is set; otherwise requires token auth_time >= revokedBefore.
+    function isSessionTokenFresh(sessionData) {
+      return !(sessionData is map)
+        || !('revokedBefore' in sessionData)
+        || !(sessionData.revokedBefore is number)
+        || (
+          'auth_time' in request.auth.token
+          && request.auth.token.auth_time is number
+          && request.auth.token.auth_time >= sessionData.revokedBefore
+        );
+    }
+
+    // Enforces immediate session revocation written by backend revoke_all_sessions() at serverSecrets/session.
+    function isSessionNotRevoked(uid) {
+      return !exists(/databases/$(database)/documents/users/$(uid)/serverSecrets/session)
+        || isSessionTokenFresh(
+          get(/databases/$(database)/documents/users/$(uid)/serverSecrets/session).data
+        );
+    }
+
     function isVerifiedUser(uid) {
-      return isAuthenticated()
-        && request.auth.uid == uid
+      return isOwner(uid)
+        && 'firebase' in request.auth.token
+        && request.auth.token.firebase is map
+        && 'sign_in_provider' in request.auth.token.firebase
         && request.auth.token.firebase.sign_in_provider != 'anonymous'
         && (
           (
@@ -42,23 +70,83 @@ service cloud.firestore {
             'owner' in request.auth.token
             && request.auth.token.owner == true
           )
-        );
+        )
+        && isSessionNotRevoked(uid);
     }
 
     function hasOnlyAllowedFields(data, fields) {
       return data.keys().hasOnly(fields);
     }
 
+    function isSafeDocId(id) {
+      return id is string && id.matches('^[A-Za-z0-9_-]{1,128}$');
+    }
+
+    // Glossary document keys may carry normalized CJK surface prefixes followed by a hash suffix.
+    function isSafeGlossaryKey(key) {
+      return key is string
+        && key.size() > 0
+        && key.size() <= 128
+        && key != '.'
+        && key != '..'
+        && !key.matches('(?s).*[/\\\\].*');
+    }
+
+    // Validates 4-segment user-scoped Storage paths without interpolating uid into a regex.
+    function isOptionalScopedStoragePath(data, field, prefix, uid) {
+      return !(field in data)
+        || data[field] == null
+        || data[field] == ''
+        || (
+          data[field] is string
+          && data[field].size() <= 1024
+          && data[field].split('/').size() == 4
+          && data[field].split('/')[0] == prefix
+          && data[field].split('/')[1] == uid
+          && data[field].split('/')[2].matches('^[A-Za-z0-9_-]{1,128}$')
+          && data[field].split('/')[3].matches('^[^/\\r\\n\\\\]{1,255}$')
+          && data[field].split('/')[3] != '.'
+          && data[field].split('/')[3] != '..'
+          && !data[field].matches('(?s).*\\.\\..*')
+        );
+    }
+
     function isCreatedAtUnchanged() {
       return !('createdAt' in resource.data)
-        || !('createdAt' in request.resource.data)
-        || request.resource.data.createdAt == resource.data.createdAt;
+        || (
+          'createdAt' in request.resource.data
+          && request.resource.data.createdAt == resource.data.createdAt
+        );
     }
 
     function isOptionalBoundedString(data, field, maxLen) {
       return !(field in data)
         || data[field] == null
         || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isOptionalBool(data, field) {
+      return !(field in data)
+        || data[field] == null
+        || data[field] is bool;
+    }
+
+    function isOptionalBoundedInt(data, field, minVal, maxVal) {
+      return !(field in data)
+        || data[field] == null
+        || (data[field] is int && data[field] >= minVal && data[field] <= maxVal);
+    }
+
+    function isOptionalBoundedNumber(data, field, minVal, maxVal) {
+      return !(field in data)
+        || data[field] == null
+        || (data[field] is number && data[field] >= minVal && data[field] <= maxVal);
+    }
+
+    function isOptionalBoundedList(data, field, maxLen) {
+      return !(field in data)
+        || data[field] == null
+        || (data[field] is list && data[field].size() <= maxLen);
     }
 
     function isOptionalTimeValue(data, field) {
@@ -69,7 +157,7 @@ service cloud.firestore {
     }
 
     function isValidLanguageMode(mode) {
-      return mode in [
+      return mode is string && mode in [
         'ja-id',
         'ja-en',
         'id-ja',
@@ -80,6 +168,50 @@ service cloud.firestore {
         'auto-en',
         'auto-ja'
       ];
+    }
+
+    function isValidEbookPrefs(prefs) {
+      return prefs is map
+        && hasOnlyAllowedFields(prefs, [
+          'themeMode',
+          'dayTheme',
+          'nightTheme',
+          'lockedTheme',
+          'theme',
+          'fontId',
+          'fontSize',
+          'lineHeight',
+          'letterSpacing',
+          'wordSpacing',
+          'paragraphSpacing',
+          'measure',
+          'align',
+          'pageMode',
+          'spread',
+          'readingRuler',
+          'tapZone',
+          'inlinePeek',
+          'zenMode'
+        ])
+        && (!('themeMode' in prefs) || (prefs.themeMode is string && prefs.themeMode in ['adaptive', 'locked']))
+        && (!('dayTheme' in prefs) || (prefs.dayTheme is string && prefs.dayTheme in ['paper', 'sepia', 'sage', 'eink']))
+        && (!('nightTheme' in prefs) || (prefs.nightTheme is string && prefs.nightTheme in ['dusk', 'midnight']))
+        && (!('lockedTheme' in prefs) || (prefs.lockedTheme is string && prefs.lockedTheme in ['paper', 'sepia', 'sage', 'dusk', 'midnight', 'eink']))
+        && (!('theme' in prefs) || (prefs.theme is string && prefs.theme in ['auto', 'paper', 'sepia', 'sage', 'dusk', 'midnight', 'eink']))
+        && (!('fontId' in prefs) || (prefs.fontId is string && prefs.fontId.size() > 0 && prefs.fontId.size() <= 40))
+        && (!('fontSize' in prefs) || (prefs.fontSize is number && prefs.fontSize >= 14 && prefs.fontSize <= 32))
+        && (!('lineHeight' in prefs) || (prefs.lineHeight is number && prefs.lineHeight >= 1.5 && prefs.lineHeight <= 2.05))
+        && (!('letterSpacing' in prefs) || (prefs.letterSpacing is number && prefs.letterSpacing >= 0 && prefs.letterSpacing <= 0.16))
+        && (!('wordSpacing' in prefs) || (prefs.wordSpacing is number && prefs.wordSpacing >= 0 && prefs.wordSpacing <= 0.24))
+        && (!('paragraphSpacing' in prefs) || (prefs.paragraphSpacing is number && prefs.paragraphSpacing >= 0.8 && prefs.paragraphSpacing <= 2.4))
+        && (!('measure' in prefs) || (prefs.measure is string && prefs.measure in ['narrow', 'standard', 'wide']))
+        && (!('align' in prefs) || (prefs.align is string && prefs.align in ['left', 'justify']))
+        && (!('pageMode' in prefs) || (prefs.pageMode is string && prefs.pageMode in ['scroll', 'slide', 'flip']))
+        && (!('spread' in prefs) || (prefs.spread is string && prefs.spread in ['single', 'auto']))
+        && (!('readingRuler' in prefs) || (prefs.readingRuler is string && prefs.readingRuler in ['off', 'bar', 'shade', 'underline']))
+        && (!('tapZone' in prefs) || (prefs.tapZone is string && prefs.tapZone in ['edges', 'right-hand', 'left-hand']))
+        && (!('inlinePeek' in prefs) || prefs.inlinePeek is bool)
+        && (!('zenMode' in prefs) || prefs.zenMode is bool);
     }
 
     function isValidAppSettings(data) {
@@ -95,6 +227,8 @@ service cloud.firestore {
           'defaultTarget',
           'uiLang',
           'theme',
+          'translationTone',
+          'ebookPrefs',
           'updatedAt'
         ])
         && (!('llmModels' in data)
@@ -110,13 +244,16 @@ service cloud.firestore {
         && (!('maxUploadMb' in data)
           || (data.maxUploadMb is int && data.maxUploadMb > 0 && data.maxUploadMb <= 50))
         && (!('dailyCharCap' in data)
-          || (data.dailyCharCap is int && data.dailyCharCap > 0 && data.dailyCharCap <= 1000000000))
+          || (data.dailyCharCap is int && data.dailyCharCap > 0 && data.dailyCharCap <= 1000000))
         && (!('dailyCallCap' in data)
-          || (data.dailyCallCap is int && data.dailyCallCap > 0 && data.dailyCallCap <= 10000000))
-        && (!('defaultSource' in data) || data.defaultSource in ['auto', 'ja', 'id', 'en'])
-        && (!('defaultTarget' in data) || data.defaultTarget in ['id', 'en', 'ja'])
-        && (!('uiLang' in data) || data.uiLang in ['id', 'en'])
-        && (!('theme' in data) || data.theme in ['system', 'light', 'dark'])
+          || (data.dailyCallCap is int && data.dailyCallCap > 0 && data.dailyCallCap <= 5000))
+        && (!('defaultSource' in data) || (data.defaultSource is string && data.defaultSource in ['auto', 'ja', 'id', 'en']))
+        && (!('defaultTarget' in data) || (data.defaultTarget is string && data.defaultTarget in ['id', 'en', 'ja']))
+        && (!('uiLang' in data) || (data.uiLang is string && data.uiLang in ['id', 'en']))
+        && (!('theme' in data) || (data.theme is string && data.theme in ['system', 'light', 'dark']))
+        && (!('translationTone' in data)
+          || (data.translationTone is string && data.translationTone in ['auto', 'novel', 'casual', 'formal']))
+        && (!('ebookPrefs' in data) || isValidEbookPrefs(data.ebookPrefs))
         && isOptionalTimeValue(data, 'updatedAt');
     }
 
@@ -128,26 +265,46 @@ service cloud.firestore {
 
     function isValidTitleStyle(style) {
       return style is map
-        && style.keys().size() <= 20
+        && hasOnlyAllowedFields(style, ['honorific_style', 'name_order', 'romanization'])
         && 'honorific_style' in style
+        && style.honorific_style is string
         && style.honorific_style in ['keep', 'localize', 'drop']
-        && (!('name_order' in style) || style.name_order == null || style.name_order in ['jp', 'western'])
+        && (!('name_order' in style)
+          || style.name_order == null
+          || (style.name_order is string && style.name_order in ['jp', 'western']))
         && 'romanization' in style
+        && style.romanization is string
         && style.romanization in ['macron', 'kana', 'plain'];
     }
 
     function isValidTitle(data) {
-      return data.keys().size() <= 25
+      return hasOnlyAllowedFields(data, [
+          'name',
+          'kind',
+          'style',
+          'description',
+          'notes',
+          'mergedInto',
+          'auto',
+          'sources',
+          'createdAt',
+          'updatedAt'
+        ])
         && 'name' in data
         && data.name is string
         && data.name.size() > 0
         && data.name.size() <= 300
         && 'kind' in data
+        && data.kind is string
         && data.kind in ['novel', 'komik', 'dokumen', 'subtitle', 'web', 'lepas']
         && (!('style' in data) || isValidTitleStyle(data.style))
         && isOptionalBoundedString(data, 'description', 5000)
         && isOptionalBoundedString(data, 'notes', 5000)
-        && isOptionalBoundedString(data, 'mergedInto', 200);
+        && isOptionalBoundedString(data, 'mergedInto', 200)
+        && isOptionalBool(data, 'auto')
+        && isOptionalBoundedList(data, 'sources', 100)
+        && isOptionalTimeValue(data, 'createdAt')
+        && isOptionalTimeValue(data, 'updatedAt');
     }
 
     function isValidGlossaryEntry(data) {
@@ -173,13 +330,15 @@ service cloud.firestore {
         && data.surface.size() > 0
         && data.surface.size() <= 300
         && 'kind' in data
+        && data.kind is string
         && data.kind in ['PERSON', 'PLACE', 'ORG', 'TERM', 'CULTURE']
         && 'source' in data
+        && data.source is string
         && data.source == 'user'
         && 'confirmed' in data
         && data.confirmed is bool
         && data.confirmed == true
-        && (!('gender' in data) || data.gender in ['m', 'f', ''])
+        && (!('gender' in data) || (data.gender is string && data.gender in ['m', 'f', '']))
         && isOptionalBoundedString(data, 'reading', 300)
         && isOptionalBoundedString(data, 'romaji', 300)
         && isOptionalBoundedString(data, 'render_id', 500)
@@ -193,15 +352,28 @@ service cloud.firestore {
     }
 
     function isValidConversationFields(data) {
-      return 'pinned' in data
+      return hasOnlyAllowedFields(data, [
+          'title',
+          'titleId',
+          'mode',
+          'detectedSource',
+          'activeTab',
+          'pinned',
+          'pinnedAt',
+          'preview',
+          'createdAt',
+          'updatedAt'
+        ])
+        && 'pinned' in data
         && data.pinned is bool
         && 'mode' in data
         && isValidLanguageMode(data.mode)
         && 'activeTab' in data
+        && data.activeTab is string
         && data.activeTab in ['teks', 'gambar', 'dokumen', 'link']
         && (!('detectedSource' in data)
           || data.detectedSource == null
-          || data.detectedSource in ['ja', 'id', 'en', ''])
+          || (data.detectedSource is string && data.detectedSource in ['ja', 'id', 'en', '']))
         && isOptionalBoundedString(data, 'title', 500)
         && isOptionalBoundedString(data, 'titleId', 200)
         && isOptionalBoundedString(data, 'preview', 2000)
@@ -210,57 +382,254 @@ service cloud.firestore {
         && isOptionalTimeValue(data, 'updatedAt');
     }
 
-    function isValidMessage(data) {
-      return data.keys().size() <= 30
+    function isValidImageResult(img) {
+      return img is map
+        && hasOnlyAllowedFields(img, [
+          'width',
+          'height',
+          'blocks',
+          'fullSrc',
+          'fullDst',
+          'model',
+          'dataUrl',
+          'readingDir',
+          'comicLayout',
+          'isSpread',
+          'lockedNames'
+        ])
+        && isOptionalBoundedNumber(img, 'width', 0, 50000)
+        && isOptionalBoundedNumber(img, 'height', 0, 50000)
+        && isOptionalBoundedList(img, 'blocks', 250)
+        && isOptionalBoundedString(img, 'fullSrc', 200000)
+        && isOptionalBoundedString(img, 'fullDst', 200000)
+        && isOptionalBoundedString(img, 'model', 200)
+        && isOptionalBoundedString(img, 'dataUrl', 400000)
+        && (!('readingDir' in img)
+          || img.readingDir == null
+          || (img.readingDir is string && img.readingDir in ['rtl', 'ltr', 'vertical']))
+        && (!('comicLayout' in img)
+          || img.comicLayout == null
+          || (img.comicLayout is string && img.comicLayout in ['rtl_manga', 'webtoon_strip', 'four_koma', 'ltr_comic', 'single_image']))
+        && isOptionalBool(img, 'isSpread')
+        && isOptionalBoundedList(img, 'lockedNames', 200);
+    }
+
+    function isValidNovelNav(nav) {
+      return nav is map
+        && hasOnlyAllowedFields(nav, [
+          'isNovel',
+          'isTocPage',
+          'seriesTitle',
+          'chapterLabel',
+          'totalChapters',
+          'currentIndex',
+          'firstUrl',
+          'prevUrl',
+          'nextUrl',
+          'tocUrl',
+          'chapters'
+        ])
+        && isOptionalBool(nav, 'isNovel')
+        && isOptionalBool(nav, 'isTocPage')
+        && isOptionalBoundedString(nav, 'seriesTitle', 1000)
+        && isOptionalBoundedString(nav, 'chapterLabel', 500)
+        && isOptionalBoundedInt(nav, 'totalChapters', 0, 100000)
+        && isOptionalBoundedInt(nav, 'currentIndex', 0, 100000)
+        && isOptionalBoundedString(nav, 'firstUrl', 4096)
+        && isOptionalBoundedString(nav, 'prevUrl', 4096)
+        && isOptionalBoundedString(nav, 'nextUrl', 4096)
+        && isOptionalBoundedString(nav, 'tocUrl', 4096)
+        && isOptionalBoundedList(nav, 'chapters', 80);
+    }
+
+    function isValidComicMeta(meta) {
+      return meta is map
+        && hasOnlyAllowedFields(meta, [
+          'isComic',
+          'isDirectImage',
+          'layout',
+          'pageCount',
+          'pages',
+          'drmProtected',
+          'drmReason',
+          'sourceHint'
+        ])
+        && isOptionalBool(meta, 'isComic')
+        && isOptionalBool(meta, 'isDirectImage')
+        && (!('layout' in meta)
+          || meta.layout == null
+          || (meta.layout is string && meta.layout in ['rtl_manga', 'webtoon_strip', 'four_koma', 'ltr_comic', 'single_image']))
+        && isOptionalBoundedInt(meta, 'pageCount', 0, 10000)
+        && isOptionalBoundedList(meta, 'pages', 120)
+        && isOptionalBool(meta, 'drmProtected')
+        && isOptionalBoundedString(meta, 'drmReason', 1000)
+        && isOptionalBoundedString(meta, 'sourceHint', 1000);
+    }
+
+    function isValidLinkPreview(lp) {
+      return lp is map
+        && hasOnlyAllowedFields(lp, [
+          'mid',
+          'cid',
+          'titleId',
+          'url',
+          'host',
+          'isAozora',
+          'titleSrc',
+          'titleDst',
+          'excerptSrc',
+          'excerptDst',
+          'paragraphCount',
+          'lockedNames',
+          'readerSupported',
+          'novelNav',
+          'comicMeta',
+          'firstImageResult'
+        ])
+        && isOptionalBoundedString(lp, 'mid', 200)
+        && isOptionalBoundedString(lp, 'cid', 200)
+        && isOptionalBoundedString(lp, 'titleId', 200)
+        && isOptionalBoundedString(lp, 'url', 4096)
+        && isOptionalBoundedString(lp, 'host', 512)
+        && isOptionalBool(lp, 'isAozora')
+        && isOptionalBoundedString(lp, 'titleSrc', 2000)
+        && isOptionalBoundedString(lp, 'titleDst', 2000)
+        && isOptionalBoundedString(lp, 'excerptSrc', 10000)
+        && isOptionalBoundedString(lp, 'excerptDst', 10000)
+        && isOptionalBoundedInt(lp, 'paragraphCount', 0, 100000)
+        && isOptionalBoundedInt(lp, 'lockedNames', 0, 10000)
+        && isOptionalBool(lp, 'readerSupported')
+        && (!('novelNav' in lp) || lp.novelNav == null || isValidNovelNav(lp.novelNav))
+        && (!('comicMeta' in lp) || lp.comicMeta == null || isValidComicMeta(lp.comicMeta))
+        && (!('firstImageResult' in lp) || lp.firstImageResult == null || isValidImageResult(lp.firstImageResult));
+    }
+
+    function isValidMessage(data, uid) {
+      return hasOnlyAllowedFields(data, [
+          'role',
+          'kind',
+          'mode',
+          'detectedSource',
+          'titleId',
+          'text',
+          'srcText',
+          'sentences',
+          'nameChips',
+          'fileName',
+          'fmt',
+          'jobId',
+          'storageOutputPath',
+          'done',
+          'total',
+          'imageResult',
+          'linkPreview',
+          'ruby',
+          'state',
+          'model',
+          'ms',
+          'error',
+          'createdAt',
+          'updatedAt'
+        ])
         && 'role' in data
+        && data.role is string
         && data.role in ['user', 'assistant']
         && 'kind' in data
+        && data.kind is string
         && data.kind in ['text', 'long', 'image', 'document', 'link']
         && 'mode' in data
         && isValidLanguageMode(data.mode)
         && 'state' in data
+        && data.state is string
         && data.state in ['running', 'done', 'partial', 'stopped', 'busy', 'error']
+        && (!('detectedSource' in data)
+          || data.detectedSource == null
+          || (data.detectedSource is string && data.detectedSource in ['ja', 'id', 'en', '']))
         && isOptionalBoundedString(data, 'text', 250000)
         && isOptionalBoundedString(data, 'srcText', 250000)
         && isOptionalBoundedString(data, 'titleId', 200)
+        && isOptionalBoundedList(data, 'sentences', 500)
+        && isOptionalBoundedList(data, 'nameChips', 50)
         && isOptionalBoundedString(data, 'fileName', 500)
         && isOptionalBoundedString(data, 'fmt', 32)
         && isOptionalBoundedString(data, 'jobId', 200)
-        && isOptionalBoundedString(data, 'storageOutputPath', 1024)
+        && isOptionalScopedStoragePath(data, 'storageOutputPath', 'outputs', uid)
+        && isOptionalBoundedInt(data, 'done', 0, 1000000)
+        && isOptionalBoundedInt(data, 'total', 0, 1000000)
+        && (!('imageResult' in data) || data.imageResult == null || isValidImageResult(data.imageResult))
+        && (!('linkPreview' in data) || data.linkPreview == null || isValidLinkPreview(data.linkPreview))
+        && (!('ruby' in data) || data.ruby == null || (data.ruby is map && data.ruby.keys().size() <= 500))
         && isOptionalBoundedString(data, 'model', 200)
+        && isOptionalBoundedNumber(data, 'ms', 0, 86400000)
         && isOptionalBoundedString(data, 'error', 4000)
         && isOptionalTimeValue(data, 'createdAt')
         && isOptionalTimeValue(data, 'updatedAt');
     }
 
     function isValidPara(data) {
-      return data.keys().size() <= 20
+      return hasOnlyAllowedFields(data, [
+          'i',
+          'src',
+          'dst',
+          'text',
+          'target',
+          'source',
+          'kind',
+          'meta',
+          'sentences',
+          'model',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isOptionalBoundedInt(data, 'i', 0, 1000000)
         && isOptionalBoundedString(data, 'src', 50000)
         && isOptionalBoundedString(data, 'dst', 50000)
         && isOptionalBoundedString(data, 'text', 50000)
         && isOptionalBoundedString(data, 'target', 50000)
-        && isOptionalBoundedString(data, 'source', 50000);
+        && isOptionalBoundedString(data, 'source', 50000)
+        && isOptionalBoundedString(data, 'kind', 64)
+        && (!('meta' in data) || data.meta == null || (data.meta is map && data.meta.keys().size() <= 30))
+        && isOptionalBoundedList(data, 'sentences', 500)
+        && isOptionalBoundedString(data, 'model', 200)
+        && isOptionalTimeValue(data, 'createdAt')
+        && isOptionalTimeValue(data, 'updatedAt');
     }
 
-    function isValidJobCreate(data) {
-      return data.keys().size() <= 30
+    function isValidJobCreate(data, uid) {
+      return hasOnlyAllowedFields(data, [
+          'state',
+          'fileSize',
+          'mode',
+          'doneParas',
+          'totalParas',
+          'fileName',
+          'fmt',
+          'storagePath',
+          'storageOutputPath',
+          'message',
+          'mimeType',
+          'contentType',
+          'cid',
+          'mid',
+          'conversationId',
+          'titleId',
+          'createdAt',
+          'updatedAt'
+        ])
         && 'state' in data
+        && data.state is string
         && data.state in ['uploading', 'running', 'done']
         && 'fileSize' in data
         && data.fileSize is int
         && data.fileSize >= 0
         && data.fileSize <= 52428800
         && (!('mode' in data) || isValidLanguageMode(data.mode))
-        && (!('doneParas' in data)
-          || data.doneParas == null
-          || (data.doneParas is int && data.doneParas >= 0 && data.doneParas <= 1000000))
-        && (!('totalParas' in data)
-          || data.totalParas == null
-          || (data.totalParas is int && data.totalParas >= 0 && data.totalParas <= 1000000))
+        && isOptionalBoundedInt(data, 'doneParas', 0, 1000000)
+        && isOptionalBoundedInt(data, 'totalParas', 0, 1000000)
         && isOptionalBoundedString(data, 'fileName', 500)
         && isOptionalBoundedString(data, 'fmt', 32)
-        && isOptionalBoundedString(data, 'storagePath', 1024)
-        && isOptionalBoundedString(data, 'storageOutputPath', 1024)
+        && isOptionalScopedStoragePath(data, 'storagePath', 'uploads', uid)
+        && isOptionalScopedStoragePath(data, 'storageOutputPath', 'outputs', uid)
         && isOptionalBoundedString(data, 'message', 4000)
         && isOptionalBoundedString(data, 'mimeType', 200)
         && isOptionalBoundedString(data, 'contentType', 200)
@@ -272,8 +641,31 @@ service cloud.firestore {
         && isOptionalTimeValue(data, 'updatedAt');
     }
 
-    function isValidJobUpdate(prev, next) {
-      return next.diff(prev).affectedKeys().hasOnly([
+    function isValidJobUpdate(prev, next, uid) {
+      return hasOnlyAllowedFields(next, [
+          'state',
+          'fileSize',
+          'mode',
+          'doneParas',
+          'totalParas',
+          'fileName',
+          'fmt',
+          'storagePath',
+          'storageInputPath',
+          'storageOutputPath',
+          'message',
+          'mimeType',
+          'contentType',
+          'cid',
+          'mid',
+          'conversationId',
+          'titleId',
+          'errorCode',
+          'expireAt',
+          'createdAt',
+          'updatedAt'
+        ])
+        && next.diff(prev).affectedKeys().hasOnly([
           'state',
           'doneParas',
           'totalParas',
@@ -282,32 +674,78 @@ service cloud.firestore {
           'updatedAt'
         ])
         && 'state' in next
+        && next.state is string
         && next.state in ['queued', 'running', 'done', 'partial', 'stopped', 'error']
-        && (!('doneParas' in next)
-          || next.doneParas == null
-          || (next.doneParas is int && next.doneParas >= 0 && next.doneParas <= 1000000))
-        && (!('totalParas' in next)
-          || next.totalParas == null
-          || (next.totalParas is int && next.totalParas >= 0 && next.totalParas <= 1000000))
+        && isOptionalBoundedInt(next, 'doneParas', 0, 1000000)
+        && isOptionalBoundedInt(next, 'totalParas', 0, 1000000)
         && isOptionalBoundedString(next, 'message', 4000)
-        && isOptionalBoundedString(next, 'storageOutputPath', 1024)
+        && isOptionalScopedStoragePath(next, 'storageOutputPath', 'outputs', uid)
         && isOptionalTimeValue(next, 'updatedAt');
     }
 
     function isValidMetric(data) {
-      return data.keys().size() <= 30
+      return hasOnlyAllowedFields(data, [
+          'name',
+          'event',
+          'kind',
+          'route',
+          'value',
+          'ms',
+          'durationMs',
+          'chars',
+          'model',
+          'mode',
+          'ok',
+          'status',
+          'createdAt'
+        ])
+        && (
+          ('name' in data && data.name is string && data.name.size() > 0)
+          || ('event' in data && data.event is string && data.event.size() > 0)
+          || ('kind' in data && data.kind is string && data.kind.size() > 0)
+        )
         && isOptionalBoundedString(data, 'name', 200)
         && isOptionalBoundedString(data, 'event', 200)
         && isOptionalBoundedString(data, 'kind', 200)
-        && isOptionalBoundedString(data, 'route', 500);
+        && isOptionalBoundedString(data, 'route', 500)
+        && isOptionalBoundedNumber(data, 'value', -1000000000, 1000000000)
+        && isOptionalBoundedNumber(data, 'ms', 0, 86400000)
+        && isOptionalBoundedNumber(data, 'durationMs', 0, 86400000)
+        && isOptionalBoundedInt(data, 'chars', 0, 10000000)
+        && isOptionalBoundedString(data, 'model', 200)
+        && (!('mode' in data)
+          || data.mode == null
+          || data.mode == ''
+          || isValidLanguageMode(data.mode))
+        && isOptionalBool(data, 'ok')
+        && isOptionalBoundedString(data, 'status', 64)
+        && isOptionalTimeValue(data, 'createdAt');
     }
 
     function isValidDevice(data) {
-      return data.keys().size() <= 25
+      return hasOnlyAllowedFields(data, [
+          'name',
+          'label',
+          'platform',
+          'userAgent',
+          'appVersion',
+          'lastSeenAt',
+          'createdAt',
+          'updatedAt'
+        ])
+        && (
+          ('name' in data && data.name is string && data.name.size() > 0)
+          || ('label' in data && data.label is string && data.label.size() > 0)
+          || ('platform' in data && data.platform is string && data.platform.size() > 0)
+        )
         && isOptionalBoundedString(data, 'name', 200)
         && isOptionalBoundedString(data, 'label', 200)
         && isOptionalBoundedString(data, 'platform', 100)
-        && isOptionalBoundedString(data, 'userAgent', 1000);
+        && isOptionalBoundedString(data, 'userAgent', 1000)
+        && isOptionalBoundedString(data, 'appVersion', 64)
+        && isOptionalTimeValue(data, 'lastSeenAt')
+        && isOptionalTimeValue(data, 'createdAt')
+        && isOptionalTimeValue(data, 'updatedAt');
     }
 
     match /users/{uid} {
@@ -319,7 +757,7 @@ service cloud.firestore {
         allow delete: if false;
       }
 
-      // Cross-device per-user API key storage; accessible only to the verified user.
+      // Legacy cross-device per-user API key storage; accessible only to the verified, non-revoked user.
       match /settings/secrets {
         allow read, delete: if isVerifiedUser(uid);
         allow create, update: if isVerifiedUser(uid) && isValidSecrets(request.resource.data);
@@ -333,34 +771,30 @@ service cloud.firestore {
 
       match /titles/{titleId} {
         allow read, delete: if isVerifiedUser(uid);
-        allow create: if isVerifiedUser(uid) && isValidTitle(request.resource.data);
+        allow create: if isVerifiedUser(uid)
+          && isSafeDocId(titleId)
+          && isValidTitle(request.resource.data);
         allow update: if isVerifiedUser(uid)
+          && isSafeDocId(titleId)
           && isValidTitle(request.resource.data)
           && isCreatedAtUnchanged();
 
         match /glossary/{key} {
           allow read, delete: if isVerifiedUser(uid);
-          allow create, update: if isVerifiedUser(uid) && isValidGlossaryEntry(request.resource.data);
+          allow create, update: if isVerifiedUser(uid)
+            && isSafeDocId(titleId)
+            && isSafeGlossaryKey(key)
+            && isValidGlossaryEntry(request.resource.data);
         }
       }
 
       match /conversations/{cid} {
         allow read, delete: if isVerifiedUser(uid);
         allow create: if isVerifiedUser(uid)
-          && hasOnlyAllowedFields(request.resource.data, [
-            'title',
-            'titleId',
-            'mode',
-            'detectedSource',
-            'activeTab',
-            'pinned',
-            'pinnedAt',
-            'preview',
-            'createdAt',
-            'updatedAt'
-          ])
+          && isSafeDocId(cid)
           && isValidConversationFields(request.resource.data);
         allow update: if isVerifiedUser(uid)
+          && isSafeDocId(cid)
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
             'title',
             'titleId',
@@ -372,23 +806,47 @@ service cloud.firestore {
             'preview',
             'updatedAt'
           ])
-          && isValidConversationFields(request.resource.data);
+          && isValidConversationFields(request.resource.data)
+          && isCreatedAtUnchanged();
 
         match /messages/{mid} {
           allow read, delete: if isVerifiedUser(uid);
-          allow create, update: if isVerifiedUser(uid) && isValidMessage(request.resource.data);
+          allow create: if isVerifiedUser(uid)
+            && isSafeDocId(cid)
+            && isSafeDocId(mid)
+            && isValidMessage(request.resource.data, uid);
+          allow update: if isVerifiedUser(uid)
+            && isSafeDocId(cid)
+            && isSafeDocId(mid)
+            && isValidMessage(request.resource.data, uid)
+            && isCreatedAtUnchanged();
 
           match /paras/{paraId} {
             allow read, delete: if isVerifiedUser(uid);
-            allow create, update: if isVerifiedUser(uid) && isValidPara(request.resource.data);
+            allow create: if isVerifiedUser(uid)
+              && isSafeDocId(cid)
+              && isSafeDocId(mid)
+              && isSafeDocId(paraId)
+              && isValidPara(request.resource.data);
+            allow update: if isVerifiedUser(uid)
+              && isSafeDocId(cid)
+              && isSafeDocId(mid)
+              && isSafeDocId(paraId)
+              && isValidPara(request.resource.data)
+              && isCreatedAtUnchanged();
           }
         }
       }
 
       match /jobs/{jobId} {
         allow read, delete: if isVerifiedUser(uid);
-        allow create: if isVerifiedUser(uid) && isValidJobCreate(request.resource.data);
-        allow update: if isVerifiedUser(uid) && isValidJobUpdate(resource.data, request.resource.data);
+        allow create: if isVerifiedUser(uid)
+          && isSafeDocId(jobId)
+          && isValidJobCreate(request.resource.data, uid);
+        allow update: if isVerifiedUser(uid)
+          && isSafeDocId(jobId)
+          && isValidJobUpdate(resource.data, request.resource.data, uid)
+          && isCreatedAtUnchanged();
       }
 
       match /usage/{dayId} {
@@ -397,25 +855,33 @@ service cloud.firestore {
       }
 
       match /inbox/{inboxId} {
-        allow read: if isVerifiedUser(uid);
-        allow write: if false;
+        allow get: if isVerifiedUser(uid) && isSafeDocId(inboxId);
+        allow list: if isVerifiedUser(uid);
+        allow create, update: if false;
+        allow delete: if isVerifiedUser(uid) && isSafeDocId(inboxId);
       }
 
       match /metrics/{metricId} {
         allow read: if isVerifiedUser(uid);
-        allow create: if isVerifiedUser(uid) && isValidMetric(request.resource.data);
+        allow create: if isVerifiedUser(uid)
+          && isSafeDocId(metricId)
+          && isValidMetric(request.resource.data);
         allow update, delete: if false;
       }
 
       match /devices/{deviceId} {
-        allow read, delete: if isVerifiedUser(uid);
-        allow create: if isVerifiedUser(uid) && isValidDevice(request.resource.data);
+        allow read: if isVerifiedUser(uid);
+        allow create: if isVerifiedUser(uid)
+          && isSafeDocId(deviceId)
+          && isValidDevice(request.resource.data);
         allow update: if isVerifiedUser(uid)
+          && isSafeDocId(deviceId)
           && isValidDevice(request.resource.data)
           && isCreatedAtUnchanged();
+        allow delete: if isVerifiedUser(uid) && isSafeDocId(deviceId);
       }
 
-      // Per-user server secrets and translation cache are Admin SDK only.
+      // Per-user server secrets (llm vault key, session.revokedBefore) and translation cache are Admin SDK only.
       match /serverSecrets/{docId} {
         allow read, write: if false;
       }
