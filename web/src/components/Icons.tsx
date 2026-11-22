@@ -431,3 +431,98 @@ export function IconAlert(props: IconProps) {
     </Svg20>
   );
 }
+
+export function IconBookmark({ filled = false, ...props }: IconProps & { filled?: boolean }) {
+  return (
+    <Svg20 {...props}>
+      <path
+        d="M6 4h12a1 1 0 0 1 1 1v15l-7-4.5L5 20V5a1 1 0 0 1 1-1z"
+        fill={filled ? 'currentColor' : 'none'}
+      />
+    </Svg20>
+  );
+}
+
+export function IconHeadphones(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <path d="M4 13a8 8 0 0 1 16 0" />
+      <rect x="4" y="13" width="3.5" height="6" rx="1.5" />
+      <rect x="16.5" y="13" width="3.5" height="6" rx="1.5" />
+    </Svg20>
+  );
+}
+
+export function IconEye(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" />
+      <circle cx="12" cy="12" r="2.75" />
+    </Svg20>
+  );
+}
+
+export function IconBookOpen(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <path d="M2.5 6.5A2.5 2.5 0 0 1 5 4h5.5a2 2 0 0 1 1.5.7A2 2 0 0 1 13.5 4H19a2.5 2.5 0 0 1 2.5 2.5v12a.5.5 0 0 1-.5.5h-7a2 2 0 0 0-2 1.5A2 2 0 0 0 10 19H3a.5.5 0 0 1-.5-.5v-12z" />
+      <path d="M12 5.2V19.5" />
+    </Svg20>
+  );
+}
+
+export function IconPlay(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <polygon points="7 5 19 12 7 19 7 5" fill="currentColor" stroke="currentColor" />
+    </Svg20>
+  );
+}
+
+export function IconPause(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <rect x="6.5" y="5" width="3.5" height="14" rx="1" fill="currentColor" stroke="none" />
+      <rect x="14" y="5" width="3.5" height="14" rx="1" fill="currentColor" stroke="none" />
+    </Svg20>
+  );
+}
+
+export function IconSkipBack(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <path d="M6 6v12" />
+      <polygon points="18 6 9.5 12 18 18 18 6" fill="currentColor" />
+    </Svg20>
+  );
+}
+
+export function IconSkipForward(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <path d="M18 6v12" />
+      <polygon points="6 6 14.5 12 6 18 6 6" fill="currentColor" />
+    </Svg20>
+  );
+}
+
+export function IconAutoScroll(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <rect x="6" y="3.5" width="12" height="17" rx="6" />
+      <path d="M12 7.5v4.5" />
+      <path d="M9.5 10.5L12 13l2.5-2.5" />
+    </Svg20>
+  );
+}
+
+export function IconSliders(props: IconProps) {
+  return (
+    <Svg20 {...props}>
+      <path d="M4 7h16" />
+      <path d="M4 17h16" />
+      <circle cx="9" cy="7" r="2" fill="var(--bg, #fff)" />
+      <circle cx="15" cy="17" r="2" fill="var(--bg, #fff)" />
+    </Svg20>
+  );
+}

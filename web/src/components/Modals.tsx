@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import type { AppSettingsDoc, ThemePref, UiLang } from '../types';
+import { useEffect, useRef, useState } from 'react';
+import type { AppSettingsDoc, ThemePref, TranslationTonePref, UiLang } from '../types';
 import type { UiStrings } from '../i18n/strings';
 import {
   downloadFullBackup,
@@ -12,17 +12,19 @@ import {
   saveEngineVaultKey,
 } from '../lib/api';
 import { updateAppSettings, type AuthSessionUser } from '../lib/firebase';
+import {
+  EBOOK_DAY_THEMES,
+  EBOOK_NIGHT_THEMES,
+  loadEbookPrefs,
+  pickSyncableEbookPrefs,
+  saveEbookPrefs,
+  type EbookDayThemeId,
+  type EbookNightThemeId,
+  type EbookPrefs,
+} from '../lib/ebookPrefs';
+import { saveTranslationTonePref } from '../lib/tonePrefs';
+import { useDialogFocusTrap } from '../lib/useDialogFocusTrap';
 import { IconCheck, IconCopy, IconDownload, IconRefresh, IconX } from './Icons';
-
-function useEscapeClose(onClose: () => void) {
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [onClose]);
-}
 
 export function LogoutDialog({
   strings,
@@ -33,10 +35,12 @@ export function LogoutDialog({
   onClose: () => void;
   onConfirm: () => void;
 }) {
-  useEscapeClose(onClose);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useDialogFocusTrap(dialogRef, onClose);
   return (
     <div className="scrim-backdrop" onClick={onClose}>
       <div
+        ref={dialogRef}
         className="modal-dialog"
         style={{ width: 'min(400px, 100%)' }}
         role="dialog"
@@ -51,7 +55,7 @@ export function LogoutDialog({
           <button
             type="button"
             className="icon-square-btn"
-            aria-label={strings.cancel}
+            aria-label={strings.closeLabel}
             onClick={onClose}
           >
             <IconX size={18} />
@@ -87,10 +91,12 @@ export function RenameDialog({
   onSave: (title: string) => void;
 }) {
   const [title, setTitle] = useState(initialTitle);
-  useEscapeClose(onClose);
+  const dialogRef = useRef<HTMLFormElement | null>(null);
+  useDialogFocusTrap(dialogRef, onClose);
   return (
     <div className="scrim-backdrop" onClick={onClose}>
       <form
+        ref={dialogRef}
         className="modal-dialog"
         style={{ width: 'min(420px, 100%)' }}
         role="dialog"
@@ -109,7 +115,7 @@ export function RenameDialog({
           <button
             type="button"
             className="icon-square-btn"
-            aria-label={strings.cancel}
+            aria-label={strings.closeLabel}
             onClick={onClose}
           >
             <IconX size={18} />
@@ -148,12 +154,13 @@ export function ShortcutsModal({
   strings: UiStrings;
   onClose: () => void;
 }) {
-  useEscapeClose(onClose);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useDialogFocusTrap(dialogRef, onClose);
   const rows = [
     ['Cmd / Ctrl + K', 'Cari riwayat percakapan'],
     ['Cmd / Ctrl + ,', 'Buka Setelan'],
     ['Cmd / Ctrl + /', 'Tampilkan daftar pintasan keyboard'],
-    ['Cmd / Ctrl + Shift + C', 'Salin hasil terjemahan terakhir'],
+    ['Alt + Shift + C', 'Salin hasil terjemahan terakhir'],
     ['Enter', 'Kirim teks (aman terhadap komposisi IME Jepang)'],
     ['Shift + Enter', 'Baris baru di area ketik'],
     ['Escape', 'Tutup menu, laci, atau dialog aktif'],
@@ -161,6 +168,7 @@ export function ShortcutsModal({
   return (
     <div className="scrim-backdrop" onClick={onClose}>
       <div
+        ref={dialogRef}
         className="modal-dialog"
         style={{ width: 'min(480px, 100%)' }}
         role="dialog"
@@ -175,7 +183,7 @@ export function ShortcutsModal({
           <button
             type="button"
             className="icon-square-btn"
-            aria-label={strings.cancel}
+            aria-label={strings.closeLabel}
             onClick={onClose}
           >
             <IconX size={18} />
@@ -225,11 +233,13 @@ export function InfoModal({
   strings: UiStrings;
   onClose: () => void;
 }) {
-  useEscapeClose(onClose);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useDialogFocusTrap(dialogRef, onClose);
   const title = kind === 'help' ? strings.help : strings.learnMore;
   return (
     <div className="scrim-backdrop" onClick={onClose}>
       <div
+        ref={dialogRef}
         className="modal-dialog"
         role="dialog"
         aria-modal="true"
@@ -243,7 +253,7 @@ export function InfoModal({
           <button
             type="button"
             className="icon-square-btn"
-            aria-label={strings.cancel}
+            aria-label={strings.closeLabel}
             onClick={onClose}
           >
             <IconX size={18} />
@@ -319,23 +329,44 @@ export function SettingsModal({
   const [statusError, setStatusError] = useState<string | null>(null);
   const [charCapInput, setCharCapInput] = useState(String(settings.dailyCharCap));
   const [callCapInput, setCallCapInput] = useState(String(settings.dailyCallCap));
+  const [ebookPrefsLocal, setEbookPrefsLocal] = useState<EbookPrefs>(() => loadEbookPrefs());
 
-  useEscapeClose(onClose);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const handleUpdateEbookFromSettings = (patch: Partial<EbookPrefs>) => {
+    const next = saveEbookPrefs({ ...ebookPrefsLocal, ...patch });
+    setEbookPrefsLocal(next);
+    void updateAppSettings({
+      ebookPrefs: pickSyncableEbookPrefs(next),
+    }).catch(() => {});
+  };
+
+  useDialogFocusTrap(dialogRef, onClose);
+
+  useEffect(() => {
+    setCharCapInput(String(settings.dailyCharCap));
+    setCallCapInput(String(settings.dailyCallCap));
+  }, [settings.dailyCharCap, settings.dailyCallCap]);
 
   useEffect(() => {
     if (tab !== 'advanced') return;
+    let alive = true;
     fetchEngineMeta(user)
       .then((info) => {
+        if (!alive) return;
         setMetaInfo(info);
         setStatusError(null);
       })
       .catch((err) => {
+        if (!alive) return;
         setStatusError(
           err instanceof Error
             ? err.message
             : 'Layanan Cloud Functions belum terjangkau saat ini.'
         );
       });
+    return () => {
+      alive = false;
+    };
   }, [tab, user]);
 
   const handleSaveTheme = async (theme: ThemePref) => {
@@ -380,7 +411,7 @@ export function SettingsModal({
       document.body.appendChild(a);
       a.click();
       a.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
       onNotify('Cadangan JSON berhasil diunduh');
     } catch (err) {
       setStatusError(err instanceof Error ? err.message : 'Gagal mengekspor cadangan.');
@@ -433,6 +464,7 @@ export function SettingsModal({
   return (
     <div className="scrim-backdrop" onClick={onClose}>
       <div
+        ref={dialogRef}
         className="modal-dialog"
         role="dialog"
         aria-modal="true"
@@ -446,7 +478,7 @@ export function SettingsModal({
           <button
             type="button"
             className="icon-square-btn"
-            aria-label={strings.cancel}
+            aria-label={strings.closeLabel}
             onClick={onClose}
           >
             <IconX size={18} />
@@ -507,6 +539,9 @@ export function SettingsModal({
             <>
               <div className="field-label">
                 <span>{strings.themeLabel}</span>
+                <span style={{ fontSize: '12px', fontWeight: 400, color: 'var(--text-muted)' }}>
+                  {strings.settingsAppThemeHint}
+                </span>
                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                   {(
                     [
@@ -529,6 +564,118 @@ export function SettingsModal({
                       {label}
                     </button>
                   ))}
+                </div>
+              </div>
+
+              <div
+                className="field-label"
+                style={{
+                  padding: '12px',
+                  borderRadius: 'var(--r-card)',
+                  background: 'var(--bg)',
+                  border: '1px solid var(--border)',
+                }}
+              >
+                <span>{strings.settingsEbookThemeLabel}</span>
+                <span style={{ fontSize: '12px', fontWeight: 400, color: 'var(--text-muted)' }}>
+                  {strings.settingsEbookThemeHint}
+                </span>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '4px' }}>
+                  <button
+                    type="button"
+                    className={
+                      ebookPrefsLocal.themeMode === 'adaptive'
+                        ? 'btn-primary pressable'
+                        : 'btn-secondary pressable'
+                    }
+                    onClick={() =>
+                      handleUpdateEbookFromSettings({ themeMode: 'adaptive', theme: 'auto' })
+                    }
+                  >
+                    {ebookPrefsLocal.themeMode === 'adaptive' && <IconCheck size={15} />}
+                    {strings.ebookThemeModeAdaptive}
+                  </button>
+                  <button
+                    type="button"
+                    className={
+                      ebookPrefsLocal.themeMode === 'locked'
+                        ? 'btn-primary pressable'
+                        : 'btn-secondary pressable'
+                    }
+                    onClick={() =>
+                      handleUpdateEbookFromSettings({
+                        themeMode: 'locked',
+                        theme: ebookPrefsLocal.lockedTheme,
+                      })
+                    }
+                  >
+                    {ebookPrefsLocal.themeMode === 'locked' && <IconCheck size={15} />}
+                    {strings.ebookThemeModeLocked}
+                  </button>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '6px' }}>
+                  <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                    {strings.ebookDaySlotLabel}
+                  </span>
+                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                    {EBOOK_DAY_THEMES.map((t) => {
+                      const isEn = strings.backBtn === 'Back';
+                      const active =
+                        ebookPrefsLocal.themeMode === 'locked'
+                          ? ebookPrefsLocal.lockedTheme === t.id
+                          : ebookPrefsLocal.dayTheme === t.id;
+                      return (
+                        <button
+                          key={t.id}
+                          type="button"
+                          className={active ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                          style={{ padding: '0 12px', fontSize: '13px' }}
+                          onClick={() =>
+                            handleUpdateEbookFromSettings({
+                              dayTheme: t.id as EbookDayThemeId,
+                              ...(ebookPrefsLocal.themeMode === 'locked'
+                                ? { lockedTheme: t.id, theme: t.id }
+                                : { theme: 'auto' }),
+                            })
+                          }
+                        >
+                          {active && <IconCheck size={14} />}
+                          {isEn ? t.labelEn : t.labelId}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <span style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                    {strings.ebookNightSlotLabel}
+                  </span>
+                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                    {EBOOK_NIGHT_THEMES.map((t) => {
+                      const isEn = strings.backBtn === 'Back';
+                      const active =
+                        ebookPrefsLocal.themeMode === 'locked'
+                          ? ebookPrefsLocal.lockedTheme === t.id
+                          : ebookPrefsLocal.nightTheme === t.id;
+                      return (
+                        <button
+                          key={t.id}
+                          type="button"
+                          className={active ? 'btn-primary pressable' : 'btn-secondary pressable'}
+                          style={{ padding: '0 12px', fontSize: '13px' }}
+                          onClick={() =>
+                            handleUpdateEbookFromSettings({
+                              nightTheme: t.id as EbookNightThemeId,
+                              ...(ebookPrefsLocal.themeMode === 'locked'
+                                ? { lockedTheme: t.id, theme: t.id }
+                                : { theme: 'auto' }),
+                            })
+                          }
+                        >
+                          {active && <IconCheck size={14} />}
+                          {isEn ? t.labelEn : t.labelId}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
 
@@ -577,7 +724,13 @@ export function SettingsModal({
                           ? 'btn-primary pressable'
                           : 'btn-secondary pressable'
                       }
-                      onClick={() => updateAppSettings({ defaultSource: srcCode })}
+                      onClick={() => {
+                        const patch: Partial<AppSettingsDoc> = { defaultSource: srcCode };
+                        if (srcCode !== 'auto' && srcCode === settings.defaultTarget) {
+                          patch.defaultTarget = srcCode === 'ja' ? 'id' : 'ja';
+                        }
+                        void updateAppSettings(patch);
+                      }}
                     >
                       {settings.defaultSource === srcCode && <IconCheck size={16} />}
                       {label}
@@ -604,12 +757,52 @@ export function SettingsModal({
                           ? 'btn-primary pressable'
                           : 'btn-secondary pressable'
                       }
-                      onClick={() => updateAppSettings({ defaultTarget: tgt })}
+                      onClick={() => {
+                        const patch: Partial<AppSettingsDoc> = { defaultTarget: tgt };
+                        if (settings.defaultSource !== 'auto' && settings.defaultSource === tgt) {
+                          patch.defaultSource = 'auto';
+                        }
+                        void updateAppSettings(patch);
+                      }}
                     >
                       {settings.defaultTarget === tgt && <IconCheck size={16} />}
                       {label}
                     </button>
                   ))}
+                </div>
+              </div>
+
+              <div className="field-label">
+                <span>{strings.translationToneLabel}</span>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  {(
+                    [
+                      ['auto', strings.toneAuto],
+                      ['novel', strings.toneNovel],
+                      ['casual', strings.toneCasual],
+                      ['formal', strings.toneFormal],
+                    ] as ReadonlyArray<readonly [TranslationTonePref, string]>
+                  ).map(([toneVal, label]) => {
+                    const activeTone = settings.translationTone || 'auto';
+                    return (
+                      <button
+                        key={toneVal}
+                        type="button"
+                        className={
+                          activeTone === toneVal
+                            ? 'btn-primary pressable'
+                            : 'btn-secondary pressable'
+                        }
+                        onClick={() => {
+                          saveTranslationTonePref(toneVal);
+                          void updateAppSettings({ translationTone: toneVal }).catch(() => {});
+                        }}
+                      >
+                        {activeTone === toneVal && <IconCheck size={16} />}
+                        {label}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             </>
@@ -665,8 +858,16 @@ export function SettingsModal({
                     type="button"
                     className="btn-danger pressable"
                     onClick={async () => {
-                      await revokeAllOwnerSessions(user);
-                      onNotify('Seluruh token sesi perangkat lain telah dicabut');
+                      try {
+                        await revokeAllOwnerSessions(user);
+                        onNotify('Seluruh token sesi perangkat lain telah dicabut');
+                      } catch (err) {
+                        onNotify(
+                          err instanceof Error
+                            ? err.message
+                            : 'Gagal mencabut sesi perangkat lain.'
+                        );
+                      }
                     }}
                   >
                     Putuskan semua perangkat
@@ -775,12 +976,17 @@ export function SettingsModal({
               </div>
 
               <form onSubmit={handleSaveVaultKey} className="field-label">
-                <span>Simpan kunci API Gemini berbayar di brankas server (0 kunci di peramban)</span>
+                <label htmlFor="settings-gemini-vault-key">
+                  Simpan kunci API Gemini pribadi (brankas server Cloud Functions, atau dokumen Firestore privat akun pada mode Spark)
+                </label>
                 <div style={{ display: 'flex', gap: '8px' }}>
                   <input
+                    id="settings-gemini-vault-key"
                     type="password"
                     className="field-input"
                     style={{ flex: 1 }}
+                    aria-label="Kunci API Gemini"
+                    autoComplete="off"
                     placeholder="Masukkan kunci API Gemini..."
                     value={vaultKeyInput}
                     onChange={(e) => setVaultKeyInput(e.target.value)}

@@ -174,6 +174,175 @@ export interface UiStrings {
   shortPrevChapter: string;
   shortNextChapter: string;
   closeLabel: string;
+  // 404 Guard
+  notFoundTitle: string;
+  notFoundDesc: string;
+  backToHomeBtn: string;
+  // Translation Tone / Style
+  translationToneLabel: string;
+  toneAuto: string;
+  toneNovel: string;
+  toneCasual: string;
+  toneFormal: string;
+  // Ebook Appearance, Themes, Fonts & Page-Turn HCI
+  ebookAppearanceBtn: string;
+  ebookAppearanceTitle: string;
+  ebookThemeSection: string;
+  ebookPageModeSection: string;
+  ebookPageScroll: string;
+  ebookPageSlide: string;
+  ebookPageFlip: string;
+  ebookFontSection: string;
+  ebookTextSizeLabel: string;
+  ebookLineHeightLabel: string;
+  ebookWidthLabel: string;
+  ebookWidthNarrow: string;
+  ebookWidthStandard: string;
+  ebookWidthWide: string;
+  ebookAlignLabel: string;
+  ebookAlignLeft: string;
+  ebookAlignJustify: string;
+  ebookZenModeLabel: string;
+  ebookExitZenBtn: string;
+  ebookPageCounter: string;
+  ebookMinUnit: string;
+  ebookPrevPage: string;
+  ebookNextPage: string;
+  ebookThemeAuto: string;
+  ebookResetDefaults: string;
+  // Ebook v2 Dual-Slot Theme, Progressive Disclosure, Spread, Inline Peek, Bookmark, TTS & Shelf
+  ebookThemeModeAdaptive: string;
+  ebookThemeModeLocked: string;
+  ebookDaySlotLabel: string;
+  ebookNightSlotLabel: string;
+  ebookActiveSlotHint: string;
+  ebookLockedSlotHint: string;
+  ebookSpreadLabel: string;
+  ebookSpreadSingle: string;
+  ebookSpreadAuto: string;
+  ebookFontFilterAll: string;
+  ebookFontFilterSerif: string;
+  ebookFontFilterSans: string;
+  ebookFontFilterJp: string;
+  ebookToolsMenuBtn: string;
+  ebookToolsMenuTitle: string;
+  ebookInlinePeekLabel: string;
+  ebookInlinePeekHint: string;
+  ebookBookmarkAdd: string;
+  ebookBookmarkSaved: string;
+  ebookBookmarksTab: string;
+  ebookChaptersTab: string;
+  ebookNoBookmarks: string;
+  ebookListenBtn: string;
+  ebookListenStop: string;
+  ebookListenPause: string;
+  ebookListenResume: string;
+  ebookListenUnsupported: string;
+  ebookScrubberLabel: string;
+  ebookHudHintToast: string;
+  ebookContinueShelfTitle: string;
+  ebookContinueShelfOpen: string;
+  ebookRemoveShelfItem: string;
+  settingsAppThemeHint: string;
+  settingsEbookThemeLabel: string;
+  settingsEbookThemeHint: string;
+  // Ebook v3: Hierarchy Groups, Auto-Gulir, Tactile Page-Turn & Podcast Narration Studio
+  ebookToolsGroupHandsFree: string;
+  ebookToolsGroupReading: string;
+  ebookToolsGroupSource: string;
+  ebookPageGestureHint: string;
+  ebookAutoScrollBtn: string;
+  ebookAutoScrollActive: string;
+  ebookAutoScrollPaused: string;
+  ebookAutoScrollStop: string;
+  ebookAutoScrollSpeedDown: string;
+  ebookAutoScrollSpeedUp: string;
+  ebookAutoScrollSwitchedToast: string;
+  ebookAutoScrollPausedTouchToast: string;
+  ebookAutoScrollEndToast: string;
+  ebookPodcastBtn: string;
+  ebookPodcastStudioBtn: string;
+  ebookPodcastStyleLabel: string;
+  ebookPodcastStyleSantai: string;
+  ebookPodcastStyleNarasi: string;
+  ebookPodcastStyleCepat: string;
+  ebookPodcastVoiceLabel: string;
+  ebookPodcastVoiceAuto: string;
+  ebookPodcastSleepLabel: string;
+  ebookPodcastSleepOff: string;
+  ebookPodcastSleep15: string;
+  ebookPodcastSleep30: string;
+  ebookPodcastSleepChapter: string;
+  ebookPodcastSleepDoneToast: string;
+  ebookPodcastPrevPara: string;
+  ebookPodcastNextPara: string;
+  ebookPodcastFollowBtn: string;
+  ebookPodcastKindNarration: string;
+  ebookPodcastKindDialogue: string;
+  ebookPodcastKindThought: string;
+  ebookPodcastKindIntro: string;
+  ebookPodcastKindQuestion: string;
+  ebookPodcastKindCode: string;
+  ebookPodcastKindTable: string;
+  ebookPodcastKindList: string;
+  ebookPodcastKindVerse: string;
+  ebookPodcastFormatLabel: string;
+  ebookPodcastFormatAuto: string;
+  ebookPodcastFormatFiction: string;
+  ebookPodcastFormatScript: string;
+  ebookPodcastFormatNews: string;
+  ebookPodcastFormatAcademic: string;
+  ebookPodcastFormatTech: string;
+  ebookPodcastFormatList: string;
+  ebookPodcastFormatPoetry: string;
+  ebookPodcastFormatLetter: string;
+  // Manga / Comic / Direct-Image Link Scanner & Visual Overlay
+  statusDone: string;
+  mangaDetectedBadge: string;
+  mangaDirectImageBadge: string;
+  mangaPageUnit: string;
+  mangaScannedLabel: string;
+  mangaToolbarLabel: string;
+  mangaViewOverlay: string;
+  mangaViewOriginal: string;
+  mangaViewList: string;
+  mangaSfxToggle: string;
+  mangaScanAllBtn: string;
+  mangaScanningProgress: string;
+  mangaListenDialogue: string;
+  mangaDrmTitle: string;
+  mangaCorsFallbackTitle: string;
+  mangaCorsFallbackDesc: string;
+  mangaUploadRescueBtn: string;
+  mangaUploadRescueResult: string;
+  mangaPageLabel: string;
+  mangaBubblesUnit: string;
+  mangaScanPageBtn: string;
+  mangaRescanPageBtn: string;
+  mangaNotScannedYet: string;
+  openMangaReaderBtn: string;
+  // v2.5 WCAG 1.4.12 Spacing, Reading Ruler, Handedness, Jump-Back & Podcast Studio Telemetry
+  ebookDyslexiaPresetBtn: string;
+  ebookSpacingSection: string;
+  ebookLetterSpacingLabel: string;
+  ebookWordSpacingLabel: string;
+  ebookParaSpacingLabel: string;
+  ebookReadingRulerLabel: string;
+  ebookRulerOff: string;
+  ebookRulerBar: string;
+  ebookRulerShade: string;
+  ebookRulerUnderline: string;
+  ebookTapZoneLabel: string;
+  ebookTapEdges: string;
+  ebookTapRight: string;
+  ebookTapLeft: string;
+  ebookJumpBackBtn: string;
+  ebookPodcastCastLabel: string;
+  ebookPodcastCastSingle: string;
+  ebookPodcastCastPersona: string;
+  ebookPodcastCastMulti: string;
+  ebookPodcastPreviewVoiceBtn: string;
+  ebookPodcastLocalFallbackPill: string;
 }
 
 export const STRINGS: Record<UiLang, UiStrings> = {
@@ -351,6 +520,170 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     shortPrevChapter: 'Sblm',
     shortNextChapter: 'Lanjut',
     closeLabel: 'Tutup',
+    notFoundTitle: 'Halaman tidak ditemukan',
+    notFoundDesc:
+      'Alamat atau jalur tautan yang Anda buka tidak valid atau tidak tersedia di tranX. Silakan kembali ke beranda untuk melanjutkan.',
+    backToHomeBtn: 'Kembali ke Beranda',
+    translationToneLabel: 'Gaya bahasa terjemahan',
+    toneAuto: 'Otomatis (Kontekstual)',
+    toneNovel: 'Novel Alami',
+    toneCasual: 'Santai & Dialog',
+    toneFormal: 'Formal & Baku',
+    ebookAppearanceBtn: 'Tampilan',
+    ebookAppearanceTitle: 'Tampilan Ebook',
+    ebookThemeSection: 'Tema kertas & warna nyaman mata',
+    ebookPageModeSection: 'Gaya pindah halaman',
+    ebookPageScroll: 'Gulir',
+    ebookPageSlide: 'Geser',
+    ebookPageFlip: 'Balik Buku',
+    ebookFontSection: 'Font bacaan (14 pilihan penerbit)',
+    ebookTextSizeLabel: 'Ukuran huruf',
+    ebookLineHeightLabel: 'Jarak baris',
+    ebookWidthLabel: 'Lebar halaman',
+    ebookWidthNarrow: 'Sempit',
+    ebookWidthStandard: 'Standar',
+    ebookWidthWide: 'Lebar',
+    ebookAlignLabel: 'Perataan',
+    ebookAlignLeft: 'Rata kiri',
+    ebookAlignJustify: 'Rata kanan-kiri',
+    ebookZenModeLabel: 'Mode Fokus (Zen)',
+    ebookExitZenBtn: 'Keluar Fokus',
+    ebookPageCounter: 'Hal',
+    ebookMinUnit: 'mnt',
+    ebookPrevPage: 'Halaman sebelumnya',
+    ebookNextPage: 'Halaman berikutnya',
+    ebookThemeAuto: 'Otomatis Siang/Malam',
+    ebookResetDefaults: 'Atur ulang bawaan',
+    ebookThemeModeAdaptive: 'Otomatis Siang/Malam',
+    ebookThemeModeLocked: 'Kunci 1 Kertas',
+    ebookDaySlotLabel: 'Kertas Siang (Saat App Terang)',
+    ebookNightSlotLabel: 'Kertas Malam (Saat App Gelap)',
+    ebookActiveSlotHint: 'Mengikuti tema sistem & aplikasi',
+    ebookLockedSlotHint: 'Terkunci di semua kondisi pencahayaan',
+    ebookSpreadLabel: 'Tata letak layar lebar',
+    ebookSpreadSingle: '1 Halaman',
+    ebookSpreadAuto: '2 Halaman',
+    ebookFontFilterAll: 'Semua',
+    ebookFontFilterSerif: 'Serif',
+    ebookFontFilterSans: 'Sans',
+    ebookFontFilterJp: 'Jepang',
+    ebookToolsMenuBtn: 'Alat baca',
+    ebookToolsMenuTitle: 'Alat & Navigasi Ebook',
+    ebookInlinePeekLabel: 'Intip teks asli (ketuk paragraf)',
+    ebookInlinePeekHint: 'Ketuk paragraf untuk melihat kalimat asli di bawahnya',
+    ebookBookmarkAdd: 'Simpan markah',
+    ebookBookmarkSaved: 'Tersimpan di markah',
+    ebookBookmarksTab: 'Markah',
+    ebookChaptersTab: 'Daftar bab',
+    ebookNoBookmarks: 'Belum ada markah tersimpan untuk bacaan ini. Tekan tombol Markah saat membaca untuk menyimpan posisi penting.',
+    ebookListenBtn: 'Dengarkan bab',
+    ebookListenStop: 'Berhenti',
+    ebookListenPause: 'Jeda',
+    ebookListenResume: 'Lanjut',
+    ebookListenUnsupported: 'Browser perangkat ini belum mendukung pembacaan suara otomatis.',
+    ebookScrubberLabel: 'Lompat halaman bab',
+    ebookHudHintToast: 'Ketuk tengah layar untuk menampilkan bilah kontrol kembali',
+    ebookContinueShelfTitle: 'Lanjutkan membaca',
+    ebookContinueShelfOpen: 'Lanjutkan',
+    ebookRemoveShelfItem: 'Hapus dari rak lanjutkan membaca',
+    settingsAppThemeHint: 'Mengatur warna ruang kerja, panel samping, dan dialog aplikasi.',
+    settingsEbookThemeLabel: 'Kertas baca Ebook',
+    settingsEbookThemeHint: 'Otomatis memasangkan kertas siang & kertas malam mengikuti tema aplikasi tanpa saling menimpa.',
+    ebookToolsGroupHandsFree: 'Audio & Gulir Otomatis',
+    ebookToolsGroupReading: 'Bantuan Baca & Navigasi',
+    ebookToolsGroupSource: 'Sumber Halaman',
+    ebookPageGestureHint: 'Ketuk tepi kiri/kanan atau usap layar seperti membalik halaman buku.',
+    ebookAutoScrollBtn: 'Auto-Gulir (Baca Otomatis)',
+    ebookAutoScrollActive: 'Auto-Gulir berjalan',
+    ebookAutoScrollPaused: 'Auto-Gulir dijeda',
+    ebookAutoScrollStop: 'Hentikan Auto-Gulir',
+    ebookAutoScrollSpeedDown: 'Perlambat gulir',
+    ebookAutoScrollSpeedUp: 'Percepat gulir',
+    ebookAutoScrollSwitchedToast: 'Auto-Gulir aktif di mode Gulir. Ketuk layar kapan saja untuk jeda.',
+    ebookAutoScrollPausedTouchToast: 'Auto-Gulir dijeda saat layar disentuh.',
+    ebookAutoScrollEndToast: 'Akhir bab tercapai.',
+    ebookPodcastBtn: 'Dengarkan bab (Podcast)',
+    ebookPodcastStudioBtn: 'Gaya & Suara',
+    ebookPodcastStyleLabel: 'Gaya narasi',
+    ebookPodcastStyleSantai: 'Podcast Santai',
+    ebookPodcastStyleNarasi: 'Narasi Buku',
+    ebookPodcastStyleCepat: 'Fokus Cepat',
+    ebookPodcastVoiceLabel: 'Suara narator',
+    ebookPodcastVoiceAuto: 'Otomatis (Terbaik di perangkat)',
+    ebookPodcastSleepLabel: 'Timer tidur',
+    ebookPodcastSleepOff: 'Mati',
+    ebookPodcastSleep15: '15 mnt',
+    ebookPodcastSleep30: '30 mnt',
+    ebookPodcastSleepChapter: 'Akhir bab',
+    ebookPodcastSleepDoneToast: 'Timer tidur selesai. Audio dijeda dengan tenang.',
+    ebookPodcastPrevPara: 'Paragraf sebelumnya',
+    ebookPodcastNextPara: 'Paragraf berikutnya',
+    ebookPodcastFollowBtn: 'Ikuti suara',
+    ebookPodcastKindNarration: 'Narasi',
+    ebookPodcastKindDialogue: 'Dialog',
+    ebookPodcastKindThought: 'Monolog',
+    ebookPodcastKindIntro: 'Pembuka',
+    ebookPodcastKindQuestion: 'Pertanyaan',
+    ebookPodcastKindCode: 'Kode',
+    ebookPodcastKindTable: 'Tabel',
+    ebookPodcastKindList: 'Daftar',
+    ebookPodcastKindVerse: 'Bait',
+    ebookPodcastFormatLabel: 'Format bacaan',
+    ebookPodcastFormatAuto: 'Otomatis',
+    ebookPodcastFormatFiction: 'Novel / Cerita',
+    ebookPodcastFormatScript: 'Naskah Dialog',
+    ebookPodcastFormatNews: 'Berita / Editorial',
+    ebookPodcastFormatAcademic: 'Akademik / Riset',
+    ebookPodcastFormatTech: 'Teknis / Kode',
+    ebookPodcastFormatList: 'Daftar / Langkah',
+    ebookPodcastFormatPoetry: 'Puisi / Bait',
+    ebookPodcastFormatLetter: 'Surat / Kutipan',
+    statusDone: 'Selesai',
+    mangaDetectedBadge: 'Komik / Manga terdeteksi',
+    mangaDirectImageBadge: 'Gambar komik langsung',
+    mangaPageUnit: 'halaman',
+    mangaScannedLabel: 'dipindai',
+    mangaToolbarLabel: 'Kontrol pembaca komik',
+    mangaViewOverlay: 'Terjemahan Visual',
+    mangaViewOriginal: 'Asli',
+    mangaViewList: 'Daftar Dialog',
+    mangaSfxToggle: 'SFX',
+    mangaScanAllBtn: 'Pindai Semua',
+    mangaScanningProgress: 'Memindai',
+    mangaListenDialogue: 'Dengarkan Dialog',
+    mangaDrmTitle: 'Halaman menggunakan proteksi kanvas DRM',
+    mangaCorsFallbackTitle: 'Sebagian gambar dibatasi situs asal',
+    mangaCorsFallbackDesc:
+      'Situs penerbit membatasi pengambilan piksel langsung. Anda tetap bisa menempel tangkapan layar (Ctrl+V) atau memilih berkas gambar di bawah untuk langsung dipindai.',
+    mangaUploadRescueBtn: 'Pilih / Tempel Gambar',
+    mangaUploadRescueResult: 'Hasil pindai gambar tempelan',
+    mangaPageLabel: 'Halaman',
+    mangaBubblesUnit: 'balon teks',
+    mangaScanPageBtn: 'Pindai Halaman',
+    mangaRescanPageBtn: 'Pindai Ulang',
+    mangaNotScannedYet: 'Halaman ini belum dipindai. Ketuk Pindai Halaman untuk membaca dan menerjemahkan dialognya.',
+    openMangaReaderBtn: 'Buka Pembaca Komik Visual',
+    ebookDyslexiaPresetBtn: 'Preset Fokus Disleksia',
+    ebookSpacingSection: 'Spasi huruf, kata & paragraf (WCAG)',
+    ebookLetterSpacingLabel: 'Spasi huruf',
+    ebookWordSpacingLabel: 'Spasi kata',
+    ebookParaSpacingLabel: 'Jarak paragraf',
+    ebookReadingRulerLabel: 'Penggaris fokus baca',
+    ebookRulerOff: 'Mati',
+    ebookRulerBar: 'Pita',
+    ebookRulerShade: 'Redup',
+    ebookRulerUnderline: 'Garis',
+    ebookTapZoneLabel: 'Zona ketuk balik halaman',
+    ebookTapEdges: 'Tepi',
+    ebookTapRight: 'Tangan kanan',
+    ebookTapLeft: 'Tangan kiri',
+    ebookJumpBackBtn: 'Kembali ke posisi sebelumnya',
+    ebookPodcastCastLabel: 'Gaya pemeran dialog',
+    ebookPodcastCastSingle: 'Tunggal',
+    ebookPodcastCastPersona: 'Persona',
+    ebookPodcastCastMulti: 'Multi-Suara',
+    ebookPodcastPreviewVoiceBtn: 'Coba suara',
+    ebookPodcastLocalFallbackPill: 'Mode Lokal',
   },
   en: {
     greeting: 'What would you like to read today?',
@@ -526,6 +859,170 @@ export const STRINGS: Record<UiLang, UiStrings> = {
     shortPrevChapter: 'Prev',
     shortNextChapter: 'Next',
     closeLabel: 'Close',
+    notFoundTitle: 'Page not found',
+    notFoundDesc:
+      'The URL or path you opened is invalid or not available in tranX. Return to the home workspace to continue reading and translating.',
+    backToHomeBtn: 'Back to Home',
+    translationToneLabel: 'Translation style',
+    toneAuto: 'Auto (Context-aware)',
+    toneNovel: 'Natural Novel',
+    toneCasual: 'Casual & Dialogue',
+    toneFormal: 'Formal & Standard',
+    ebookAppearanceBtn: 'Appearance',
+    ebookAppearanceTitle: 'Ebook Appearance',
+    ebookThemeSection: 'Paper & eye-comfort themes',
+    ebookPageModeSection: 'Page-turn animation',
+    ebookPageScroll: 'Scroll',
+    ebookPageSlide: 'Slide',
+    ebookPageFlip: 'Book Flip',
+    ebookFontSection: 'Reading font (14 curated faces)',
+    ebookTextSizeLabel: 'Font size',
+    ebookLineHeightLabel: 'Line height',
+    ebookWidthLabel: 'Page width',
+    ebookWidthNarrow: 'Narrow',
+    ebookWidthStandard: 'Standard',
+    ebookWidthWide: 'Wide',
+    ebookAlignLabel: 'Alignment',
+    ebookAlignLeft: 'Left',
+    ebookAlignJustify: 'Justify',
+    ebookZenModeLabel: 'Focus Mode (Zen)',
+    ebookExitZenBtn: 'Exit Focus',
+    ebookPageCounter: 'Page',
+    ebookMinUnit: 'min',
+    ebookPrevPage: 'Previous page',
+    ebookNextPage: 'Next page',
+    ebookThemeAuto: 'Auto Day/Night',
+    ebookResetDefaults: 'Reset defaults',
+    ebookThemeModeAdaptive: 'Auto Day/Night',
+    ebookThemeModeLocked: 'Lock 1 Paper',
+    ebookDaySlotLabel: 'Day Paper (When App is Light)',
+    ebookNightSlotLabel: 'Night Paper (When App is Dark)',
+    ebookActiveSlotHint: 'Follows system & app theme automatically',
+    ebookLockedSlotHint: 'Locked across all lighting modes',
+    ebookSpreadLabel: 'Wide-screen layout',
+    ebookSpreadSingle: '1 Page',
+    ebookSpreadAuto: '2 Pages',
+    ebookFontFilterAll: 'All',
+    ebookFontFilterSerif: 'Serif',
+    ebookFontFilterSans: 'Sans',
+    ebookFontFilterJp: 'Japanese',
+    ebookToolsMenuBtn: 'Reader tools',
+    ebookToolsMenuTitle: 'Ebook Tools & Options',
+    ebookInlinePeekLabel: 'Inline source peek (tap paragraph)',
+    ebookInlinePeekHint: 'Tap any paragraph to reveal the original sentence beneath it',
+    ebookBookmarkAdd: 'Save bookmark',
+    ebookBookmarkSaved: 'Bookmarked',
+    ebookBookmarksTab: 'Bookmarks',
+    ebookChaptersTab: 'Chapters',
+    ebookNoBookmarks: 'No bookmarks saved for this book yet. Tap Bookmark while reading to save a spot.',
+    ebookListenBtn: 'Listen to chapter',
+    ebookListenStop: 'Stop',
+    ebookListenPause: 'Pause',
+    ebookListenResume: 'Resume',
+    ebookListenUnsupported: 'Your browser does not support built-in speech synthesis.',
+    ebookScrubberLabel: 'Jump to page in chapter',
+    ebookHudHintToast: 'Tap the center of the page anytime to show reader controls',
+    ebookContinueShelfTitle: 'Continue reading',
+    ebookContinueShelfOpen: 'Continue',
+    ebookRemoveShelfItem: 'Remove from Continue reading',
+    settingsAppThemeHint: 'Controls workspace, sidebar, and dialog colors.',
+    settingsEbookThemeLabel: 'Ebook reading paper',
+    settingsEbookThemeHint: 'Automatically pairs your Day paper and Night paper with app theme without clashing.',
+    ebookToolsGroupHandsFree: 'Audio & Auto-Scroll',
+    ebookToolsGroupReading: 'Reading Aids & Navigation',
+    ebookToolsGroupSource: 'Page Source',
+    ebookPageGestureHint: 'Tap left/right edges or swipe horizontally like turning a real book page.',
+    ebookAutoScrollBtn: 'Auto-Scroll (Hands-Free)',
+    ebookAutoScrollActive: 'Auto-Scroll running',
+    ebookAutoScrollPaused: 'Auto-Scroll paused',
+    ebookAutoScrollStop: 'Stop Auto-Scroll',
+    ebookAutoScrollSpeedDown: 'Slow down scroll',
+    ebookAutoScrollSpeedUp: 'Speed up scroll',
+    ebookAutoScrollSwitchedToast: 'Auto-Scroll started in Scroll mode. Tap anywhere to pause.',
+    ebookAutoScrollPausedTouchToast: 'Auto-Scroll paused on touch.',
+    ebookAutoScrollEndToast: 'Reached end of chapter.',
+    ebookPodcastBtn: 'Listen to chapter (Podcast)',
+    ebookPodcastStudioBtn: 'Style & Voice',
+    ebookPodcastStyleLabel: 'Narration style',
+    ebookPodcastStyleSantai: 'Warm Podcast',
+    ebookPodcastStyleNarasi: 'Audiobook',
+    ebookPodcastStyleCepat: 'Crisp Focus',
+    ebookPodcastVoiceLabel: 'Narrator voice',
+    ebookPodcastVoiceAuto: 'Automatic (Best on device)',
+    ebookPodcastSleepLabel: 'Sleep timer',
+    ebookPodcastSleepOff: 'Off',
+    ebookPodcastSleep15: '15 min',
+    ebookPodcastSleep30: '30 min',
+    ebookPodcastSleepChapter: 'End of chapter',
+    ebookPodcastSleepDoneToast: 'Sleep timer ended. Audio paused gently.',
+    ebookPodcastPrevPara: 'Previous paragraph',
+    ebookPodcastNextPara: 'Next paragraph',
+    ebookPodcastFollowBtn: 'Follow audio',
+    ebookPodcastKindNarration: 'Narration',
+    ebookPodcastKindDialogue: 'Dialogue',
+    ebookPodcastKindThought: 'Thought',
+    ebookPodcastKindIntro: 'Intro',
+    ebookPodcastKindQuestion: 'Question',
+    ebookPodcastKindCode: 'Code',
+    ebookPodcastKindTable: 'Table',
+    ebookPodcastKindList: 'List',
+    ebookPodcastKindVerse: 'Verse',
+    ebookPodcastFormatLabel: 'Reading format',
+    ebookPodcastFormatAuto: 'Auto',
+    ebookPodcastFormatFiction: 'Novel / Story',
+    ebookPodcastFormatScript: 'Script Dialogue',
+    ebookPodcastFormatNews: 'News / Editorial',
+    ebookPodcastFormatAcademic: 'Academic / Paper',
+    ebookPodcastFormatTech: 'Technical / Code',
+    ebookPodcastFormatList: 'List / Steps',
+    ebookPodcastFormatPoetry: 'Poetry / Verse',
+    ebookPodcastFormatLetter: 'Letter / Quote',
+    statusDone: 'Done',
+    mangaDetectedBadge: 'Comic / Manga detected',
+    mangaDirectImageBadge: 'Direct comic image',
+    mangaPageUnit: 'pages',
+    mangaScannedLabel: 'scanned',
+    mangaToolbarLabel: 'Comic reader controls',
+    mangaViewOverlay: 'Visual overlay',
+    mangaViewOriginal: 'Original',
+    mangaViewList: 'Dialogue list',
+    mangaSfxToggle: 'SFX',
+    mangaScanAllBtn: 'Scan All',
+    mangaScanningProgress: 'Scanning',
+    mangaListenDialogue: 'Listen to Dialogue',
+    mangaDrmTitle: 'Publisher uses encrypted DRM canvas',
+    mangaCorsFallbackTitle: 'Some images are restricted by origin host',
+    mangaCorsFallbackDesc:
+      'The source publisher restricts direct pixel fetches. Paste a screenshot (Ctrl+V) or upload an image below to scan and overlay immediately.',
+    mangaUploadRescueBtn: 'Choose / Paste Image',
+    mangaUploadRescueResult: 'Scanned pasted image',
+    mangaPageLabel: 'Page',
+    mangaBubblesUnit: 'bubbles',
+    mangaScanPageBtn: 'Scan Page',
+    mangaRescanPageBtn: 'Rescan',
+    mangaNotScannedYet: 'This page has not been scanned yet. Tap Scan Page to extract and translate dialogue.',
+    openMangaReaderBtn: 'Open Visual Comic Reader',
+    ebookDyslexiaPresetBtn: 'Dyslexia / Low-Vision Preset',
+    ebookSpacingSection: 'Letter, word & paragraph spacing (WCAG)',
+    ebookLetterSpacingLabel: 'Letter spacing',
+    ebookWordSpacingLabel: 'Word spacing',
+    ebookParaSpacingLabel: 'Paragraph gap',
+    ebookReadingRulerLabel: 'Digital reading ruler',
+    ebookRulerOff: 'Off',
+    ebookRulerBar: 'Band',
+    ebookRulerShade: 'Shade',
+    ebookRulerUnderline: 'Line',
+    ebookTapZoneLabel: 'Page-turn tap handedness',
+    ebookTapEdges: 'Edges',
+    ebookTapRight: 'Right hand',
+    ebookTapLeft: 'Left hand',
+    ebookJumpBackBtn: 'Return to previous spot',
+    ebookPodcastCastLabel: 'Dialogue cast mode',
+    ebookPodcastCastSingle: 'Single',
+    ebookPodcastCastPersona: 'Persona',
+    ebookPodcastCastMulti: 'Multi-Voice',
+    ebookPodcastPreviewVoiceBtn: 'Preview voice',
+    ebookPodcastLocalFallbackPill: 'Local Mode',
   },
 };
 

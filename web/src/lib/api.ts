@@ -1,5 +1,6 @@
 import {
   deleteConversationDirect,
+  deleteInboxItemDirect,
   exportFullBackupDirect,
   getE2EStore,
   getOwnerGeminiKey,
@@ -13,19 +14,12 @@ import {
   type AuthSessionUser,
 } from './firebase';
 import {
-  buildDirectExportBlob,
   classifyParagraphLanguage,
   deriveSeriesTitleId,
   detectLanguageLocal,
-  directFetchTranslatedWebHtml,
-  directFetchWebReaderBundle,
-  directPreviewLink,
-  directTranslateDocumentFile,
-  directTranslateImage,
   normalizeWebUrl,
   parseModePair,
-  translateParagraphsDirect,
-} from './directEngine';
+} from './langUtils';
 import type {
   ImageTranslationResult,
   LinkPreviewPayload,
@@ -36,14 +30,52 @@ import type {
   WebReaderBundle,
 } from '../types';
 
+let directEnginePromise: Promise<typeof import('./directEngine')> | null = null;
+function loadDirectEngine(): Promise<typeof import('./directEngine')> {
+  if (!directEnginePromise) {
+    directEnginePromise = import('./directEngine');
+  }
+  return directEnginePromise;
+}
+
+function shouldPoisonCloudProbe(status: number): boolean {
+  return status === 404 || status === 502 || status === 503 || status === 504;
+}
+
+const TRUSTED_API_HOSTS = new Set<string>([
+  'asia-southeast2-tranx-hanif-id.cloudfunctions.net',
+  'tranx-hanif-id.web.app',
+  'tranx-hanif-id.firebaseapp.com',
+]);
+
+function normalizeTrustedApiBase(raw: string): string {
+  const clean = raw.trim().replace(/\/+$/, '');
+  if (!clean) return '';
+  try {
+    const parsed = new URL(clean);
+    if (parsed.username || parsed.password) return '';
+    const host = parsed.hostname.toLowerCase();
+    const isLocalDev =
+      import.meta.env.DEV &&
+      parsed.protocol === 'http:' &&
+      (host === 'localhost' || host === '127.0.0.1');
+    if (isLocalDev) return clean;
+    if (parsed.protocol !== 'https:' || !TRUSTED_API_HOSTS.has(host)) return '';
+    return clean;
+  } catch {
+    return '';
+  }
+}
+
 export function getApiBaseUrl(): string {
-  const custom =
-    typeof window !== 'undefined'
-      ? window.localStorage.getItem('tranx_api_base') || ''
-      : '';
-  if (custom.trim()) return custom.trim().replace(/\/+$/, '');
+  if (import.meta.env.DEV && typeof window !== 'undefined') {
+    const custom = window.localStorage.getItem('tranx_api_base') || '';
+    const safeCustom = normalizeTrustedApiBase(custom);
+    if (safeCustom) return safeCustom;
+  }
   const envUrl = (import.meta.env.VITE_API_BASE_URL || '').trim();
-  if (envUrl) return envUrl.replace(/\/+$/, '');
+  const safeEnv = normalizeTrustedApiBase(envUrl);
+  if (safeEnv) return safeEnv;
   return '';
 }
 
@@ -209,22 +241,32 @@ async function consumeNdjson(
   const reader = resp.body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let idx = buffer.indexOf('\n');
-    while (idx >= 0) {
-      const line = buffer.slice(0, idx).trim();
-      buffer = buffer.slice(idx + 1);
-      if (line) {
-        onEvent(JSON.parse(line) as StreamEvent);
-      }
-      idx = buffer.indexOf('\n');
+  const parseAndEmit = (line: string) => {
+    try {
+      onEvent(JSON.parse(line) as StreamEvent);
+    } catch {
+      // Skip malformed keepalive/proxy fragments cleanly instead of crashing the stream
     }
+  };
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx = buffer.indexOf('\n');
+      while (idx >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (line) parseAndEmit(line);
+        idx = buffer.indexOf('\n');
+      }
+    }
+    buffer += decoder.decode();
+    const tail = buffer.trim();
+    if (tail) parseAndEmit(tail);
+  } finally {
+    reader.releaseLock();
   }
-  const tail = buffer.trim();
-  if (tail) onEvent(JSON.parse(tail) as StreamEvent);
 }
 
 export async function streamChatTurn(params: {
@@ -368,14 +410,20 @@ export async function streamChatTurn(params: {
         await consumeNdjson(resp, params.onEvent);
         return;
       }
+      if (!shouldPoisonCloudProbe(resp.status)) {
+        throw await parseErrorResponse(resp);
+      }
       writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     } catch (err) {
-      if ((err as { name?: string })?.name === 'AbortError') throw err;
+      if (err instanceof ApiClientError || (err as { name?: string })?.name === 'AbortError') {
+        throw err;
+      }
       writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
   /* Direct Browser Translation + Real Cloud Firestore Sync */
+  const { translateParagraphsDirect } = await loadDirectEngine();
   const t0 = performance.now();
   const tid = params.titleId || `t_${params.cid}`;
   const asstMid = `${params.clientMsgId}_r`;
@@ -403,7 +451,9 @@ export async function streamChatTurn(params: {
       text: params.text,
       state: 'done',
     }),
-  ]);
+  ]).catch(() => {
+    // Non-fatal persistence error should never leak as unhandled rejection on abort/error
+  });
 
   const inputParas = paras.length ? paras : [params.text];
   let streamedPrefix = 0;
@@ -488,6 +538,7 @@ export async function streamChatTurn(params: {
       activeTab: 'teks',
       preview: fullDst.slice(0, 180) || firstLine,
     }),
+    ...(params.inboxId ? [deleteInboxItemDirect(params.inboxId).catch(() => {})] : []),
   ]);
 }
 
@@ -527,7 +578,13 @@ export async function lookupTurnNames(params: {
         'Content-Type': 'application/json',
         ...(await authHeaders(params.user)),
       },
-      body: JSON.stringify(params),
+      body: JSON.stringify({
+        cid: params.cid,
+        mid: params.mid,
+        titleId: params.titleId,
+        text: params.text,
+        mode: params.mode,
+      }),
     });
     if (!resp.ok) return { titleId: params.titleId || '', entries: [] };
     return resp.json();
@@ -614,11 +671,17 @@ export async function translateImageRequest(params: {
         }),
       });
       if (resp.ok) return resp.json();
-    } catch {
+      if (!shouldPoisonCloudProbe(resp.status)) {
+        throw await parseErrorResponse(resp);
+      }
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
+    } catch (err) {
+      if (err instanceof ApiClientError) throw err;
       writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
+  const { directTranslateImage } = await loadDirectEngine();
   return directTranslateImage({
     cid: params.cid,
     mode: params.mode,
@@ -694,6 +757,7 @@ export async function processDocumentSubmission(params: {
     }
   }
 
+  const { directTranslateDocumentFile } = await loadDirectEngine();
   return directTranslateDocumentFile({
     cid: params.cid,
     mid: params.mid,
@@ -812,10 +876,15 @@ export async function previewLinkRequest(params: {
           'Content-Type': 'application/json',
           ...(await authHeaders(params.user)),
         },
-        body: JSON.stringify({ ...params, url: cleanUrl }),
+        body: JSON.stringify({
+          cid: params.cid,
+          url: cleanUrl,
+          mode: params.mode,
+          titleId: params.titleId,
+        }),
       });
       if (resp.ok) return resp.json();
-      if (resp.status === 403 || resp.status === 422) {
+      if (!shouldPoisonCloudProbe(resp.status)) {
         throw await parseErrorResponse(resp);
       }
       writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
@@ -826,6 +895,7 @@ export async function previewLinkRequest(params: {
   }
 
   try {
+    const { directPreviewLink } = await loadDirectEngine();
     return await directPreviewLink({
       cid: params.cid,
       url: cleanUrl,
@@ -944,6 +1014,7 @@ export async function fetchWebReaderBundle(params: {
     };
   }
 
+  const { directFetchWebReaderBundle } = await loadDirectEngine();
   return directFetchWebReaderBundle({
     url: cleanUrl,
     mode: params.mode,
@@ -989,11 +1060,17 @@ export async function fetchTranslatedWebHtml(params: {
         headers: await authHeaders(params.user),
       });
       if (resp.ok) return resp.text();
-    } catch {
+      if (!shouldPoisonCloudProbe(resp.status)) {
+        throw await parseErrorResponse(resp);
+      }
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
+    } catch (err) {
+      if (err instanceof ApiClientError) throw err;
       writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
 
+  const { directFetchTranslatedWebHtml } = await loadDirectEngine();
   return directFetchTranslatedWebHtml({
     url: cleanUrl,
     mode: params.mode,
@@ -1013,10 +1090,22 @@ export async function transcribeShortClip(params: {
     return '千早は小さく笑った。';
   }
 
+  const baseMime = (params.blob.type || 'audio/webm').split(';', 1)[0].trim().toLowerCase() || 'audio/webm';
+  const extByMime: Record<string, string> = {
+    'audio/mp4': 'm4a',
+    'audio/ogg': 'ogg',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/webm': 'webm',
+  };
+  const clipExt = extByMime[baseMime] || 'webm';
+
   if (await isCloudBackendAvailable()) {
     try {
       const fd = new FormData();
-      fd.append('audio', params.blob, 'dictation.webm');
+      fd.append('audio', params.blob, `dictation.${clipExt}`);
       fd.append('lang', params.lang || 'ja-JP');
       const resp = await fetch(`${getApiBaseUrl()}/v1/speech:transcribe`, {
         method: 'POST',
@@ -1027,7 +1116,12 @@ export async function transcribeShortClip(params: {
         const data = await resp.json();
         return String(data.text || '');
       }
-    } catch {
+      if (!shouldPoisonCloudProbe(resp.status)) {
+        throw await parseErrorResponse(resp);
+      }
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
+    } catch (err) {
+      if (err instanceof ApiClientError) throw err;
       writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
   }
@@ -1054,7 +1148,7 @@ export async function transcribeShortClip(params: {
           {
             role: 'user',
             parts: [
-              { inlineData: { mimeType: params.blob.type || 'audio/webm', data: b64 } },
+              { inlineData: { mimeType: baseMime, data: b64 } },
               {
                 text: `Transcribe the spoken speech (${params.lang || 'ja-JP'}) verbatim as plain text only.`,
               },
@@ -1066,7 +1160,11 @@ export async function transcribeShortClip(params: {
   );
   if (!resp.ok) throw new Error(`Gemini Audio HTTP ${resp.status}`);
   const data = await resp.json();
-  return String(data?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+  const parts = Array.isArray(data?.candidates?.[0]?.content?.parts)
+    ? (data.candidates[0].content.parts as Array<{ text?: string; thought?: boolean }>)
+    : [];
+  const chosen = parts.find((p) => !p?.thought && typeof p?.text === 'string' && p.text.trim());
+  return String(chosen?.text || '').trim();
 }
 
 export async function downloadExportedTurn(params: {
@@ -1079,7 +1177,7 @@ export async function downloadExportedTurn(params: {
   fallbackSentences?: SentencePair[];
   fallbackText?: string;
 }): Promise<{ blob: Blob; filename: string }> {
-  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
+  const buildLocalExport = async () => {
     let fallbackSentences = params.fallbackSentences;
     let fallbackText = params.fallbackText;
     if (!fallbackSentences && !fallbackText) {
@@ -1089,6 +1187,7 @@ export async function downloadExportedTurn(params: {
         fallbackText = stored.text;
       }
     }
+    const { buildDirectExportBlob } = await loadDirectEngine();
     return buildDirectExportBlob({
       cid: params.cid,
       mid: params.mid,
@@ -1098,6 +1197,10 @@ export async function downloadExportedTurn(params: {
       bilingual: params.bilingual,
       theme: params.theme,
     });
+  };
+
+  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
+    return buildLocalExport();
   }
   const qs = new URLSearchParams({
     cid: params.cid,
@@ -1105,23 +1208,19 @@ export async function downloadExportedTurn(params: {
     ...(params.bilingual ? { bilingual: '1' } : {}),
     ...(params.theme ? { theme: params.theme } : {}),
   });
-  const resp = await fetch(
-    `${getApiBaseUrl()}/v1/messages/${encodeURIComponent(params.mid)}/export?${qs.toString()}`,
-    { headers: await authHeaders(params.user) }
-  );
-  if (!resp.ok) {
-    return buildDirectExportBlob({
-      cid: params.cid,
-      mid: params.mid,
-      fmt: params.fmt,
-      fallbackSentences: params.fallbackSentences,
-      fallbackText: params.fallbackText,
-      bilingual: params.bilingual,
-      theme: params.theme,
-    });
+  try {
+    const resp = await fetch(
+      `${getApiBaseUrl()}/v1/messages/${encodeURIComponent(params.mid)}/export?${qs.toString()}`,
+      { headers: await authHeaders(params.user) }
+    );
+    if (!resp.ok) {
+      return buildLocalExport();
+    }
+    const blob = await resp.blob();
+    return { blob, filename: `tranx-${params.mid}.${params.fmt}` };
+  } catch {
+    return buildLocalExport();
   }
-  const blob = await resp.blob();
-  return { blob, filename: `tranx-${params.mid}.${params.fmt}` };
 }
 
 export async function resumeInterruptedTurn(params: {
@@ -1130,9 +1229,16 @@ export async function resumeInterruptedTurn(params: {
   mid: string;
   onEvent: (ev: StreamEvent) => void;
 }): Promise<void> {
-  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) {
+  if (isLocalE2EMode()) {
     params.onEvent({ type: 'done', state: 'done', doneParas: 3, totalParas: 3 });
     return;
+  }
+  if (!(await isCloudBackendAvailable())) {
+    throw new ApiClientError(
+      503,
+      'CLOUD_FN_REQUIRED',
+      'Melanjutkan terjemahan terpotong memerlukan Cloud Functions aktif. Kirim ulang berkas atau teks pada mode langsung.'
+    );
   }
   const resp = await fetch(`${getApiBaseUrl()}/v1/translate:resume`, {
     method: 'POST',
@@ -1179,7 +1285,6 @@ export async function saveEngineVaultKey(
   user: AuthSessionUser,
   apiKey: string
 ): Promise<{ configured: boolean; source: string }> {
-  await setOwnerGeminiKey(apiKey);
   if (!isLocalE2EMode() && (await isCloudBackendAvailable())) {
     try {
       const resp = await fetch(`${getApiBaseUrl()}/v1/engine:key`, {
@@ -1190,11 +1295,16 @@ export async function saveEngineVaultKey(
         },
         body: JSON.stringify({ apiKey }),
       });
-      if (resp.ok) return resp.json();
+      if (resp.ok) {
+        // Keep browser-readable settings/secrets empty when server vault is active
+        await setOwnerGeminiKey('').catch(() => {});
+        return resp.json();
+      }
     } catch {
-      // Stored safely in owner-only Firestore settings/secrets
+      // Fall back to Spark-only owner-scoped Firestore secrets
     }
   }
+  await setOwnerGeminiKey(apiKey);
   return {
     configured: Boolean(apiKey.trim()),
     source: apiKey.trim() ? 'firestore-vault' : 'missing',
@@ -1230,6 +1340,11 @@ export async function runEngineCheck(
         const data = await resp.json();
         return data.models || [];
       }
+      if (!shouldPoisonCloudProbe(resp.status)) {
+        const err = await parseErrorResponse(resp);
+        return [{ model: 'cloud-backend', ok: false, ms: 0, error: err.message }];
+      }
+      writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     } catch {
       writePersistedCloudProbe({ ok: false, checkedAt: Date.now(), base: getApiBaseUrl() });
     }
@@ -1237,6 +1352,7 @@ export async function runEngineCheck(
 
   const t0 = performance.now();
   try {
+    const { translateParagraphsDirect } = await loadDirectEngine();
     const { outputs, model } = await translateParagraphsDirect({
       paragraphs: ['おはようございます。'],
       mode: 'ja-id',
@@ -1314,7 +1430,14 @@ export async function redeemPairCodeRequest(code: string): Promise<string> {
 }
 
 export async function revokeAllOwnerSessions(user: AuthSessionUser): Promise<void> {
-  if (isLocalE2EMode() || !(await isCloudBackendAvailable())) return;
+  if (isLocalE2EMode()) return;
+  if (!(await isCloudBackendAvailable())) {
+    throw new ApiClientError(
+      503,
+      'CLOUD_FN_REQUIRED',
+      'Pencabutan sesi lintas perangkat memerlukan backend Cloud Functions aktif. Keluar secara manual di perangkat terkait atau ubah sandi akun Google Anda.'
+    );
+  }
   const resp = await fetch(`${getApiBaseUrl()}/v1/auth:revoke`, {
     method: 'POST',
     headers: await authHeaders(user),
@@ -1351,11 +1474,17 @@ export async function dismissInboxItem(user: AuthSessionUser, inboxId: string): 
     return;
   }
   if (await isCloudBackendAvailable()) {
-    await fetch(`${getApiBaseUrl()}/v1/inbox/${encodeURIComponent(inboxId)}`, {
-      method: 'DELETE',
-      headers: await authHeaders(user),
-    }).catch(() => {});
+    try {
+      const resp = await fetch(`${getApiBaseUrl()}/v1/inbox/${encodeURIComponent(inboxId)}`, {
+        method: 'DELETE',
+        headers: await authHeaders(user),
+      });
+      if (resp.ok) return;
+    } catch {
+      // fall through to direct Firestore delete
+    }
   }
+  await deleteInboxItemDirect(inboxId);
 }
 
 export async function mergeTitleGlossaries(

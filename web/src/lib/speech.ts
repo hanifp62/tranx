@@ -54,6 +54,7 @@ export function startVoiceDictation(params: {
     rec.continuous = true;
     rec.interimResults = true;
     let accumulated = '';
+    let lastCombined = '';
     let finished = false;
 
     rec.onresult = (ev) => {
@@ -67,6 +68,7 @@ export function startVoiceDictation(params: {
         }
       }
       const combined = (accumulated + interim).trim();
+      lastCombined = combined;
       params.onInterim(combined);
       params.onLevels(
         combined.length % 2 === 0 ? [7, 15, 19, 12, 8] : [10, 18, 11, 16, 6]
@@ -86,10 +88,16 @@ export function startVoiceDictation(params: {
     rec.onend = () => {
       if (finished) return;
       finished = true;
-      params.onDone(accumulated.trim());
+      params.onDone((accumulated || lastCombined).trim());
     };
 
-    rec.start();
+    try {
+      rec.start();
+    } catch {
+      finished = true;
+      params.onError('Gagal memulai dikte mikrofon pada peramban ini.');
+      return { stop: () => {} };
+    }
     return {
       stop: () => {
         try {
@@ -97,7 +105,7 @@ export function startVoiceDictation(params: {
         } catch {
           if (!finished) {
             finished = true;
-            params.onDone(accumulated.trim());
+            params.onDone((accumulated || lastCombined).trim());
           }
         }
       },
@@ -105,15 +113,42 @@ export function startVoiceDictation(params: {
   }
 
   /* Fallback: MediaRecorder -> transcribeShortClip */
+  if (
+    typeof navigator === 'undefined' ||
+    !navigator.mediaDevices?.getUserMedia ||
+    typeof MediaRecorder === 'undefined'
+  ) {
+    params.onError('Dikte mikrofon tidak didukung pada peramban ini.');
+    return { stop: () => {} };
+  }
   let mediaStream: MediaStream | null = null;
   let recorder: MediaRecorder | null = null;
   let rafId = 0;
   let audioCtx: AudioContext | null = null;
+  let stoppedEarly = false;
   const chunks: BlobPart[] = [];
+
+  const cleanupMedia = () => {
+    if (rafId) {
+      window.cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+    mediaStream?.getTracks().forEach((t) => t.stop());
+    mediaStream = null;
+    if (audioCtx) {
+      const ctx = audioCtx;
+      audioCtx = null;
+      void ctx.close().catch(() => {});
+    }
+  };
 
   navigator.mediaDevices
     .getUserMedia({ audio: true })
     .then((stream) => {
+      if (stoppedEarly) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       mediaStream = stream;
       audioCtx = new AudioContext();
       const source = audioCtx.createMediaStreamSource(stream);
@@ -122,29 +157,38 @@ export function startVoiceDictation(params: {
       source.connect(analyser);
       const freq = new Uint8Array(analyser.frequencyBinCount);
 
-      const tick = () => {
-        analyser.getByteFrequencyData(freq);
-        const bars = [2, 5, 8, 11, 14].map((idx) =>
-          Math.max(4, Math.min(20, Math.round((freq[idx] / 255) * 20)))
-        );
-        params.onLevels(bars);
+      let lastLevelTs = 0;
+      const tick = (now: number) => {
+        if (stoppedEarly) return;
+        if (now - lastLevelTs >= 50) {
+          lastLevelTs = now;
+          analyser.getByteFrequencyData(freq);
+          const bars = [2, 5, 8, 11, 14].map((idx) =>
+            Math.max(4, Math.min(20, Math.round((freq[idx] / 255) * 20)))
+          );
+          params.onLevels(bars);
+        }
         rafId = window.requestAnimationFrame(tick);
       };
       rafId = window.requestAnimationFrame(tick);
 
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : 'audio/mp4';
-      recorder = new MediaRecorder(stream, { mimeType });
+      const mimeType =
+        typeof MediaRecorder.isTypeSupported === 'function' &&
+        MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : typeof MediaRecorder.isTypeSupported === 'function' &&
+              MediaRecorder.isTypeSupported('audio/mp4')
+            ? 'audio/mp4'
+            : '';
+      recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      const effectiveMime = recorder.mimeType || mimeType || 'audio/webm';
       recorder.ondataavailable = (e) => {
         if (e.data.size > 0) chunks.push(e.data);
       };
       recorder.onstop = async () => {
-        window.cancelAnimationFrame(rafId);
-        mediaStream?.getTracks().forEach((t) => t.stop());
-        await audioCtx?.close().catch(() => {});
+        cleanupMedia();
         try {
-          const blob = new Blob(chunks, { type: mimeType });
+          const blob = new Blob(chunks, { type: effectiveMime });
           const transcript = await transcribeShortClip({
             user: params.user,
             blob,
@@ -160,16 +204,19 @@ export function startVoiceDictation(params: {
       recorder.start();
     })
     .catch(() => {
-      params.onError('Mikrofon tidak dapat diakses pada perangkat ini.');
+      cleanupMedia();
+      if (!stoppedEarly) {
+        params.onError('Mikrofon tidak dapat diakses pada perangkat ini.');
+      }
     });
 
   return {
     stop: () => {
+      stoppedEarly = true;
       if (recorder && recorder.state !== 'inactive') {
         recorder.stop();
       } else {
-        window.cancelAnimationFrame(rafId);
-        mediaStream?.getTracks().forEach((t) => t.stop());
+        cleanupMedia();
       }
     },
   };

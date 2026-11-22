@@ -12,6 +12,7 @@ export type ModePair =
   | 'en-ja';
 export type UiLang = 'id' | 'en';
 export type ThemePref = 'system' | 'light' | 'dark';
+export type TranslationTonePref = 'auto' | 'novel' | 'casual' | 'formal';
 export type ResolvedTheme = 'Terang' | 'Gelap';
 export type WorkTab = 'teks' | 'gambar' | 'dokumen' | 'link';
 export type EntityKind = 'PERSON' | 'PLACE' | 'ORG' | 'TERM' | 'CULTURE';
@@ -81,11 +82,38 @@ export interface NameChipItem {
   source: string;
 }
 
+export type VisionBlockKind =
+  | 'dialogue'
+  | 'shout'
+  | 'thought'
+  | 'narration'
+  | 'sfx'
+  | 'aside'
+  | 'sign'
+  | 'caption'
+  | 'status_window';
+
+export type VisionBlockShape = 'oval' | 'jagged' | 'rect' | 'cloud' | 'unbordered';
+export type VisionBgTone = 'light' | 'dark' | 'artwork' | 'colored';
+export type ComicLayoutMode =
+  | 'rtl_manga'
+  | 'webtoon_strip'
+  | 'four_koma'
+  | 'ltr_comic'
+  | 'single_image';
+
 export interface VisionBlock {
   id: number;
   box: [number, number, number, number]; // [x, y, w, h] in pixels
   src: string;
   dst: string;
+  kind?: VisionBlockKind;
+  shape?: VisionBlockShape;
+  bgTone?: VisionBgTone;
+  writingDir?: 'vertical' | 'horizontal';
+  furiganaNote?: string;
+  sfxImportance?: 'none' | 'ambient' | 'impact' | 'narrative' | 'major' | 'minor' | 'plot_critical';
+  rows?: Array<[string, string]>;
 }
 
 export interface ImageTranslationResult {
@@ -96,6 +124,29 @@ export interface ImageTranslationResult {
   fullDst: string;
   model: string;
   dataUrl?: string;
+  readingDir?: 'rtl' | 'ltr' | 'vertical';
+  comicLayout?: ComicLayoutMode;
+  isSpread?: boolean;
+}
+
+export interface MangaPageItem {
+  index: number;
+  url: string;
+  alt?: string;
+  width?: number;
+  height?: number;
+  possibleCredit?: boolean;
+}
+
+export interface MangaLinkMeta {
+  isComic: boolean;
+  isDirectImage: boolean;
+  layout: ComicLayoutMode;
+  pageCount: number;
+  pages: MangaPageItem[];
+  drmProtected?: boolean;
+  drmReason?: string;
+  sourceHint?: string;
 }
 
 export interface NovelChapterLink {
@@ -134,6 +185,8 @@ export interface LinkPreviewPayload {
   lockedNames: number;
   readerSupported: boolean;
   novelNav?: NovelNavigation;
+  comicMeta?: MangaLinkMeta;
+  firstImageResult?: ImageTranslationResult;
 }
 
 export interface WebReaderBundle {
@@ -146,6 +199,8 @@ export interface WebReaderBundle {
   sentences: SentencePair[];
   novelNav: NovelNavigation;
   siteHtml?: string;
+  comicMeta?: MangaLinkMeta;
+  firstImageResult?: ImageTranslationResult;
 }
 
 export type TurnState =
@@ -188,9 +243,29 @@ export interface PendingAttachment {
   name: string;
   sizeBytes: number;
   ext: string;
-  status: 'ready' | 'reading' | 'error' | 'unsupported';
+  status: 'checking' | 'ready' | 'reading' | 'error' | 'unsupported';
   reason?: string;
   previewUrl?: string;
+}
+
+export interface EbookPrefsSync {
+  themeMode?: 'adaptive' | 'locked';
+  dayTheme?: 'paper' | 'sepia' | 'sage' | 'eink';
+  nightTheme?: 'dusk' | 'midnight';
+  lockedTheme?: 'paper' | 'sepia' | 'sage' | 'dusk' | 'midnight' | 'eink';
+  fontId?: string;
+  fontSize?: number;
+  lineHeight?: number;
+  letterSpacing?: number;
+  wordSpacing?: number;
+  paragraphSpacing?: number;
+  measure?: 'narrow' | 'standard' | 'wide';
+  align?: 'left' | 'justify';
+  pageMode?: 'scroll' | 'slide' | 'flip';
+  spread?: 'single' | 'auto';
+  inlinePeek?: boolean;
+  readingRuler?: 'off' | 'bar' | 'shade' | 'underline';
+  tapZone?: 'edges' | 'right-hand' | 'left-hand';
 }
 
 export interface AppSettingsDoc {
@@ -205,6 +280,8 @@ export interface AppSettingsDoc {
   defaultTarget: TargetLang;
   uiLang: UiLang;
   theme: ThemePref;
+  translationTone?: TranslationTonePref;
+  ebookPrefs?: EbookPrefsSync;
 }
 
 export interface JobDoc {

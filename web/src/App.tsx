@@ -1,14 +1,30 @@
 import {
   Suspense,
   lazy,
+  memo,
   useCallback,
   useDeferredValue,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from 'react';
+import { useDialogFocusTrap } from './lib/useDialogFocusTrap';
 import { STRINGS, labelForLang } from './i18n/strings';
+import { validateAppRoute } from './lib/routeGuard';
+import { saveTranslationTonePref } from './lib/tonePrefs';
+import {
+  loadEbookPrefs,
+  saveEbookPrefs,
+  syncDocumentThemeColor,
+} from './lib/ebookPrefs';
+import {
+  listRecentReadings,
+  removeRecentReading,
+  type RichReadingShelfItem,
+} from './lib/ebookStorage';
+import { NotFoundView } from './components/NotFoundView';
 import type {
   AppSettingsDoc,
   ConversationDoc,
@@ -65,12 +81,11 @@ import {
   detectLanguageLocal,
   isSingleStandaloneUrl,
   parseModePair,
-  prefetchNextChapterTranslatedDirect,
   swapModePair,
   toSafeHttpUrl,
-  translateChapterTitlesDirect,
   validateUploadedFileMagic,
-} from './lib/directEngine';
+} from './lib/langUtils';
+import { getDeviceRuntimeProfile } from './lib/resilience';
 import { startVoiceDictation, type DictationHandle } from './lib/speech';
 import {
   getPwaInstallState,
@@ -165,6 +180,64 @@ const SUPPORTED_DOC_EXTS = new Set([
 ]);
 const SUPPORTED_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp']);
 
+const SidebarHistoryRow = memo(function SidebarHistoryRow({
+  conv,
+  title,
+  isActive,
+  isMenuOpen,
+  showPin,
+  onSelect,
+  onOpenMenu,
+}: {
+  conv: ConversationDoc;
+  title: string;
+  isActive: boolean;
+  isMenuOpen: boolean;
+  showPin: boolean;
+  onSelect: (id: string) => void;
+  onOpenMenu: (conv: ConversationDoc, rect: DOMRect) => void;
+}) {
+  return (
+    <div className={`history-row ${isActive ? 'active' : ''}`}>
+      <button type="button" className="history-row-main" onClick={() => onSelect(conv.id)}>
+        {showPin && (
+          <span className="history-pin-icon" aria-hidden="true">
+            <IconPin size={15} />
+          </span>
+        )}
+        <span className="history-row-title">{title}</span>
+      </button>
+      <button
+        type="button"
+        className="history-dots-btn"
+        aria-label={`Menu riwayat ${title}`}
+        aria-expanded={isMenuOpen}
+        onClick={(e) => {
+          e.stopPropagation();
+          onOpenMenu(conv, e.currentTarget.getBoundingClientRect());
+        }}
+      >
+        <IconDots size={17} />
+      </button>
+    </div>
+  );
+});
+
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function prefetchNextChapterLazy(url: string, mode: ModePair, titleId?: string): void {
+  if (!getDeviceRuntimeProfile().allowBackgroundPrefetch) return;
+  void import('./lib/directEngine')
+    .then((m) => m.prefetchNextChapterTranslatedDirect(url, mode, titleId))
+    .catch(() => { });
+}
+
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -172,6 +245,38 @@ function readFileAsDataUrl(file: File): Promise<string> {
     reader.onerror = () => reject(new Error('Gagal membaca berkas gambar.'));
     reader.readAsDataURL(file);
   });
+}
+
+const INITIAL_DICTATION_BARS = [6, 12, 9, 14, 7] as const;
+
+function FocusTrappedDialog({
+  className,
+  ariaLabel,
+  ariaLabelledBy,
+  onClose,
+  children,
+}: {
+  className: string;
+  ariaLabel?: string;
+  ariaLabelledBy?: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useDialogFocusTrap(ref, onClose);
+  return (
+    <div
+      ref={ref}
+      className={className}
+      role="dialog"
+      aria-modal="true"
+      aria-label={ariaLabel}
+      aria-labelledby={ariaLabelledBy}
+      onClick={(e) => e.stopPropagation()}
+    >
+      {children}
+    </div>
+  );
 }
 
 export function App() {
@@ -212,6 +317,9 @@ export function App() {
   const [composerText, setComposerText] = useState('');
   const [linkUrlInput, setLinkUrlInput] = useState('');
   const [isFetchingLink, setIsFetchingLink] = useState(false);
+  const [recentReadings, setRecentReadings] = useState<RichReadingShelfItem[]>(() =>
+    listRecentReadings(4)
+  );
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [isSubmittingAttachment, setIsSubmittingAttachment] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
@@ -219,9 +327,35 @@ export function App() {
 
   const [isDictating, setIsDictating] = useState(false);
   const [dictationSeconds, setDictationSeconds] = useState(0);
-  const [dictationBars, setDictationBars] = useState<number[]>([6, 12, 9, 14, 7]);
+  const dictationBarRefs = useRef<Array<HTMLSpanElement | null>>([]);
   const dictationRef = useRef<DictationHandle | null>(null);
+  const dictationBasePrefixRef = useRef<string>('');
   const streamAbortRef = useRef<AbortController | null>(null);
+  const streamRunIdRef = useRef<number>(0);
+  const streamClearTimerRef = useRef<number | null>(null);
+  const toastTimersRef = useRef<Set<number>>(new Set());
+  const [swUpdateReady, setSwUpdateReady] = useState(false);
+  const swApplyUpdateRef = useRef<(() => Promise<void> | void) | null>(null);
+
+  useEffect(() => {
+    const onSwUpdate = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ applyUpdate?: () => Promise<void> | void }>).detail;
+      swApplyUpdateRef.current = detail?.applyUpdate || null;
+      setSwUpdateReady(true);
+    };
+    window.addEventListener('tranx:sw-update-ready', onSwUpdate as EventListener);
+    return () => {
+      window.removeEventListener('tranx:sw-update-ready', onSwUpdate as EventListener);
+      dictationRef.current?.stop();
+      streamAbortRef.current?.abort();
+      if (streamClearTimerRef.current !== null) {
+        window.clearTimeout(streamClearTimerRef.current);
+        streamClearTimerRef.current = null;
+      }
+      toastTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      toastTimersRef.current.clear();
+    };
+  }, []);
 
   /* Floating Glass Menu / Sheet State (strictly <= 1 floating menu open at once -> R-10 dose cap) */
   const [langPickerSide, setLangPickerSide] = useState<'source' | 'target' | null>(null);
@@ -297,19 +431,34 @@ export function App() {
     (message: string, undoLabel?: string, onUndo?: () => void) => {
       const id = `tst_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
       setToasts((prev) => [...prev.slice(-2), { id, message, undoLabel, onUndo }]);
-      window.setTimeout(() => {
+      const timerId = window.setTimeout(() => {
+        toastTimersRef.current.delete(timerId);
         setToasts((prev) => prev.filter((t) => t.id !== id));
       }, 4500);
+      toastTimersRef.current.add(timerId);
     },
     []
   );
 
-  const parsedUrl = useMemo(() => new URL(routePath, window.location.origin), [routePath]);
+  const rawPathname = useMemo(() => {
+    const qIdx = routePath.search(/[?#]/);
+    return qIdx >= 0 ? routePath.slice(0, qIdx) : routePath;
+  }, [routePath]);
+  const routeCheck = useMemo(() => validateAppRoute(rawPathname), [rawPathname]);
+  const parsedUrl = useMemo(() => {
+    try {
+      return new URL(routePath, window.location.origin);
+    } catch {
+      return new URL('/', window.location.origin);
+    }
+  }, [routePath]);
   const pathname = parsedUrl.pathname;
   const lastNonWebPathRef = useRef<string>('/');
   if (
+    routeCheck.valid &&
     pathname !== '/web' &&
     pathname !== '/share' &&
+    pathname !== '/open' &&
     !pathname.startsWith('/r/') &&
     !pathname.startsWith('/masuk')
   ) {
@@ -317,15 +466,17 @@ export function App() {
   }
   const activeCid = useMemo(() => {
     const match = pathname.match(/^\/c\/([^/]+)/);
-    return match ? decodeURIComponent(match[1]) : '';
+    return match ? safeDecodeURIComponent(match[1]) : '';
   }, [pathname]);
   const readerMatch = useMemo(() => {
     const m = pathname.match(/^\/c\/([^/]+)\/m\/([^/]+)\/baca$/);
-    return m ? { cid: decodeURIComponent(m[1]), mid: decodeURIComponent(m[2]) } : null;
+    return m
+      ? { cid: safeDecodeURIComponent(m[1]), mid: safeDecodeURIComponent(m[2]) }
+      : null;
   }, [pathname]);
   const kamusMatch = useMemo(() => {
     const m = pathname.match(/^\/kamus(?:\/([^/]+))?$/);
-    return m ? { titleId: m[1] ? decodeURIComponent(m[1]) : undefined } : null;
+    return m ? { titleId: m[1] ? safeDecodeURIComponent(m[1]) : undefined } : null;
   }, [pathname]);
 
   const resolvedTheme: ResolvedTheme = useMemo(() => {
@@ -342,33 +493,57 @@ export function App() {
       root.removeAttribute('data-tranx-v3');
     }
     root.lang = settings.uiLang;
-  }, [resolvedTheme, settings.uiLang]);
+    // Sync OS/PWA status bar color cleanly for Workspace Shell (Ebook reader overrides while active)
+    if (pathname !== '/web' && !readerMatch) {
+      syncDocumentThemeColor(resolvedTheme === 'Gelap' ? '#171B1A' : '#FAFBFA');
+    }
+  }, [resolvedTheme, settings.uiLang, pathname, readerMatch]);
+
+  useEffect(() => {
+    if (pathname !== '/web') {
+      setRecentReadings(listRecentReadings(4));
+    }
+  }, [pathname, activeTab]);
 
   const strings = STRINGS[settings.uiLang];
 
   useEffect(() => {
-    const onResize = () => setIsMobile(window.innerWidth < 768);
+    let resizeRaf = 0;
+    const onResize = () => {
+      if (resizeRaf) return;
+      resizeRaf = window.requestAnimationFrame(() => {
+        resizeRaf = 0;
+        const nextMobile = window.innerWidth < 768;
+        setIsMobile((prev) => (prev === nextMobile ? prev : nextMobile));
+      });
+    };
     const onPop = () => setRoutePath(window.location.pathname + window.location.search);
     const onOnline = () => setIsOnline(true);
     const onOffline = () => setIsOnline(false);
     const mq = window.matchMedia?.('(prefers-color-scheme: dark)');
     const onMq = (e: MediaQueryListEvent) => setSystemDark(e.matches);
 
-    window.addEventListener('resize', onResize);
+    window.addEventListener('resize', onResize, { passive: true });
     window.addEventListener('popstate', onPop);
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
     mq?.addEventListener?.('change', onMq);
 
     const vv = window.visualViewport;
+    let vvRaf = 0;
     const onVv = () => {
-      if (!vv) return;
-      const kbOffset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-      document.documentElement.style.setProperty('--dur-kb-offset', `${kbOffset}px`);
+      if (!vv || vvRaf) return;
+      vvRaf = window.requestAnimationFrame(() => {
+        vvRaf = 0;
+        const kbOffset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        document.documentElement.style.setProperty('--dur-kb-offset', `${kbOffset}px`);
+      });
     };
-    vv?.addEventListener('resize', onVv);
+    vv?.addEventListener('resize', onVv, { passive: true });
 
     return () => {
+      if (resizeRaf) window.cancelAnimationFrame(resizeRaf);
+      if (vvRaf) window.cancelAnimationFrame(vvRaf);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('popstate', onPop);
       window.removeEventListener('online', onOnline);
@@ -406,21 +581,24 @@ export function App() {
     const key = `${inlineChaptersNav.tocKey}::${inlineChaptersNav.mode}`;
     const total = inlineChaptersNav.nav.chapters.length;
     setInlineChapterProgress({ done: 0, total });
-    translateChapterTitlesDirect({
-      chapters: inlineChaptersNav.nav.chapters,
-      mode: inlineChaptersNav.mode,
-      titleId: inlineChaptersNav.titleId,
-      tocKey: inlineChaptersNav.tocKey,
-      seriesTitle: inlineChaptersNav.nav.seriesTitle,
-      signal: ctrl.signal,
-      onProgress: (partialMap, doneCount, totalCount) => {
-        if (!active) return;
-        setInlineTranslatedTitlesByKey((prev) => ({ ...prev, [key]: partialMap }));
-        setInlineChapterProgress(
-          doneCount < totalCount ? { done: doneCount, total: totalCount } : null
-        );
-      },
-    })
+    import('./lib/directEngine')
+      .then((m) =>
+        m.translateChapterTitlesDirect({
+          chapters: inlineChaptersNav.nav.chapters!,
+          mode: inlineChaptersNav.mode,
+          titleId: inlineChaptersNav.titleId,
+          tocKey: inlineChaptersNav.tocKey,
+          seriesTitle: inlineChaptersNav.nav.seriesTitle,
+          signal: ctrl.signal,
+          onProgress: (partialMap, doneCount, totalCount) => {
+            if (!active) return;
+            setInlineTranslatedTitlesByKey((prev) => ({ ...prev, [key]: partialMap }));
+            setInlineChapterProgress(
+              doneCount < totalCount ? { done: doneCount, total: totalCount } : null
+            );
+          },
+        })
+      )
       .then((map) => {
         if (active) {
           setInlineTranslatedTitlesByKey((prev) => ({ ...prev, [key]: map }));
@@ -447,24 +625,32 @@ export function App() {
     }
   }, []);
 
-  // Idle pre-warm: probe backend & preload lazy UI chunks so Web and Installed PWA feel instant on every tap
+  // Idle pre-warm: only after sign-in and when device/network allows background prefetch
   useEffect(() => {
+    if (!user || !getDeviceRuntimeProfile().allowBackgroundPrefetch) return;
+    let cancelled = false;
     const warm = () => {
+      if (cancelled) return;
       warmCloudBackendProbe();
-      void import('./components/SubViews').catch(() => {});
-      void import('./components/Modals').catch(() => {});
+      void import('./components/Modals').catch(() => { });
     };
-    const idleCb = (
-      window as unknown as {
-        requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
-      }
-    ).requestIdleCallback;
-    if (typeof idleCb === 'function') {
-      idleCb(warm, { timeout: 1500 });
-    } else {
-      window.setTimeout(warm, 400);
+    const win = window as unknown as {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    if (typeof win.requestIdleCallback === 'function') {
+      const id = win.requestIdleCallback(warm, { timeout: 1800 });
+      return () => {
+        cancelled = true;
+        win.cancelIdleCallback?.(id);
+      };
     }
-  }, []);
+    const timer = window.setTimeout(warm, 600);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [user]);
 
   // Lock background page scroll while a mobile drawer or sheet is active
   useEffect(() => {
@@ -498,6 +684,12 @@ export function App() {
     const unsubs = [
       subscribeSettings((s) => {
         setSettings(s);
+        if (s.translationTone) {
+          saveTranslationTonePref(s.translationTone);
+        }
+        if (s.ebookPrefs && typeof s.ebookPrefs === 'object') {
+          saveEbookPrefs({ ...loadEbookPrefs(), ...s.ebookPrefs });
+        }
         const nextDefPair = `${s.defaultSource}-${s.defaultTarget}`;
         if (nextDefPair !== prevDefPair) {
           prevDefPair = nextDefPair;
@@ -523,6 +715,7 @@ export function App() {
   }, [user, activeCid]);
 
   useEffect(() => {
+    if (!routeCheck.valid) return;
     const qTab = parsedUrl.searchParams.get('tab');
     if (qTab && ['teks', 'gambar', 'dokumen', 'link'].includes(qTab)) {
       setActiveTab(qTab as WorkTab);
@@ -548,7 +741,7 @@ export function App() {
 
     // Instant URL prefix shortcut: /r/https://kakuyomu.jp/... or /r/kakuyomu.jp/...
     if (pathname.startsWith('/r/') && pathname.length > 3) {
-      const rawTail = decodeURIComponent(pathname.slice(3)) + parsedUrl.search;
+      const rawTail = safeDecodeURIComponent(pathname.slice(3)) + parsedUrl.search;
       const safeUrl = toSafeHttpUrl(rawTail);
       if (safeUrl) {
         navigate(
@@ -581,7 +774,9 @@ export function App() {
         navigate('/');
       }
     }
-  }, [pathname, parsedUrl, routePath, authReady, user, activeMode, navigate]);
+  }, [routeCheck.valid, pathname, parsedUrl, routePath, authReady, user, activeMode, navigate]);
+
+  const handleStageFilesRef = useRef<(files: FileList | File[], targetTab: WorkTab) => void>(() => { });
 
   useEffect(() => {
     if (window.launchQueue) {
@@ -593,7 +788,7 @@ export function App() {
         }
         if (files.length) {
           setActiveTab('dokumen');
-          handleStageFiles(files, 'dokumen');
+          handleStageFilesRef.current(files, 'dokumen');
           navigate('/');
         }
       });
@@ -619,36 +814,76 @@ export function App() {
     }
   }, [activeConversation, activeCid]);
 
+  const copyToClipboardWithToast = useCallback(
+    (text: string) => {
+      if (!navigator.clipboard?.writeText) {
+        pushToast('Salin manual dengan Cmd/Ctrl+C.');
+        return;
+      }
+      navigator.clipboard
+        .writeText(text)
+        .then(() => pushToast(strings.copiedToast))
+        .catch(() => pushToast('Gagal menyalin ke papan klip.'));
+    },
+    [pushToast, strings.copiedToast]
+  );
+
+  const keydownStateRef = useRef({
+    user,
+    messages,
+    copyToClipboardWithToast,
+    langPickerSide,
+    moreMenuOpen,
+    accountMenuOpen,
+    historyMenuTarget,
+    mobileTurnSheet,
+    inlineChaptersNav,
+    installGuideOpen,
+  });
+  keydownStateRef.current = {
+    user,
+    messages,
+    copyToClipboardWithToast,
+    langPickerSide,
+    moreMenuOpen,
+    accountMenuOpen,
+    historyMenuTarget,
+    mobileTurnSheet,
+    inlineChaptersNav,
+    installGuideOpen,
+  };
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      const s = keydownStateRef.current;
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.key.toLowerCase() === 'k') {
+      const key = e.key.toLowerCase();
+      if (mod && key === 'k') {
         e.preventDefault();
         setSidebarCollapsed(false);
         setSearchOpen(true);
         window.setTimeout(() => searchInputRef.current?.focus(), 40);
       } else if (mod && e.key === ',') {
         e.preventDefault();
-        if (user) setSettingsOpen(true);
+        if (s.user) setSettingsOpen(true);
       } else if (mod && e.key === '/') {
         e.preventDefault();
         setShortcutsOpen((v) => !v);
-      } else if (mod && e.shiftKey && e.key.toLowerCase() === 'c') {
-        const lastAsst = [...messages].reverse().find((m) => m.role === 'assistant');
+      } else if (e.altKey && e.shiftKey && !mod && key === 'c') {
+        const lastAsst = [...s.messages].reverse().find((m) => m.role === 'assistant');
         if (lastAsst?.text) {
           e.preventDefault();
-          navigator.clipboard?.writeText(lastAsst.text);
-          pushToast(strings.copiedToast);
+          s.copyToClipboardWithToast(lastAsst.text);
         }
       } else if (e.key === 'Escape') {
         const hadSheetOrPopover = Boolean(
-          langPickerSide ||
-            moreMenuOpen ||
-            accountMenuOpen ||
-            historyMenuTarget ||
-            mobileTurnSheet ||
-            inlineChaptersNav ||
-            installGuideOpen
+          s.langPickerSide ||
+          s.moreMenuOpen ||
+          s.accountMenuOpen ||
+          s.historyMenuTarget ||
+          s.mobileTurnSheet ||
+          s.inlineChaptersNav ||
+          s.installGuideOpen
         );
         setLangPickerSide(null);
         setMoreMenuOpen(false);
@@ -664,19 +899,7 @@ export function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [
-    user,
-    messages,
-    pushToast,
-    strings.copiedToast,
-    langPickerSide,
-    moreMenuOpen,
-    accountMenuOpen,
-    historyMenuTarget,
-    mobileTurnSheet,
-    inlineChaptersNav,
-    installGuideOpen,
-  ]);
+  }, []);
 
   useEffect(() => {
     if (!isDictating) {
@@ -694,9 +917,9 @@ export function App() {
     const q = deferredSearchQuery.trim().toLowerCase();
     const filtered = q
       ? conversations.filter(
-          (c) =>
-            c.title.toLowerCase().includes(q) || c.preview.toLowerCase().includes(q)
-        )
+        (c) =>
+          c.title.toLowerCase().includes(q) || c.preview.toLowerCase().includes(q)
+      )
       : conversations;
     const pinned = filtered
       .filter((c) => c.pinned)
@@ -712,16 +935,18 @@ export function App() {
     [activeMode]
   );
 
+  const deferredComposerText = useDeferredValue(composerText);
+
   const liveDetectedLang: TargetLang | '' = useMemo(() => {
     if (currentSrcLang !== 'auto') return '';
-    if (composerText.trim().length >= 3) {
+    if (deferredComposerText.trim().length >= 3) {
       return detectLanguageLocal(
-        composerText,
+        deferredComposerText,
         currentTgtLang === 'ja' ? 'id' : 'ja'
       );
     }
     return lastDetectedSource;
-  }, [currentSrcLang, currentTgtLang, composerText, lastDetectedSource]);
+  }, [currentSrcLang, currentTgtLang, deferredComposerText, lastDetectedSource]);
 
   const displayedMessages = useMemo(() => {
     if (!streamingTurn) return messages;
@@ -820,25 +1045,37 @@ export function App() {
         name: f.name,
         sizeBytes: f.size,
         ext,
-        status: 'ready',
+        status: 'checking',
       };
     });
     setAttachments((prev) => [...prev, ...next]);
 
     for (const item of next) {
-      if (item.status === 'ready' && item.file) {
-        void validateUploadedFileMagic(item.file, kind).then((magicErr) => {
-          if (magicErr) {
+      if (item.status === 'checking' && item.file) {
+        void validateUploadedFileMagic(item.file, kind)
+          .then((magicErr) => {
+            setAttachments((prev) =>
+              prev.map((a) => {
+                if (a.id !== item.id || a.status !== 'checking') return a;
+                return magicErr
+                  ? { ...a, status: 'error', reason: magicErr }
+                  : { ...a, status: 'ready' };
+              })
+            );
+          })
+          .catch(() => {
             setAttachments((prev) =>
               prev.map((a) =>
-                a.id === item.id ? { ...a, status: 'error', reason: magicErr } : a
+                a.id === item.id && a.status === 'checking'
+                  ? { ...a, status: 'error', reason: 'Gagal memeriksa isi berkas.' }
+                  : a
               )
             );
-          }
-        });
+          });
       }
     }
   };
+  handleStageFilesRef.current = handleStageFiles;
 
   const handleChangeUiLang = async (nextLang: UiLang) => {
     const prevLang = settings.uiLang;
@@ -870,19 +1107,22 @@ export function App() {
     if (navigator.share) {
       await navigator
         .share({ title: conv.title, text: conv.preview, url: shareUrl })
-        .catch(() => {});
+        .catch(() => { });
     } else {
-      await navigator.clipboard?.writeText(text);
-      pushToast(strings.copiedToast);
+      copyToClipboardWithToast(text);
     }
   };
 
   const handleDeleteConversation = async (conv: ConversationDoc) => {
     if (!user) return;
     setHistoryMenuTarget(null);
-    await deleteConversationRemote(user, conv.id);
-    if (activeCid === conv.id) navigate('/');
-    pushToast(strings.deletedToast);
+    try {
+      await deleteConversationRemote(user, conv.id);
+      if (activeCid === conv.id) navigate('/');
+      pushToast(strings.deletedToast);
+    } catch (err) {
+      pushToast(humanizeFetchError(err, 'Gagal menghapus riwayat percakapan.'));
+    }
   };
 
   const handleSelectWorkTab = useCallback(
@@ -1007,8 +1247,11 @@ export function App() {
     if (!overrideText) setComposerText('');
     if (activeCid !== cid) navigate(`/c/${cid}`);
 
+    streamAbortRef.current?.abort();
+    const runId = ++streamRunIdRef.current;
     const abort = new AbortController();
     streamAbortRef.current = abort;
+    let streamSucceeded = false;
 
     setStreamingTurn({
       id: asstId,
@@ -1041,54 +1284,55 @@ export function App() {
             setStreamingTurn((prev) =>
               prev
                 ? {
-                    ...prev,
-                    id: finalMid,
-                    detectedSource: ev.detectedSource || prev.detectedSource,
-                    text: prev.text ? `${prev.text}\n${ev.dst}` : ev.dst || '',
-                  }
+                  ...prev,
+                  id: finalMid,
+                  detectedSource: ev.detectedSource || prev.detectedSource,
+                  text: prev.text ? `${prev.text}\n${ev.dst}` : ev.dst || '',
+                }
                 : null
             );
           } else if (ev.type === 'para') {
             setStreamingTurn((prev) =>
               prev
                 ? {
-                    ...prev,
-                    text: prev.text ? `${prev.text}\n\n${ev.dst || ''}` : ev.dst || '',
-                    done: ev.doneParas,
-                    total: ev.totalParas,
-                  }
+                  ...prev,
+                  text: prev.text ? `${prev.text}\n\n${ev.dst || ''}` : ev.dst || '',
+                  done: ev.doneParas,
+                  total: ev.totalParas,
+                }
                 : null
             );
           } else if (ev.type === 'done') {
             setStreamingTurn((prev) =>
               prev
                 ? {
-                    ...prev,
-                    id: finalMid,
-                    titleId: finalTid,
-                    detectedSource: ev.detectedSource || prev.detectedSource,
-                    text: ev.fullDst || prev.text,
-                    sentences: ev.sentences,
-                    state: 'done',
-                    model: ev.model,
-                    ms: ev.ms,
-                  }
+                  ...prev,
+                  id: finalMid,
+                  titleId: finalTid,
+                  detectedSource: ev.detectedSource || prev.detectedSource,
+                  text: ev.fullDst || prev.text,
+                  sentences: ev.sentences,
+                  state: 'done',
+                  model: ev.model,
+                  ms: ev.ms,
+                }
                 : null
             );
           } else if (ev.type === 'error') {
             setStreamingTurn((prev) =>
               prev
                 ? {
-                    ...prev,
-                    state: ev.code === 'DAILY_CAP_REACHED' ? 'busy' : 'error',
-                    error: ev.message || 'Terjemahan terhenti.',
-                  }
+                  ...prev,
+                  state: ev.code === 'DAILY_CAP_REACHED' ? 'busy' : 'error',
+                  error: ev.message || 'Terjemahan terhenti.',
+                }
                 : null
             );
           }
         },
       });
 
+      streamSucceeded = true;
       lookupTurnNames({
         user,
         cid,
@@ -1096,7 +1340,7 @@ export function App() {
         titleId: finalTid,
         text: raw,
         mode: activeMode,
-      }).catch(() => {});
+      }).catch(() => { });
     } catch (err) {
       if ((err as { name?: string })?.name === 'AbortError') {
         setStreamingTurn((prev) => (prev ? { ...prev, state: 'stopped' } : null));
@@ -1104,19 +1348,31 @@ export function App() {
         setStreamingTurn((prev) =>
           prev
             ? {
-                ...prev,
-                state: 'error',
-                error: humanizeFetchError(
-                  err,
-                  'Koneksi jaringan terganggu saat menerjemahkan. Tekan Coba sekarang.'
-                ),
-              }
+              ...prev,
+              state: 'error',
+              error: humanizeFetchError(
+                err,
+                'Koneksi jaringan terganggu saat menerjemahkan. Tekan Coba sekarang.'
+              ),
+            }
             : null
         );
       }
     } finally {
-      streamAbortRef.current = null;
-      window.setTimeout(() => setStreamingTurn(null), 350);
+      if (streamAbortRef.current === abort) {
+        streamAbortRef.current = null;
+      }
+      if (streamSucceeded) {
+        if (streamClearTimerRef.current !== null) {
+          window.clearTimeout(streamClearTimerRef.current);
+        }
+        streamClearTimerRef.current = window.setTimeout(() => {
+          streamClearTimerRef.current = null;
+          if (streamRunIdRef.current === runId) {
+            setStreamingTurn(null);
+          }
+        }, 350);
+      }
     }
   };
 
@@ -1170,10 +1426,10 @@ export function App() {
             prev.map((a) =>
               a.id === item.id
                 ? {
-                    ...a,
-                    status: 'error',
-                    reason: humanizeFetchError(err, 'Gagal memproses berkas.'),
-                  }
+                  ...a,
+                  status: 'error',
+                  reason: humanizeFetchError(err, 'Gagal memproses berkas.'),
+                }
                 : a
             )
           );
@@ -1191,17 +1447,28 @@ export function App() {
       setIsDictating(false);
       return;
     }
+    dictationBasePrefixRef.current = composerText.trim();
     setIsDictating(true);
     dictationRef.current = startVoiceDictation({
       user,
       sourceLang: currentSrcLang,
       detectedLang: liveDetectedLang || lastDetectedSource,
-      onInterim: (txt) => setComposerText(txt),
-      onLevels: (bars) => setDictationBars(bars),
+      onInterim: (txt) => {
+        const prefix = dictationBasePrefixRef.current;
+        setComposerText(prefix ? `${prefix} ${txt}` : txt);
+      },
+      onLevels: (bars) => {
+        for (let i = 0; i < bars.length; i += 1) {
+          const el = dictationBarRefs.current[i];
+          if (el) el.style.height = `${bars[i]}px`;
+        }
+      },
       onDone: (finalTxt) => {
         setIsDictating(false);
-        if (finalTxt) {
-          setComposerText((prev) => (prev ? prev : finalTxt));
+        const cleaned = finalTxt.trim();
+        if (cleaned) {
+          const prefix = dictationBasePrefixRef.current;
+          setComposerText(prefix ? `${prefix} ${cleaned}` : cleaned);
         }
       },
       onError: (msg) => {
@@ -1210,6 +1477,29 @@ export function App() {
       },
     });
   };
+
+  const handleSelectConversation = useCallback(
+    (id: string) => navigate(`/c/${id}`),
+    [navigate]
+  );
+
+  const handleOpenHistoryMenu = useCallback((conv: ConversationDoc, rect: DOMRect) => {
+    setMoreMenuOpen(false);
+    setAccountMenuOpen(false);
+    setLangPickerSide(null);
+    setHistoryMenuTarget((prev) => (prev?.conv.id === conv.id ? null : { conv, rect }));
+  }, []);
+
+  /* Strict 404 Route Guard: reject malformed slashes, dotfiles, and unknown paths BEFORE auth/app shell */
+  if (!routeCheck.valid) {
+    return (
+      <NotFoundView
+        badPath={rawPathname || '/'}
+        strings={strings}
+        onGoHome={() => navigate('/')}
+      />
+    );
+  }
 
   /* Auth Gate (/masuk & /masuk/kode) */
   if (!authReady) {
@@ -1355,6 +1645,7 @@ export function App() {
     const rawView = parsedUrl.searchParams.get('view');
     const qView: 'reader' | 'site' | 'original' =
       rawView === 'site' || rawView === 'original' ? rawView : 'reader';
+    const qPos = parsedUrl.searchParams.get('pos') || undefined;
     return (
       <>
         <Suspense
@@ -1373,6 +1664,7 @@ export function App() {
             url={targetUrl}
             initialMode={qMode}
             initialView={qView}
+            initialPos={qPos}
             titleId={qTid}
             backPath={lastNonWebPathRef.current || '/'}
             resolvedTheme={resolvedTheme}
@@ -1395,12 +1687,13 @@ export function App() {
 
   const isStageEmpty = !activeCid || modeMessages.length === 0;
   const readyAttachmentCount = attachments.filter((a) => a.status === 'ready').length;
+  const checkingAttachmentCount = attachments.filter((a) => a.status === 'checking').length;
   const canSendNow =
     activeTab === 'teks'
       ? composerText.trim().length > 0
       : activeTab === 'link'
         ? linkUrlInput.trim().length > 0 && !isFetchingLink
-        : readyAttachmentCount > 0 && !isSubmittingAttachment;
+        : readyAttachmentCount > 0 && checkingAttachmentCount === 0 && !isSubmittingAttachment;
 
   const numLocale = settings.uiLang === 'en' ? 'en-US' : 'id-ID';
 
@@ -1437,13 +1730,17 @@ export function App() {
               <div className="attachment-chip-sub">
                 {att.status === 'error'
                   ? att.reason
-                  : att.status === 'reading'
-                    ? modeKind === 'gambar'
-                      ? strings.readingImageOcr
-                      : uploadPct !== null
-                        ? `${strings.processingDoc} (${uploadPct}%)`
-                        : strings.processingDoc
-                    : `${strings.readyToSend} (${(att.sizeBytes / 1024).toFixed(1)} KB)`}
+                  : att.status === 'checking'
+                    ? settings.uiLang === 'en'
+                      ? 'Verifying file...'
+                      : 'Memeriksa berkas...'
+                    : att.status === 'reading'
+                      ? modeKind === 'gambar'
+                        ? strings.readingImageOcr
+                        : uploadPct !== null
+                          ? `${strings.processingDoc} (${uploadPct}%)`
+                          : strings.processingDoc
+                      : `${strings.readyToSend} (${(att.sizeBytes / 1024).toFixed(1)} KB)`}
               </div>
             </div>
           </div>
@@ -1585,7 +1882,10 @@ export function App() {
               {renderStagedAttachmentList('dokumen')}
               {isSubmittingAttachment && uploadPct !== null && (
                 <div className="progress-track">
-                  <div className="progress-fill" style={{ width: `${uploadPct}%` }} />
+                  <div
+                    className="progress-fill"
+                    style={{ transform: `scaleX(${Math.max(0, Math.min(1, uploadPct / 100))})` }}
+                  />
                 </div>
               )}
               <div className="composer-footer">
@@ -1720,24 +2020,79 @@ export function App() {
                 {isFetchingLink ? strings.loadingWebPage : strings.translateLinkBtn}
               </button>
             </div>
+
+            {recentReadings.length > 0 && (
+              <div className="ebook-continue-shelf" data-ebook-continue-shelf="true">
+                <div className="ebook-continue-shelf-head">
+                  <IconBook size={15} />
+                  <span>{strings.ebookContinueShelfTitle}</span>
+                </div>
+                <div className="ebook-continue-shelf-list">
+                  {recentReadings.map((item) => (
+                    <div key={item.seriesKey} className="ebook-shelf-row">
+                      <button
+                        type="button"
+                        className="ebook-shelf-open pressable"
+                        onClick={() => {
+                          const qs = new URLSearchParams({
+                            url: item.url,
+                            mode: item.mode || activeMode,
+                            view: 'reader',
+                            ...(item.titleId ? { titleId: item.titleId } : {}),
+                          });
+                          navigate(`/web?${qs.toString()}`);
+                        }}
+                      >
+                        <div className="ebook-shelf-title">{item.seriesTitle || item.titleDst}</div>
+                        <div className="ebook-shelf-meta">
+                          <span>{item.chapterLabel || item.titleDst}</span>
+                          <span>· {item.progressPct}%</span>
+                          <span>· {item.host}</span>
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-square-btn pressable"
+                        aria-label={strings.ebookRemoveShelfItem}
+                        onClick={() => {
+                          removeRecentReading(item.seriesKey);
+                          setRecentReadings(listRecentReadings(4));
+                        }}
+                      >
+                        <IconX size={15} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </form>
         ) : (
           <div className="composer-island">
             {isDictating ? (
-              <div className="dictation-panel" role="status" aria-live="polite">
+              <div className="dictation-panel">
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   <div className="dictation-bars" aria-hidden="true">
-                    {dictationBars.map((h, idx) => (
+                    {INITIAL_DICTATION_BARS.map((h, idx) => (
                       <span
                         key={idx}
+                        ref={(el) => {
+                          dictationBarRefs.current[idx] = el;
+                        }}
                         className="dictation-bar"
                         style={{ height: `${h}px` }}
                       />
                     ))}
                   </div>
-                  <span style={{ fontSize: '14px', fontWeight: 600 }}>
-                    {strings.dictationListening} (
-                    {String(Math.floor(dictationSeconds / 60)).padStart(2, '0')}:
+                  <span style={{ fontSize: '14px', fontWeight: 600 }} role="status" aria-live="polite">
+                    {strings.dictationListening}
+                  </span>
+                  <span
+                    style={{ fontSize: '14px', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}
+                    role="timer"
+                    aria-live="off"
+                  >
+                    ({String(Math.floor(dictationSeconds / 60)).padStart(2, '0')}:
                     {String(dictationSeconds % 60).padStart(2, '0')})
                   </span>
                 </div>
@@ -1904,7 +2259,7 @@ export function App() {
       <input
         ref={docInputRef}
         type="file"
-        accept=".epub,.pdf,.docx,.srt,.vtt,.ass,.ssa,.html,.htm,.md,.txt,.rar,.zip"
+        accept=".epub,.pdf,.docx,.srt,.vtt,.ass,.ssa,.html,.htm,.xhtml,.md,.txt"
         hidden
         onChange={(e) => {
           if (e.target.files?.length) handleStageFiles(e.target.files, 'dokumen');
@@ -1941,15 +2296,14 @@ export function App() {
             setMobileDrawerOpen(false);
           }
         }}
-        className={`sidebar ${
-          isMobile
-            ? mobileDrawerOpen
-              ? ''
-              : 'mobile-closed'
-            : sidebarCollapsed
-              ? 'collapsed'
-              : ''
-        }`}
+        className={`sidebar ${isMobile
+          ? mobileDrawerOpen
+            ? ''
+            : 'mobile-closed'
+          : sidebarCollapsed
+            ? 'collapsed'
+            : ''
+          }`}
       >
         <div className="sidebar-top-row">
           <BrandWordmark />
@@ -2053,39 +2407,16 @@ export function App() {
                   <div className="history-section-label">{strings.pinnedSection}</div>
                   <div className="history-list">
                     {pinnedList.map((conv) => (
-                      <div
+                      <SidebarHistoryRow
                         key={conv.id}
-                        className={`history-row ${activeCid === conv.id ? 'active' : ''}`}
-                      >
-                        <button
-                          type="button"
-                          className="history-row-main"
-                          onClick={() => navigate(`/c/${conv.id}`)}
-                        >
-                          <span className="history-pin-icon" aria-hidden="true">
-                            <IconPin size={15} />
-                          </span>
-                          <span className="history-row-title">{conv.title}</span>
-                        </button>
-                        <button
-                          type="button"
-                          className="history-dots-btn"
-                          aria-label={`Menu riwayat ${conv.title}`}
-                          aria-expanded={historyMenuTarget?.conv.id === conv.id}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            const rect = e.currentTarget.getBoundingClientRect();
-                            setMoreMenuOpen(false);
-                            setAccountMenuOpen(false);
-                            setLangPickerSide(null);
-                            setHistoryMenuTarget((prev) =>
-                              prev?.conv.id === conv.id ? null : { conv, rect }
-                            );
-                          }}
-                        >
-                          <IconDots size={17} />
-                        </button>
-                      </div>
+                        conv={conv}
+                        title={conv.title}
+                        isActive={activeCid === conv.id}
+                        isMenuOpen={historyMenuTarget?.conv.id === conv.id}
+                        showPin
+                        onSelect={handleSelectConversation}
+                        onOpenMenu={handleOpenHistoryMenu}
+                      />
                     ))}
                   </div>
                 </section>
@@ -2096,36 +2427,16 @@ export function App() {
                   <div className="history-section-label">{strings.recentSection}</div>
                   <div className="history-list">
                     {recentList.map((conv) => (
-                      <div
+                      <SidebarHistoryRow
                         key={conv.id}
-                        className={`history-row ${activeCid === conv.id ? 'active' : ''}`}
-                      >
-                        <button
-                          type="button"
-                          className="history-row-main"
-                          onClick={() => navigate(`/c/${conv.id}`)}
-                        >
-                          <span className="history-row-title">{conv.title}</span>
-                        </button>
-                        <button
-                          type="button"
-                          className="history-dots-btn"
-                          aria-label={`Menu riwayat ${conv.title}`}
-                          aria-expanded={historyMenuTarget?.conv.id === conv.id}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            const rect = e.currentTarget.getBoundingClientRect();
-                            setMoreMenuOpen(false);
-                            setAccountMenuOpen(false);
-                            setLangPickerSide(null);
-                            setHistoryMenuTarget((prev) =>
-                              prev?.conv.id === conv.id ? null : { conv, rect }
-                            );
-                          }}
-                        >
-                          <IconDots size={17} />
-                        </button>
-                      </div>
+                        conv={conv}
+                        title={conv.title}
+                        isActive={activeCid === conv.id}
+                        isMenuOpen={historyMenuTarget?.conv.id === conv.id}
+                        showPin={false}
+                        onSelect={handleSelectConversation}
+                        onOpenMenu={handleOpenHistoryMenu}
+                      />
                     ))}
                   </div>
                 </section>
@@ -2152,10 +2463,12 @@ export function App() {
               {(user.displayName || user.email || 'U').slice(0, 1).toUpperCase()}
             </span>
             <span className="account-meta">
-              <div className="account-name">
+              <span className="account-name" style={{ display: 'block' }}>
                 {user.displayName || user.email?.split('@')[0] || 'Account'}
-              </div>
-              <div className="account-email">{user.email}</div>
+              </span>
+              <span className="account-email" style={{ display: 'block' }}>
+                {user.email}
+              </span>
             </span>
             <IconDots size={17} />
           </button>
@@ -2390,6 +2703,7 @@ export function App() {
                           <textarea
                             className="field-input"
                             style={{ minHeight: '90px' }}
+                            aria-label={strings.retranslate}
                             value={editingDraft}
                             onChange={(e) => setEditingDraft(e.target.value)}
                           />
@@ -2464,10 +2778,7 @@ export function App() {
                           fileName={turn.fileName}
                           resolvedTheme={resolvedTheme}
                           strings={strings}
-                          onCopy={(txt) => {
-                            navigator.clipboard?.writeText(txt);
-                            pushToast(strings.copiedToast);
-                          }}
+                          onCopy={(txt) => copyToClipboardWithToast(txt)}
                         />
                       </Suspense>
                     </div>
@@ -2492,12 +2803,27 @@ export function App() {
                           }}
                         >
                           <span>
-                            {lp.host} · {lp.paragraphCount} {strings.paragraphsUnit}
-                            {lp.lockedNames > 0
-                              ? ` · ${lp.lockedNames} ${strings.lockedNamesUnit}`
-                              : ''}
+                            {lp.host} ·{' '}
+                            {lp.comicMeta?.isComic
+                              ? `${lp.comicMeta.pageCount} ${strings.mangaPageUnit}`
+                              : `${lp.paragraphCount} ${strings.paragraphsUnit}`}
+                            {(() => {
+                              const lockedCount = Array.isArray(lp.lockedNames)
+                                ? lp.lockedNames.length
+                                : Number(lp.lockedNames || 0);
+                              return lockedCount > 0
+                                ? ` · ${lockedCount} ${strings.lockedNamesUnit}`
+                                : '';
+                            })()}
                           </span>
-                          {nav?.isNovel && (
+                          {lp.comicMeta?.isComic && (
+                            <span className="status-badge done" data-comic-detected-badge="true">
+                              {lp.comicMeta.isDirectImage
+                                ? strings.mangaDirectImageBadge
+                                : `${strings.mangaDetectedBadge} · ${lp.comicMeta.pageCount} ${strings.mangaPageUnit}`}
+                            </span>
+                          )}
+                          {nav?.isNovel && !lp.comicMeta?.isComic && (
                             <span className="status-badge done">
                               {nav.isTocPage ? strings.ebookTocBadge : strings.novelDetectedBadge}
                               {nav.chapterLabel ? ` · ${nav.chapterLabel}` : ''}
@@ -2513,14 +2839,14 @@ export function App() {
                             type="button"
                             className="btn-primary pressable"
                             onMouseEnter={() =>
-                              prefetchNextChapterTranslatedDirect(
+                              prefetchNextChapterLazy(
                                 nav?.isTocPage && nav.firstUrl ? nav.firstUrl : lp.url,
                                 turn.mode,
                                 lp.titleId
                               )
                             }
                             onFocus={() =>
-                              prefetchNextChapterTranslatedDirect(
+                              prefetchNextChapterLazy(
                                 nav?.isTocPage && nav.firstUrl ? nav.firstUrl : lp.url,
                                 turn.mode,
                                 lp.titleId
@@ -2535,9 +2861,11 @@ export function App() {
                             }
                           >
                             <IconBook size={17} />
-                            {nav?.isTocPage && nav.firstUrl
-                              ? strings.startReadingCh1
-                              : strings.openFullTranslatedPage}
+                            {lp.comicMeta?.isComic
+                              ? strings.openMangaReaderBtn
+                              : nav?.isTocPage && nav.firstUrl
+                                ? strings.startReadingCh1
+                                : strings.openFullTranslatedPage}
                           </button>
                           <button
                             type="button"
@@ -2554,30 +2882,39 @@ export function App() {
                           <button
                             type="button"
                             className="btn-secondary pressable"
-                            onClick={() => {
-                              navigator.clipboard?.writeText(
-                                `${lp.titleDst}\n\n${fullArticleText}`
-                              );
-                              pushToast(strings.copiedToast);
-                            }}
+                            onClick={() =>
+                              copyToClipboardWithToast(`${lp.titleDst}\n\n${fullArticleText}`)
+                            }
                           >
                             <IconCopy size={16} />
                             {strings.copyTranslation}
                           </button>
                         </div>
 
-                        <div
-                          className={`assistant-prose ${turnTgt === 'ja' ? 'is-jp' : ''}`}
-                          style={{
-                            fontSize: '17px',
-                            lineHeight: '29px',
-                            paddingTop: '8px',
-                            borderTop: '1px solid var(--border)',
-                          }}
-                          lang={turnTgt}
-                        >
-                          {fullArticleText}
-                        </div>
+                        {lp.firstImageResult ? (
+                          <Suspense fallback={null}>
+                            <ImageResultCard
+                              result={lp.firstImageResult}
+                              fileName={lp.titleDst || lp.host}
+                              resolvedTheme={resolvedTheme}
+                              strings={strings}
+                              onCopy={(txt) => copyToClipboardWithToast(txt)}
+                            />
+                          </Suspense>
+                        ) : (
+                          <div
+                            className={`assistant-prose ${turnTgt === 'ja' ? 'is-jp' : ''}`}
+                            style={{
+                              fontSize: '17px',
+                              lineHeight: '29px',
+                              paddingTop: '8px',
+                              borderTop: '1px solid var(--border)',
+                            }}
+                            lang={turnTgt}
+                          >
+                            {fullArticleText}
+                          </div>
+                        )}
 
                         {nav && (nav.prevUrl || nav.nextUrl || nav.chapters?.length || nav.firstUrl) && (
                           <div className="novel-inline-nav">
@@ -2614,14 +2951,14 @@ export function App() {
                                 className="btn-primary pressable"
                                 disabled={isFetchingLink}
                                 onMouseEnter={() =>
-                                  prefetchNextChapterTranslatedDirect(
+                                  prefetchNextChapterLazy(
                                     nav.nextUrl!,
                                     turn.mode,
                                     lp.titleId
                                   )
                                 }
                                 onFocus={() =>
-                                  prefetchNextChapterTranslatedDirect(
+                                  prefetchNextChapterLazy(
                                     nav.nextUrl!,
                                     turn.mode,
                                     lp.titleId
@@ -2679,15 +3016,14 @@ export function App() {
                             {turn.fileName || 'Dokumen'}
                           </div>
                           <span
-                            className={`status-badge ${
-                              turn.state === 'done'
-                                ? 'done'
-                                : turn.state === 'error'
-                                  ? 'error'
-                                  : turn.state === 'running'
-                                    ? 'running'
-                                    : 'warning'
-                            }`}
+                            className={`status-badge ${turn.state === 'done'
+                              ? 'done'
+                              : turn.state === 'error'
+                                ? 'error'
+                                : turn.state === 'running'
+                                  ? 'running'
+                                  : 'warning'
+                              }`}
                           >
                             {turn.state === 'done'
                               ? 'Selesai'
@@ -2703,7 +3039,10 @@ export function App() {
 
                         {turn.state === 'running' && (
                           <div className="progress-track">
-                            <div className="progress-fill" style={{ width: `${pct}%` }} />
+                            <div
+                              className="progress-fill"
+                              style={{ transform: `scaleX(${Math.max(0, Math.min(1, pct / 100))})` }}
+                            />
                           </div>
                         )}
 
@@ -2739,14 +3078,20 @@ export function App() {
                             <button
                               type="button"
                               className="btn-primary pressable"
-                              onClick={() =>
-                                resumeInterruptedTurn({
-                                  user,
-                                  cid: activeCid,
-                                  mid: turn.id,
-                                  onEvent: () => {},
-                                })
-                              }
+                              onClick={async () => {
+                                try {
+                                  await resumeInterruptedTurn({
+                                    user,
+                                    cid: activeCid,
+                                    mid: turn.id,
+                                    onEvent: () => { },
+                                  });
+                                } catch (err) {
+                                  pushToast(
+                                    humanizeFetchError(err, 'Gagal melanjutkan terjemahan.')
+                                  );
+                                }
+                              }}
                             >
                               {strings.resumeTranslation}
                             </button>
@@ -2782,23 +3127,29 @@ export function App() {
                                   type="button"
                                   className="btn-secondary pressable"
                                   onClick={async () => {
-                                    const { blob, filename } = await downloadExportedTurn({
-                                      user,
-                                      cid: activeCid,
-                                      mid: turn.id,
-                                      fmt,
-                                      theme: resolvedTheme,
-                                      fallbackSentences: turn.sentences,
-                                      fallbackText: turn.text,
-                                    });
-                                    const url = URL.createObjectURL(blob);
-                                    const a = document.createElement('a');
-                                    a.href = url;
-                                    a.download = filename;
-                                    document.body.appendChild(a);
-                                    a.click();
-                                    a.remove();
-                                    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+                                    try {
+                                      const { blob, filename } = await downloadExportedTurn({
+                                        user,
+                                        cid: activeCid,
+                                        mid: turn.id,
+                                        fmt,
+                                        theme: resolvedTheme,
+                                        fallbackSentences: turn.sentences,
+                                        fallbackText: turn.text,
+                                      });
+                                      const url = URL.createObjectURL(blob);
+                                      const a = document.createElement('a');
+                                      a.href = url;
+                                      a.download = filename;
+                                      document.body.appendChild(a);
+                                      a.click();
+                                      a.remove();
+                                      window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+                                    } catch (err) {
+                                      pushToast(
+                                        humanizeFetchError(err, 'Gagal mengunduh berkas.')
+                                      );
+                                    }
                                   }}
                                 >
                                   <IconDownload size={16} />.{fmt}
@@ -2884,14 +3235,13 @@ export function App() {
                               <button
                                 key={chip.surface}
                                 type="button"
-                                className={`name-chip pressable ${
-                                  chip.confirmed ? 'locked' : ''
-                                }`}
+                                className={`name-chip pressable ${chip.confirmed ? 'locked' : ''
+                                  }`}
                                 onClick={async () => {
                                   const tid =
                                     turn.titleId ||
                                     activeConversation?.titleId ||
-                                    't_rashomon';
+                                    't_default';
                                   await upsertUserGlossaryEntry(tid, {
                                     surface: chip.surface,
                                     kind: chip.kind,
@@ -2929,10 +3279,7 @@ export function App() {
                             <button
                               type="button"
                               className="action-chip-btn pressable"
-                              onClick={() => {
-                                navigator.clipboard?.writeText(turn.text);
-                                pushToast(strings.copiedToast);
-                              }}
+                              onClick={() => copyToClipboardWithToast(turn.text)}
                             >
                               <IconCopy size={15} />
                               {strings.copyTranslation}
@@ -2950,10 +3297,7 @@ export function App() {
                             <button
                               type="button"
                               className="action-chip-btn pressable"
-                              onClick={() => {
-                                navigator.clipboard?.writeText(turn.text);
-                                pushToast(strings.copiedToast);
-                              }}
+                              onClick={() => copyToClipboardWithToast(turn.text)}
                             >
                               <IconShare size={15} />
                               {strings.shareChat}
@@ -2980,370 +3324,368 @@ export function App() {
           accountMenuOpen ||
           Boolean(langPickerSide) ||
           Boolean(historyMenuTarget)) && (
-        <>
-          <div className="popover-dismiss-backdrop" onClick={closeAllPopovers} />
+          <>
+            <div className="popover-dismiss-backdrop" onClick={closeAllPopovers} />
 
-          {moreMenuOpen && (
-            <div
-              className="context-popover glass-regular-surface"
-              style={{
-                width: '224px',
-                left: `${Math.min(
-                  window.innerWidth - 236,
-                  Math.max(12, moreMenuRect?.left || 14)
-                )}px`,
-                top: `${Math.min(
-                  window.innerHeight - 170,
-                  Math.max(12, (moreMenuRect?.bottom || 152) + 6)
-                )}px`,
-              }}
-              role="menu"
-            >
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => navigate('/berkas')}
-              >
-                <span className="menu-item-left">
-                  <IconFolder size={18} />
-                  {strings.myFiles}
-                </span>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => navigate('/kamus')}
-              >
-                <span className="menu-item-left">
-                  <IconBook size={18} />
-                  {strings.glossary}
-                </span>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => {
-                  setMoreMenuOpen(false);
-                  setShortcutsOpen(true);
+            {moreMenuOpen && (
+              <div
+                className="context-popover glass-regular-surface"
+                style={{
+                  width: '224px',
+                  left: `${Math.min(
+                    window.innerWidth - 236,
+                    Math.max(12, moreMenuRect?.left || 14)
+                  )}px`,
+                  top: `${Math.min(
+                    window.innerHeight - 170,
+                    Math.max(12, (moreMenuRect?.bottom || 152) + 6)
+                  )}px`,
                 }}
+                role="menu"
               >
-                <span className="menu-item-left">
-                  <IconKeyboard size={18} />
-                  {strings.shortcuts}
-                </span>
-                <span style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
-                  Ctrl+/
-                </span>
-              </button>
-            </div>
-          )}
-
-          {accountMenuOpen && (
-            <div
-              className="context-popover glass-regular-surface"
-              style={{
-                width: '236px',
-                left: `${Math.min(
-                  window.innerWidth - 248,
-                  Math.max(12, accountMenuRect?.left || 12)
-                )}px`,
-                bottom: `${Math.max(
-                  12,
-                  window.innerHeight - (accountMenuRect?.top || window.innerHeight - 64) + 8
-                )}px`,
-              }}
-              role="menu"
-            >
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => {
-                  setAccountMenuOpen(false);
-                  setSettingsOpen(true);
-                }}
-              >
-                <span className="menu-item-left">
-                  <IconSettings size={18} />
-                  {strings.settings}
-                </span>
-                <span style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>Ctrl+,</span>
-              </button>
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => handleChangeUiLang(settings.uiLang === 'id' ? 'en' : 'id')}
-              >
-                <span className="menu-item-left">
-                  <IconGlobe size={18} />
-                  {strings.uiLanguage}
-                </span>
-                <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--accent)' }}>
-                  {settings.uiLang === 'id' ? 'ID \u2192 EN' : 'EN \u2192 ID'}
-                </span>
-              </button>
-
-              {pwaState.shouldShowInstallButton && (
                 <button
                   type="button"
                   role="menuitem"
                   className="menu-item-btn"
-                  onClick={handleInstallAppClick}
+                  onClick={() => navigate('/berkas')}
                 >
                   <span className="menu-item-left">
-                    <IconDownload size={18} />
-                    {strings.installAppMenu}
+                    <IconFolder size={18} />
+                    {strings.myFiles}
                   </span>
                 </button>
-              )}
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => {
-                  setAccountMenuOpen(false);
-                  setInfoModalKind('help');
-                }}
-              >
-                <span className="menu-item-left">
-                  <IconHelp size={18} />
-                  {strings.help}
-                </span>
-              </button>
-
-              <a
-                role="menuitem"
-                className="menu-item-btn"
-                href="https://github.com/hanifp62/tranx/issues"
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={() => setAccountMenuOpen(false)}
-              >
-                <span className="menu-item-left">
-                  <IconMail size={18} />
-                  {strings.sendFeedback}
-                </span>
-              </a>
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => {
-                  setAccountMenuOpen(false);
-                  setInfoModalKind('about');
-                }}
-              >
-                <span className="menu-item-left">
-                  <IconInfo size={18} />
-                  {strings.learnMore}
-                </span>
-              </button>
-
-              <div className="menu-divider" />
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn danger"
-                onClick={() => {
-                  setAccountMenuOpen(false);
-                  setLogoutOpen(true);
-                }}
-              >
-                <span className="menu-item-left">
-                  <IconLogout size={18} />
-                  {strings.signOut}
-                </span>
-              </button>
-            </div>
-          )}
-
-          {!isMobile && langPickerSide === 'source' && (
-            <div
-              className="context-popover glass-regular-surface"
-              style={{
-                width: '240px',
-                left: `${Math.min(
-                  window.innerWidth - 252,
-                  Math.max(12, langMenuRect?.left || 276)
-                )}px`,
-                top: `${Math.min(
-                  window.innerHeight - 230,
-                  Math.max(12, (langMenuRect?.bottom || 48) + 6)
-                )}px`,
-              }}
-              role="menu"
-              aria-label={strings.sourceLangTitle}
-            >
-              <div
-                style={{
-                  padding: '4px 10px 6px 10px',
-                  fontSize: '12px',
-                  color: 'var(--text-subtle)',
-                }}
-              >
-                {strings.sourceAutoHint}
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={() => navigate('/kamus')}
+                >
+                  <span className="menu-item-left">
+                    <IconBook size={18} />
+                    {strings.glossary}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={() => {
+                    setMoreMenuOpen(false);
+                    setShortcutsOpen(true);
+                  }}
+                >
+                  <span className="menu-item-left">
+                    <IconKeyboard size={18} />
+                    {strings.shortcuts}
+                  </span>
+                  <span style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>
+                    Ctrl+/
+                  </span>
+                </button>
               </div>
-              {(
-                [
-                  ['auto', strings.langAuto],
-                  ['id', strings.langId],
-                  ['en', strings.langEn],
-                  ['ja', strings.langJa],
-                ] as const
-              ).map(([code, label]) => (
-                <button
-                  key={code}
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={currentSrcLang === code}
-                  className="menu-item-btn"
-                  onClick={() => handleSelectSourceLang(code)}
-                >
-                  <span>{label}</span>
-                  {currentSrcLang === code && (
-                    <IconCheck size={17} style={{ color: 'var(--accent)' }} />
-                  )}
-                </button>
-              ))}
-            </div>
-          )}
+            )}
 
-          {!isMobile && langPickerSide === 'target' && (
-            <div
-              className="context-popover glass-regular-surface"
-              style={{
-                width: '216px',
-                left: `${Math.min(
-                  window.innerWidth - 228,
-                  Math.max(12, langMenuRect?.left || 380)
-                )}px`,
-                top: `${Math.min(
-                  window.innerHeight - 190,
-                  Math.max(12, (langMenuRect?.bottom || 48) + 6)
-                )}px`,
-              }}
-              role="menu"
-              aria-label={strings.targetLangTitle}
-            >
-              {(
-                [
-                  ['id', strings.langId],
-                  ['en', strings.langEn],
-                  ['ja', strings.langJa],
-                ] as const
-              ).map(([code, label]) => (
-                <button
-                  key={code}
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={currentTgtLang === code}
-                  className="menu-item-btn"
-                  onClick={() => handleSelectTargetLang(code)}
-                >
-                  <span>{label}</span>
-                  {currentTgtLang === code && (
-                    <IconCheck size={17} style={{ color: 'var(--accent)' }} />
-                  )}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {!isMobile && historyMenuTarget && (
-            <div
-              className="context-popover glass-regular-surface"
-              style={{
-                width: '216px',
-                left: `${Math.min(
-                  window.innerWidth - 228,
-                  Math.max(12, historyMenuTarget.rect?.right || 220)
-                )}px`,
-                top: `${Math.min(
-                  window.innerHeight - 210,
-                  Math.max(12, historyMenuTarget.rect?.top || 120)
-                )}px`,
-              }}
-              role="menu"
-            >
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => handleTogglePin(historyMenuTarget.conv)}
-              >
-                <span className="menu-item-left">
-                  {historyMenuTarget.conv.pinned ? (
-                    <IconPinOff size={18} />
-                  ) : (
-                    <IconPin size={18} />
-                  )}
-                  {historyMenuTarget.conv.pinned ? strings.unpinChat : strings.pinChat}
-                </span>
-              </button>
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => {
-                  const target = historyMenuTarget.conv;
-                  setHistoryMenuTarget(null);
-                  setRenameTarget(target);
+            {accountMenuOpen && (
+              <div
+                className="context-popover glass-regular-surface"
+                style={{
+                  width: '236px',
+                  left: `${Math.min(
+                    window.innerWidth - 248,
+                    Math.max(12, accountMenuRect?.left || 12)
+                  )}px`,
+                  bottom: `${Math.max(
+                    12,
+                    window.innerHeight - (accountMenuRect?.top || window.innerHeight - 64) + 8
+                  )}px`,
                 }}
+                role="menu"
               >
-                <span className="menu-item-left">
-                  <IconEdit size={18} />
-                  {strings.renameChat}
-                </span>
-              </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    setSettingsOpen(true);
+                  }}
+                >
+                  <span className="menu-item-left">
+                    <IconSettings size={18} />
+                    {strings.settings}
+                  </span>
+                  <span style={{ fontSize: '12px', color: 'var(--text-subtle)' }}>Ctrl+,</span>
+                </button>
 
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn"
-                onClick={() => handleShareConversation(historyMenuTarget.conv)}
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={() => handleChangeUiLang(settings.uiLang === 'id' ? 'en' : 'id')}
+                >
+                  <span className="menu-item-left">
+                    <IconGlobe size={18} />
+                    {strings.uiLanguage}
+                  </span>
+                  <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--accent)' }}>
+                    {settings.uiLang === 'id' ? 'ID \u2192 EN' : 'EN \u2192 ID'}
+                  </span>
+                </button>
+
+                {pwaState.shouldShowInstallButton && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="menu-item-btn"
+                    onClick={handleInstallAppClick}
+                  >
+                    <span className="menu-item-left">
+                      <IconDownload size={18} />
+                      {strings.installAppMenu}
+                    </span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    setInfoModalKind('help');
+                  }}
+                >
+                  <span className="menu-item-left">
+                    <IconHelp size={18} />
+                    {strings.help}
+                  </span>
+                </button>
+
+                <a
+                  role="menuitem"
+                  className="menu-item-btn"
+                  href="https://github.com/hanifp62/tranx/issues"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => setAccountMenuOpen(false)}
+                >
+                  <span className="menu-item-left">
+                    <IconMail size={18} />
+                    {strings.sendFeedback}
+                  </span>
+                </a>
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    setInfoModalKind('about');
+                  }}
+                >
+                  <span className="menu-item-left">
+                    <IconInfo size={18} />
+                    {strings.learnMore}
+                  </span>
+                </button>
+
+                <div className="menu-divider" />
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn danger"
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    setLogoutOpen(true);
+                  }}
+                >
+                  <span className="menu-item-left">
+                    <IconLogout size={18} />
+                    {strings.signOut}
+                  </span>
+                </button>
+              </div>
+            )}
+
+            {!isMobile && langPickerSide === 'source' && (
+              <div
+                className="context-popover glass-regular-surface"
+                style={{
+                  width: '240px',
+                  left: `${Math.min(
+                    window.innerWidth - 252,
+                    Math.max(12, langMenuRect?.left || 276)
+                  )}px`,
+                  top: `${Math.min(
+                    window.innerHeight - 230,
+                    Math.max(12, (langMenuRect?.bottom || 48) + 6)
+                  )}px`,
+                }}
+                role="menu"
+                aria-label={strings.sourceLangTitle}
               >
-                <span className="menu-item-left">
-                  <IconShare size={18} />
-                  {strings.shareChat}
-                </span>
-              </button>
+                <div
+                  style={{
+                    padding: '4px 10px 6px 10px',
+                    fontSize: '12px',
+                    color: 'var(--text-subtle)',
+                  }}
+                >
+                  {strings.sourceAutoHint}
+                </div>
+                {(
+                  [
+                    ['auto', strings.langAuto],
+                    ['id', strings.langId],
+                    ['en', strings.langEn],
+                    ['ja', strings.langJa],
+                  ] as const
+                ).map(([code, label]) => (
+                  <button
+                    key={code}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={currentSrcLang === code}
+                    className="menu-item-btn"
+                    onClick={() => handleSelectSourceLang(code)}
+                  >
+                    <span>{label}</span>
+                    {currentSrcLang === code && (
+                      <IconCheck size={17} style={{ color: 'var(--accent)' }} />
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
 
-              <div className="menu-divider" />
-
-              <button
-                type="button"
-                role="menuitem"
-                className="menu-item-btn danger"
-                onClick={() => handleDeleteConversation(historyMenuTarget.conv)}
+            {!isMobile && langPickerSide === 'target' && (
+              <div
+                className="context-popover glass-regular-surface"
+                style={{
+                  width: '216px',
+                  left: `${Math.min(
+                    window.innerWidth - 228,
+                    Math.max(12, langMenuRect?.left || 380)
+                  )}px`,
+                  top: `${Math.min(
+                    window.innerHeight - 190,
+                    Math.max(12, (langMenuRect?.bottom || 48) + 6)
+                  )}px`,
+                }}
+                role="menu"
+                aria-label={strings.targetLangTitle}
               >
-                <span className="menu-item-left">
-                  <IconTrash size={18} />
-                  {strings.deleteChat}
-                </span>
-              </button>
-            </div>
-          )}
-        </>
-      )}
+                {(
+                  [
+                    ['id', strings.langId],
+                    ['en', strings.langEn],
+                    ['ja', strings.langJa],
+                  ] as const
+                ).map(([code, label]) => (
+                  <button
+                    key={code}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={currentTgtLang === code}
+                    className="menu-item-btn"
+                    onClick={() => handleSelectTargetLang(code)}
+                  >
+                    <span>{label}</span>
+                    {currentTgtLang === code && (
+                      <IconCheck size={17} style={{ color: 'var(--accent)' }} />
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {!isMobile && historyMenuTarget && (
+              <div
+                className="context-popover glass-regular-surface"
+                style={{
+                  width: '216px',
+                  left: `${Math.min(
+                    window.innerWidth - 228,
+                    Math.max(12, historyMenuTarget.rect?.right || 220)
+                  )}px`,
+                  top: `${Math.min(
+                    window.innerHeight - 210,
+                    Math.max(12, historyMenuTarget.rect?.top || 120)
+                  )}px`,
+                }}
+                role="menu"
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={() => handleTogglePin(historyMenuTarget.conv)}
+                >
+                  <span className="menu-item-left">
+                    {historyMenuTarget.conv.pinned ? (
+                      <IconPinOff size={18} />
+                    ) : (
+                      <IconPin size={18} />
+                    )}
+                    {historyMenuTarget.conv.pinned ? strings.unpinChat : strings.pinChat}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={() => {
+                    const target = historyMenuTarget.conv;
+                    setHistoryMenuTarget(null);
+                    setRenameTarget(target);
+                  }}
+                >
+                  <span className="menu-item-left">
+                    <IconEdit size={18} />
+                    {strings.renameChat}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn"
+                  onClick={() => handleShareConversation(historyMenuTarget.conv)}
+                >
+                  <span className="menu-item-left">
+                    <IconShare size={18} />
+                    {strings.shareChat}
+                  </span>
+                </button>
+
+                <div className="menu-divider" />
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="menu-item-btn danger"
+                  onClick={() => handleDeleteConversation(historyMenuTarget.conv)}
+                >
+                  <span className="menu-item-left">
+                    <IconTrash size={18} />
+                    {strings.deleteChat}
+                  </span>
+                </button>
+              </div>
+            )}
+          </>
+        )}
 
       {/* Mobile K/Lembar bawah for "Lainnya" (More) Menu */}
       {isMobile && moreMenuOpen && (
         <div className="bottom-sheet-backdrop" onClick={() => setMoreMenuOpen(false)}>
-          <div
+          <FocusTrappedDialog
             className="bottom-sheet glass-regular-surface"
-            role="dialog"
-            aria-modal="true"
-            aria-label={strings.sidebarMore}
-            onClick={(e) => e.stopPropagation()}
+            ariaLabel={strings.sidebarMore}
+            onClose={() => setMoreMenuOpen(false)}
           >
             <button
               type="button"
@@ -3381,19 +3723,17 @@ export function App() {
               <IconKeyboard size={20} />
               <span>{strings.shortcuts}</span>
             </button>
-          </div>
+          </FocusTrappedDialog>
         </div>
       )}
 
       {/* Mobile K/Lembar bawah for Account Menu */}
       {isMobile && accountMenuOpen && (
         <div className="bottom-sheet-backdrop" onClick={() => setAccountMenuOpen(false)}>
-          <div
+          <FocusTrappedDialog
             className="bottom-sheet glass-regular-surface"
-            role="dialog"
-            aria-modal="true"
-            aria-label={user.displayName || user.email || strings.settingsAccount}
-            onClick={(e) => e.stopPropagation()}
+            ariaLabel={user.displayName || user.email || strings.settingsAccount}
+            onClose={() => setAccountMenuOpen(false)}
           >
             <button
               type="button"
@@ -3489,7 +3829,7 @@ export function App() {
               <IconLogout size={20} />
               <span>{strings.signOut}</span>
             </button>
-          </div>
+          </FocusTrappedDialog>
         </div>
       )}
 
@@ -3499,12 +3839,10 @@ export function App() {
           className="bottom-sheet-backdrop"
           onClick={() => setHistoryMenuTarget(null)}
         >
-          <div
+          <FocusTrappedDialog
             className="bottom-sheet glass-regular-surface"
-            role="dialog"
-            aria-modal="true"
-            aria-label={historyMenuTarget.conv.title}
-            onClick={(e) => e.stopPropagation()}
+            ariaLabel={historyMenuTarget.conv.title}
+            onClose={() => setHistoryMenuTarget(null)}
           >
             <button
               type="button"
@@ -3576,23 +3914,21 @@ export function App() {
               <IconTrash size={20} />
               <span>{strings.deleteHistoryMobile}</span>
             </button>
-          </div>
+          </FocusTrappedDialog>
         </div>
       )}
 
       {/* Mobile K/Lembar bawah for Source / Target Language Picker (H13) */}
       {isMobile && langPickerSide && (
         <div className="bottom-sheet-backdrop" onClick={() => setLangPickerSide(null)}>
-          <div
+          <FocusTrappedDialog
             className="bottom-sheet glass-regular-surface"
-            role="dialog"
-            aria-modal="true"
-            aria-label={
+            ariaLabel={
               langPickerSide === 'source'
                 ? strings.sourceLangTitle
                 : strings.targetLangTitle
             }
-            onClick={(e) => e.stopPropagation()}
+            onClose={() => setLangPickerSide(null)}
           >
             <button
               type="button"
@@ -3616,45 +3952,45 @@ export function App() {
             </div>
             {langPickerSide === 'source'
               ? (
-                  [
-                    ['auto', strings.langAuto],
-                    ['id', strings.langId],
-                    ['en', strings.langEn],
-                    ['ja', strings.langJa],
-                  ] as const
-                ).map(([code, label]) => (
-                  <button
-                    key={code}
-                    type="button"
-                    className="sheet-row-btn"
-                    onClick={() => handleSelectSourceLang(code)}
-                  >
-                    <span style={{ flex: 1 }}>{label}</span>
-                    {currentSrcLang === code && (
-                      <IconCheck size={20} style={{ color: 'var(--accent)' }} />
-                    )}
-                  </button>
-                ))
+                [
+                  ['auto', strings.langAuto],
+                  ['id', strings.langId],
+                  ['en', strings.langEn],
+                  ['ja', strings.langJa],
+                ] as const
+              ).map(([code, label]) => (
+                <button
+                  key={code}
+                  type="button"
+                  className="sheet-row-btn"
+                  onClick={() => handleSelectSourceLang(code)}
+                >
+                  <span style={{ flex: 1 }}>{label}</span>
+                  {currentSrcLang === code && (
+                    <IconCheck size={20} style={{ color: 'var(--accent)' }} />
+                  )}
+                </button>
+              ))
               : (
-                  [
-                    ['id', strings.langId],
-                    ['en', strings.langEn],
-                    ['ja', strings.langJa],
-                  ] as const
-                ).map(([code, label]) => (
-                  <button
-                    key={code}
-                    type="button"
-                    className="sheet-row-btn"
-                    onClick={() => handleSelectTargetLang(code)}
-                  >
-                    <span style={{ flex: 1 }}>{label}</span>
-                    {currentTgtLang === code && (
-                      <IconCheck size={20} style={{ color: 'var(--accent)' }} />
-                    )}
-                  </button>
-                ))}
-          </div>
+                [
+                  ['id', strings.langId],
+                  ['en', strings.langEn],
+                  ['ja', strings.langJa],
+                ] as const
+              ).map(([code, label]) => (
+                <button
+                  key={code}
+                  type="button"
+                  className="sheet-row-btn"
+                  onClick={() => handleSelectTargetLang(code)}
+                >
+                  <span style={{ flex: 1 }}>{label}</span>
+                  {currentTgtLang === code && (
+                    <IconCheck size={20} style={{ color: 'var(--accent)' }} />
+                  )}
+                </button>
+              ))}
+          </FocusTrappedDialog>
         </div>
       )}
 
@@ -3664,12 +4000,10 @@ export function App() {
           className="bottom-sheet-backdrop"
           onClick={() => setMobileTurnSheet(null)}
         >
-          <div
+          <FocusTrappedDialog
             className="bottom-sheet glass-regular-surface"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Aksi hasil terjemahan"
-            onClick={(e) => e.stopPropagation()}
+            ariaLabel="Aksi hasil terjemahan"
+            onClose={() => setMobileTurnSheet(null)}
           >
             <button
               type="button"
@@ -3683,9 +4017,9 @@ export function App() {
               type="button"
               className="sheet-row-btn"
               onClick={() => {
-                navigator.clipboard?.writeText(mobileTurnSheet.text);
+                const txt = mobileTurnSheet.text;
                 setMobileTurnSheet(null);
-                pushToast(strings.copiedToast);
+                copyToClipboardWithToast(txt);
               }}
             >
               <IconCopy size={20} />
@@ -3709,15 +4043,15 @@ export function App() {
               type="button"
               className="sheet-row-btn"
               onClick={() => {
-                navigator.clipboard?.writeText(mobileTurnSheet.text);
+                const txt = mobileTurnSheet.text;
                 setMobileTurnSheet(null);
-                pushToast(strings.copiedToast);
+                copyToClipboardWithToast(txt);
               }}
             >
               <IconShare size={20} />
               <span>{strings.shareChat}</span>
             </button>
-          </div>
+          </FocusTrappedDialog>
         </div>
       )}
 
@@ -3743,8 +4077,12 @@ export function App() {
             onClose={() => setLogoutOpen(false)}
             onConfirm={async () => {
               setLogoutOpen(false);
-              await logoutSession();
-              navigate('/masuk');
+              try {
+                await logoutSession();
+                navigate('/masuk');
+              } catch (err) {
+                pushToast(humanizeFetchError(err, 'Gagal keluar dari sesi.'));
+              }
             }}
           />
         )}
@@ -3757,7 +4095,11 @@ export function App() {
             onSave={async (nextTitle) => {
               const target = renameTarget;
               setRenameTarget(null);
-              await renameConversationTitle(target.id, nextTitle);
+              try {
+                await renameConversationTitle(target.id, nextTitle);
+              } catch (err) {
+                pushToast(humanizeFetchError(err, 'Gagal mengubah judul percakapan.'));
+              }
             }}
           />
         )}
@@ -3774,18 +4116,16 @@ export function App() {
       {inlineChaptersNav && (() => {
         const inlineMap =
           inlineTranslatedTitlesByKey[
-            `${inlineChaptersNav.tocKey}::${inlineChaptersNav.mode}`
+          `${inlineChaptersNav.tocKey}::${inlineChaptersNav.mode}`
           ] || {};
         const inlineSeriesTitle =
           inlineMap.__seriesTitle__ || inlineChaptersNav.nav.seriesTitle || strings.chapterListBtn;
         return (
           <div className="scrim-backdrop" onClick={() => setInlineChaptersNav(null)}>
-            <div
+            <FocusTrappedDialog
               className="modal-dialog"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="inline-chapters-title"
-              onClick={(e) => e.stopPropagation()}
+              ariaLabelledBy="inline-chapters-title"
+              onClose={() => setInlineChaptersNav(null)}
             >
               <div className="modal-header">
                 <h2 id="inline-chapters-title" className="modal-title">
@@ -3808,6 +4148,7 @@ export function App() {
                   <input
                     type="search"
                     className="field-input"
+                    aria-label={strings.searchChaptersPlaceholder}
                     placeholder={strings.searchChaptersPlaceholder}
                     value={inlineChapterQuery}
                     onChange={(e) => setInlineChapterQuery(e.target.value)}
@@ -3854,19 +4195,17 @@ export function App() {
                   </div>
                 )}
               </div>
-            </div>
+            </FocusTrappedDialog>
           </div>
         );
       })()}
 
       {installGuideOpen && (
         <div className="scrim-backdrop" onClick={() => setInstallGuideOpen(false)}>
-          <div
+          <FocusTrappedDialog
             className="modal-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="install-guide-title"
-            onClick={(e) => e.stopPropagation()}
+            ariaLabelledBy="install-guide-title"
+            onClose={() => setInstallGuideOpen(false)}
           >
             <div className="modal-header">
               <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -3916,31 +4255,64 @@ export function App() {
                 {strings.closeLabel}
               </button>
             </div>
+          </FocusTrappedDialog>
+        </div>
+      )}
+
+      {swUpdateReady && (
+        <div className="sw-update-banner" role="status" aria-live="polite">
+          <span>
+            {settings.uiLang === 'en'
+              ? 'A new version of tranX is ready.'
+              : 'Versi baru tranX siap diterapkan.'}
+          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <button
+              type="button"
+              className="btn-primary pressable"
+              onClick={() => {
+                setSwUpdateReady(false);
+                window.dispatchEvent(new CustomEvent('tranx:sw-apply-requested'));
+                void swApplyUpdateRef.current?.();
+              }}
+            >
+              {settings.uiLang === 'en' ? 'Update now' : 'Perbarui'}
+            </button>
+            <button
+              type="button"
+              className="icon-square-btn"
+              aria-label={strings.closeLabel}
+              onClick={() => setSwUpdateReady(false)}
+            >
+              <IconX size={16} />
+            </button>
           </div>
         </div>
       )}
 
-      {toasts.length > 0 && (
-        <div className="toast-container" role="status" aria-live="polite">
-          {toasts.map((t) => (
-            <div key={t.id} className="toast-bar">
-              <span>{t.message}</span>
-              {t.undoLabel && t.onUndo && (
-                <button
-                  type="button"
-                  className="toast-undo-btn"
-                  onClick={() => {
-                    t.onUndo?.();
-                    setToasts((prev) => prev.filter((x) => x.id !== t.id));
-                  }}
-                >
-                  {t.undoLabel}
-                </button>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
+      <div
+        className={toasts.length > 0 ? 'toast-container' : 'sr-only'}
+        role="status"
+        aria-live="polite"
+      >
+        {toasts.map((t) => (
+          <div key={t.id} className="toast-bar">
+            <span>{t.message}</span>
+            {t.undoLabel && t.onUndo && (
+              <button
+                type="button"
+                className="toast-undo-btn"
+                onClick={() => {
+                  t.onUndo?.();
+                  setToasts((prev) => prev.filter((x) => x.id !== t.id));
+                }}
+              >
+                {t.undoLabel}
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

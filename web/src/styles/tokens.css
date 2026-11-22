@@ -28,6 +28,17 @@
   --overlay: rgba(20, 25, 23, 0.40);
   --brand-tile: #17695B;
   --brand-on-tile: #F4FBF8;
+  --app-theme-color: #FAFBFA;
+
+  /* Tier-2 Reading Canvas Default Fallbacks (Scoped Override in .ebook-reader-surface) */
+  --eb-bg: #FAF6EE;
+  --eb-surface: #F2ECE0;
+  --eb-ink: #221F1A;
+  --eb-muted: #5C564C;
+  --eb-accent: #166658;
+  --eb-border: #DDD5C7;
+  --eb-border-strong: #756E61;
+  --eb-gutter: rgba(34, 31, 26, 0.10);
 
   /* Apple Liquid Glass Optical Tokens (Terang) */
   --glass-surface: rgba(255, 255, 255, 0.85);
@@ -106,6 +117,17 @@
   --overlay: rgba(6, 9, 8, 0.64);
   --brand-tile: #17695B;
   --brand-on-tile: #F4FBF8;
+  --app-theme-color: #171B1A;
+
+  /* Tier-2 Reading Canvas Default Fallbacks (Dark) */
+  --eb-bg: #1E1F22;
+  --eb-surface: #27292E;
+  --eb-ink: #DDD8CE;
+  --eb-muted: #A39F97;
+  --eb-accent: #66CBB5;
+  --eb-border: #3A3D45;
+  --eb-border-strong: #828694;
+  --eb-gutter: rgba(255, 255, 255, 0.11);
 
   --glass-surface: rgba(31, 36, 35, 0.85);
   --glass-tray: rgba(39, 45, 43, 0.78);
@@ -120,19 +142,10 @@
 }
 
 @media (prefers-reduced-transparency: reduce) {
+
   :root,
   [data-tranx-v3="Gelap"] {
     --glass-surface: var(--surface);
     --glass-tray: var(--surface-hover);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 150ms !important;
-    transition-duration: 150ms !important;
-    scroll-behavior: auto !important;
   }
 }

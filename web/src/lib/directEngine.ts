@@ -1,7 +1,9 @@
 import type {
+  ComicLayoutMode,
   GlossaryEntry,
   ImageTranslationResult,
   LinkPreviewPayload,
+  MangaLinkMeta,
   ModePair,
   NameChipItem,
   NovelChapterLink,
@@ -9,9 +11,26 @@ import type {
   SentencePair,
   SourceLang,
   TargetLang,
+  TitleKind,
+  VisionBgTone,
   VisionBlock,
+  VisionBlockKind,
+  VisionBlockShape,
   WebReaderBundle,
 } from '../types';
+import {
+  MAX_MANGA_STRIP_HEIGHT,
+  MAX_MANGA_STRIP_PIXELS,
+  clusterOcrBoxes,
+  dedupeAndStitchTileBlocks,
+  extractMangaPagesFromHtml,
+  isLikelyDirectImageUrl,
+  normalizeComicAllCaps,
+  normalizeSocialImageUrl,
+  planVerticalStripTiles,
+  sortMangaReadingOrder,
+  type RawOcrBox,
+} from './mangaScanner';
 import {
   getOwnerGeminiKey,
   loadGlossaryEntriesOnce,
@@ -19,28 +38,49 @@ import {
   saveTurnMessageDirect,
   upsertConversationMeta,
 } from './firebase';
-import { idbDelete, idbGet, idbLoadRecent, idbPut, idbPutMany } from './perfCache';
+import {
+  getStorageHealthSnapshot,
+  idbDelete,
+  idbGet,
+  idbLoadRecent,
+  idbPut,
+  idbPutMany,
+} from './perfCache';
+import {
+  buildLiterarySystemPrompt,
+  buildSelfRepairPrompt,
+  evaluateSourceTargetQe,
+  naturalizeAndVerifyParagraph,
+  preprocessSourceForMt,
+  profileDocument,
+  restorePreMtTokens,
+  sanitizeZeroEmDashAndPunct,
+  saveSeriesDiscourseMemory,
+  type DiscourseProfile,
+} from './literaryPolish';
 import {
   AdaptiveTokenBucket,
   BoundedLruCache,
   EndpointCircuitBreaker,
   computeBackoffDelayMs,
   getDeviceRuntimeProfile,
+  shouldShedBackgroundLoad,
+  yieldToMain,
 } from './resilience';
 
-// Adaptive client-side rate limiters & circuit breakers calibrated for 5-10 concurrent users
+// Adaptive client-side rate limiters & named circuit breakers calibrated for 5-10 concurrent users
 const gtxBucket = new AdaptiveTokenBucket(6, 3.5, 1.0);
 const geminiBucket = new AdaptiveTokenBucket(4, 1.8, 0.5);
 const jinaBucket = new AdaptiveTokenBucket(3, 1.4, 0.4);
-const gtxPrimaryBreaker = new EndpointCircuitBreaker(3, 18_000);
-const gtxAltBreaker = new EndpointCircuitBreaker(3, 20_000);
-const geminiBreaker = new EndpointCircuitBreaker(2, 30_000);
+const gtxPrimaryBreaker = new EndpointCircuitBreaker(3, 18_000, 'gtx_primary');
+const gtxAltBreaker = new EndpointCircuitBreaker(3, 20_000, 'gtx_alt');
+const geminiBreaker = new EndpointCircuitBreaker(2, 30_000, 'gemini_api');
 const proxyBreakers = new Map<string, EndpointCircuitBreaker>();
 
 function getProxyBreaker(hostKey: string): EndpointCircuitBreaker {
   let b = proxyBreakers.get(hostKey);
   if (!b) {
-    b = new EndpointCircuitBreaker(2, 120_000);
+    b = new EndpointCircuitBreaker(2, 120_000, `proxy:${hostKey}`);
     proxyBreakers.set(hostKey, b);
   }
   return b;
@@ -61,126 +101,61 @@ function isMockOnlyLocalE2E(): boolean {
   }
 }
 
-const CJK_RE = /[\u3040-\u309f\u30a0-\u30ff\u3400-\u9fff]/;
-const CJK_SPAN_RE = /[\u3000-\u30ff\u3400-\u9fff\uff01-\uff60]+/g;
-const WORD_RE = /[A-Za-zÀ-ÿ']+/g;
+import {
+  CJK_RE,
+  CJK_SPAN_RE,
+  buildModePair,
+  classifyParagraphLanguage,
+  deriveSeriesTitleId,
+  detectLanguageLocal,
+  inspectBinaryMagicBytes,
+  isSingleStandaloneUrl,
+  normalizeWebUrl,
+  parseModePair,
+  scoreLatinWords,
+  swapModePair,
+  toSafeHttpUrl,
+  validateUploadedFileMagic,
+  type ParagraphLangClass,
+} from './langUtils';
 
-const ID_WORDS = new Set([
-  'yang', 'dan', 'di', 'ke', 'dari', 'ini', 'itu', 'untuk', 'dengan', 'tidak', 'tak',
-  'bisa', 'dapat', 'ada', 'saya', 'aku', 'kamu', 'kau', 'dia', 'ia', 'kami', 'kita',
-  'mereka', 'dalam', 'pada', 'adalah', 'ialah', 'sudah', 'telah', 'akan', 'sedang',
-  'atau', 'karena', 'sebab', 'seperti', 'juga', 'oleh', 'tentang', 'lebih', 'sangat',
-  'hanya', 'saja', 'cuma', 'selamat', 'pagi', 'malam', 'siang', 'sore', 'terima',
-  'kasih', 'bagaimana', 'mengapa', 'kenapa', 'kapan', 'dimana', 'apa', 'siapa', 'berapa',
-  'tetap', 'bukan', 'belum', 'masih', 'lagi', 'baru', 'lama', 'semua', 'seluruh',
-  'setiap', 'ketika', 'saat', 'waktu', 'hari', 'orang', 'rumah', 'jalan', 'cerita',
-  'bab', 'halaman', 'buku', 'baca', 'membaca', 'tulis', 'menulis', 'pergi', 'datang',
-  'lihat', 'melihat', 'kata', 'berkata', 'bilang', 'sambil', 'lalu', 'kemudian',
-  'setelah', 'sebelum', 'sampai', 'hingga', 'sejak', 'selama', 'tanpa', 'antara',
-  'tetapi', 'tapi', 'namun', 'jika', 'kalau', 'bila', 'agar', 'supaya', 'buat',
-  'mau', 'ingin', 'harus', 'boleh', 'perlu', 'pernah', 'pun', 'jadi', 'menjadi',
-  'sesuai', 'berubah', 'kakek', 'nenek', 'anak', 'ibu', 'ayah', 'teman', 'besar',
-  'kecil', 'baik', 'buruk', 'cantik', 'indah', 'tenang', 'pelan', 'cepat', 'halo',
-  'tolong', 'maaf', 'ya', 'iya', 'tidaklah', 'disini', 'disana', 'sini', 'sana',
-]);
+export {
+  buildModePair,
+  classifyParagraphLanguage,
+  deriveSeriesTitleId,
+  detectLanguageLocal,
+  inspectBinaryMagicBytes,
+  isSingleStandaloneUrl,
+  normalizeWebUrl,
+  parseModePair,
+  swapModePair,
+  toSafeHttpUrl,
+  validateUploadedFileMagic,
+  type ParagraphLangClass,
+};
 
-const EN_WORDS = new Set([
-  'the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i', 'it', 'for', 'not',
-  'on', 'with', 'he', 'as', 'you', 'do', 'at', 'this', 'but', 'his', 'by', 'from',
-  'they', 'we', 'say', 'her', 'she', 'or', 'an', 'will', 'my', 'one', 'all', 'would',
-  'there', 'their', 'what', 'so', 'up', 'out', 'if', 'about', 'who', 'get', 'which',
-  'go', 'me', 'when', 'make', 'can', 'like', 'time', 'no', 'just', 'him', 'know',
-  'take', 'into', 'year', 'your', 'good', 'some', 'could', 'them', 'see', 'other',
-  'than', 'then', 'now', 'look', 'only', 'come', 'its', 'over', 'think', 'also',
-  'back', 'after', 'use', 'two', 'how', 'our', 'work', 'first', 'well', 'way', 'even',
-  'new', 'want', 'because', 'any', 'these', 'give', 'day', 'most', 'us', 'is', 'are',
-  'was', 'were', 'been', 'has', 'had', 'does', 'did', 'more', 'very', 'much', 'still',
-  'hello', 'morning', 'evening', 'night', 'please', 'thank', 'thanks', 'chapter',
-  'episode', 'next', 'previous', 'story', 'page', 'read', 'reading', 'book', 'novel',
-  'while', 'under', 'opened', 'stood', 'quietly', 'listening', 'rain', 'letter',
-]);
-
-export type ParagraphLangClass =
-  | 'ja'
-  | 'id'
-  | 'en'
-  | 'mixed-ja'
-  | 'mixed-latin'
-  | 'unknown';
-
-function scoreLatinWords(sample: string): { idScore: number; enScore: number; wordCount: number } {
-  const words = (sample.slice(0, 4000).match(WORD_RE) || []).map((w) => w.toLowerCase());
-  let idScore = 0;
-  let enScore = 0;
-  let idStopHits = 0;
-  let enStopHits = 0;
-  for (const w of words) {
-    if (ID_WORDS.has(w)) {
-      idScore += 1.2;
-      idStopHits += 1;
-    }
-    if (EN_WORDS.has(w)) {
-      enScore += 1.2;
-      enStopHits += 1;
-    }
-    // Only apply Indonesian morphological heuristics when not an English word; avoid false positives like "terms", "terrible", "berlin"
-    if (
-      !EN_WORDS.has(w) &&
-      w.length >= 6 &&
-      (w.endsWith('nya') ||
-        w.endsWith('kan') ||
-        w.endsWith('lah') ||
-        w.endsWith('kah') ||
-        w.startsWith('meny') ||
-        w.startsWith('meng') ||
-        w.startsWith('memb') ||
-        w.startsWith('mend') ||
-        w.startsWith('berk') ||
-        w.startsWith('bert') ||
-        w.startsWith('terj') ||
-        w.startsWith('terk') ||
-        w.startsWith('terl') ||
-        w.startsWith('terd'))
-    ) {
-      idScore += 0.65;
-    }
-    if (
-      !ID_WORDS.has(w) &&
-      ((w.length >= 5 && (w.endsWith('tion') || w.endsWith('ment') || w.endsWith('ing') || w.endsWith('ness'))) ||
-        /^(don't|can't|won't|isn't|aren't|it's|i'm|you're|we're|they're|didn't|wasn't|couldn't|wouldn't)$/.test(w))
-    ) {
-      enScore += 0.7;
-    }
-  }
-  // Require at least 1 true stopword hit before affix-only score can claim a language
-  if (idStopHits === 0 && idScore < 1.5) idScore = 0;
-  if (enStopHits === 0 && enScore < 1.5) enScore = 0;
-  return { idScore, enScore, wordCount: words.length };
+function extractGeminiResponseText(raw: unknown, fallback = '{}'): string {
+  const parts = (raw as { candidates?: Array<{ content?: { parts?: Array<{ text?: string; thought?: boolean }> } }> })
+    ?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return fallback;
+  const chosen = parts.find((p) => !p?.thought && typeof p?.text === 'string' && p.text.trim());
+  return chosen?.text ? String(chosen.text).trim() : fallback;
 }
 
-export function classifyParagraphLanguage(text: string): ParagraphLangClass {
-  const sample = (text || '').trim();
-  if (!sample) return 'unknown';
-
-  const hasCjk = CJK_RE.test(sample);
-  const { idScore, enScore, wordCount } = scoreLatinWords(sample);
-
-  if (hasCjk) {
-    // Only treat as mixed-ja if there are real multi-char Latin words alongside CJK
-    const latinWords = (sample.match(/[A-Za-zÀ-ÿ]{2,}/g) || []).length;
-    return latinWords >= 2 ? 'mixed-ja' : 'ja';
-  }
-  if (wordCount === 0) return 'unknown';
-
-  // Require clear signal before declaring a short line strictly ID or EN so non-target titles are never skipped
-  if (idScore >= 1.2 && enScore === 0 && (wordCount <= 4 || idScore >= 2.0)) return 'id';
-  if (enScore >= 1.2 && idScore === 0 && (wordCount <= 4 || enScore >= 2.0)) return 'en';
-  if (idScore > 0 && enScore > 0) {
-    if (idScore >= 2.4 && idScore >= enScore * 2.2) return 'id';
-    if (enScore >= 2.4 && enScore >= idScore * 2.2) return 'en';
-    return 'mixed-latin';
-  }
-  return 'unknown';
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      globalThis.clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    const timer = globalThis.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function isStillUntranslatedForTarget(srcText: string, outText: string, tgt: TargetLang): boolean {
@@ -198,136 +173,6 @@ function isStillUntranslatedForTarget(srcText: string, outText: string, tgt: Tar
     if (latinWords >= 2 && cleanOut === cleanSrc && !CJK_RE.test(cleanOut)) return true;
   }
   return false;
-}
-
-export function parseModePair(mode: ModePair): { src: SourceLang; tgt: TargetLang } {
-  const [rawSrc, rawTgt] = mode.split('-') as [SourceLang, TargetLang];
-  const src: SourceLang = ['auto', 'id', 'en', 'ja'].includes(rawSrc) ? rawSrc : 'auto';
-  const tgt: TargetLang = ['id', 'en', 'ja'].includes(rawTgt) ? rawTgt : 'id';
-  if (src !== 'auto' && src === tgt) {
-    return { src: 'auto', tgt };
-  }
-  return { src, tgt };
-}
-
-export function buildModePair(
-  nextSrc: SourceLang,
-  nextTgt: TargetLang,
-  prevMode: ModePair = 'auto-id'
-): ModePair {
-  const prev = parseModePair(prevMode);
-  let src = nextSrc;
-  let tgt = nextTgt;
-  if (src !== 'auto' && src === tgt) {
-    // Flip whichever side wasn't just changed, mirroring Google Translate
-    if (nextTgt !== prev.tgt && prev.src !== 'auto' && prev.src !== nextTgt) {
-      src = prev.tgt;
-    } else if (nextSrc !== prev.src && prev.tgt !== nextSrc) {
-      tgt = prev.src === 'auto' ? (nextSrc === 'ja' ? 'id' : 'ja') : prev.src;
-    } else {
-      tgt = src === 'ja' ? 'id' : 'ja';
-    }
-  }
-  return `${src}-${tgt}` as ModePair;
-}
-
-export function swapModePair(
-  current: ModePair,
-  detectedSource?: TargetLang | ''
-): ModePair {
-  const { src, tgt } = parseModePair(current);
-  const concreteSrc: TargetLang =
-    src === 'auto'
-      ? detectedSource && detectedSource !== tgt
-        ? detectedSource
-        : tgt === 'ja'
-          ? 'id'
-          : 'ja'
-      : src;
-  const nextSrc: SourceLang = tgt;
-  const nextTgt: TargetLang = concreteSrc === tgt ? (tgt === 'ja' ? 'id' : 'ja') : concreteSrc;
-  return `${nextSrc}-${nextTgt}` as ModePair;
-}
-
-export function detectLanguageLocal(text: string, fallback: TargetLang = 'ja'): TargetLang {
-  const sample = (text || '').trim();
-  if (!sample) return fallback;
-  if (CJK_RE.test(sample)) return 'ja';
-
-  const { idScore, enScore, wordCount } = scoreLatinWords(sample);
-  if (wordCount === 0) return fallback;
-  if (idScore > enScore) return 'id';
-  if (enScore > idScore) return 'en';
-  return fallback;
-}
-
-export function isSingleStandaloneUrl(raw: string): boolean {
-  const trimmed = raw.trim();
-  if (!trimmed || /\s/.test(trimmed)) return false;
-  return /^https?:\/\/[^\s]+$/i.test(trimmed);
-}
-
-export function normalizeWebUrl(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 2048) {
-    throw new Error('Masukkan alamat tautan halaman web yang sah (maks. 2.048 karakter).');
-  }
-  const withScheme = /^[a-z][a-z0-9+.-]*:/i.test(trimmed)
-    ? trimmed
-    : `https://${trimmed}`;
-  let parsed: URL;
-  try {
-    parsed = new URL(withScheme);
-  } catch {
-    throw new Error('Format alamat URL tidak sah.');
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Hanya tautan http:// dan https:// yang diizinkan.');
-  }
-  if (parsed.username || parsed.password) {
-    throw new Error('Kredensial di dalam URL tidak diizinkan.');
-  }
-  if (parsed.port && parsed.port !== '80' && parsed.port !== '443') {
-    throw new Error('Hanya port standar 80 dan 443 yang diizinkan.');
-  }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (
-    !host ||
-    host === 'localhost' ||
-    host === 'metadata.google.internal' ||
-    host.endsWith('.local') ||
-    host.endsWith('.internal') ||
-    /^0\./.test(host) ||
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host) ||
-    host === '::1' ||
-    host === '::' ||
-    host.startsWith('fc') ||
-    host.startsWith('fd') ||
-    host.startsWith('fe80:') ||
-    host.startsWith('::ffff:')
-  ) {
-    const err = new Error('Alamat jaringan internal atau privat ditolak demi keamanan.') as Error & {
-      status?: number;
-      code?: string;
-    };
-    err.status = 403;
-    err.code = 'BLOCKED_URL';
-    throw err;
-  }
-  return parsed.toString();
-}
-
-export function toSafeHttpUrl(raw: string): string | null {
-  try {
-    return normalizeWebUrl(raw);
-  } catch {
-    return null;
-  }
 }
 
 function buildGlossaryPairs(
@@ -368,7 +213,18 @@ function maskWithGlossary(
   const map = new Map<string, string>();
   let idx = 1;
   for (const [srcTerm, tgtTerm] of pairs) {
-    if (masked.includes(srcTerm)) {
+    if (!masked.includes(srcTerm)) continue;
+    const isAsciiLatin = /^[A-Za-z0-9][A-Za-z0-9\s'-]*$/.test(srcTerm);
+    if (isAsciiLatin) {
+      const esc = srcTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`(?<![A-Za-z0-9_])${esc}(?![A-Za-z0-9_])`, 'g');
+      if (re.test(masked)) {
+        const tok = `[[E${idx}]]`;
+        masked = masked.replace(re, tok);
+        map.set(tok, tgtTerm);
+        idx += 1;
+      }
+    } else {
       const tok = `[[E${idx}]]`;
       masked = masked.split(srcTerm).join(tok);
       map.set(tok, tgtTerm);
@@ -388,24 +244,9 @@ function unmaskWithGlossary(text: string, map: Map<string, string>): string {
   return out;
 }
 
-/** Cleans machine-translation punctuation & spacing artifacts for crisp literary readability. */
+/** Cleans machine-translation punctuation & spacing artifacts for crisp literary readability (strictly 0 U+2014). */
 export function polishTranslatedProse(text: string, tgt: TargetLang): string {
-  if (!text) return text;
-  if (tgt === 'ja') {
-    return text.replace(/[ \t]{2,}/g, ' ').trim();
-  }
-  return text
-    .replace(/\u3000+/g, ' ')
-    .replace(/``\s*/g, '"')
-    .replace(/\s*''/g, '"')
-    .replace(/“\s+/g, '"')
-    .replace(/\s+”/g, '"')
-    .replace(/"\s+([^"\n]+?)\s+"/g, '"$1"')
-    .replace(/\s+([,.;:?!])/g, '$1')
-    .replace(/([.!?])(?=[^\s"”’)\].!?0-9])/g, '$1 ')
-    .replace(/\.{4,}/g, '...')
-    .replace(/[ \t]{2,}/g, ' ')
-    .trim();
+  return sanitizeZeroEmDashAndPunct(text, tgt);
 }
 
 /** Runs async worker tasks with bounded concurrency while preserving output order. */
@@ -428,39 +269,75 @@ async function runConcurrentPool<T>(
   await Promise.all(runners);
 }
 
-const PARA_CACHE_STORAGE_KEY = 'tranx_para_cache_v2';
 const MAX_PARA_CACHE_MEM = 2400;
-const MAX_PARA_CACHE_LS = 320;
 const paraTranslationCache = new Map<string, string>();
 const pendingIdbParaWrites = new Map<string, string>();
 let paraCacheHydrated = false;
 let paraCacheFlushTimer: number | null = null;
 
+export function clearInMemoryTranslationCaches(): void {
+  paraTranslationCache.clear();
+  pendingIdbParaWrites.clear();
+  paraCacheHydrated = false;
+  webArticleCache.clear();
+  translatedWebCache.clear();
+  translatedSiteHtmlCache.clear();
+  seriesTocCache.clear();
+  translatedChapterTitlesCache.clear();
+  scannedMangaPageCache.clear();
+  directExportCache.clear();
+  terminateAllWarmTesseractWorkers();
+  if (paraCacheFlushTimer !== null) {
+    globalThis.clearTimeout(paraCacheFlushTimer);
+    paraCacheFlushTimer = null;
+  }
+}
+
+registerLocalCacheResetHook(clearInMemoryTranslationCaches);
+registerLocalCacheResetHook(clearSeriesDiscourseMemory);
+
 function hydrateParaCacheOnce(): void {
   if (paraCacheHydrated || typeof window === 'undefined') return;
   paraCacheHydrated = true;
-  try {
-    const raw = window.localStorage.getItem(PARA_CACHE_STORAGE_KEY);
-    if (raw) {
-      const entries = JSON.parse(raw);
-      if (Array.isArray(entries)) {
-        for (const pair of entries) {
-          if (Array.isArray(pair) && typeof pair[0] === 'string' && typeof pair[1] === 'string') {
-            paraTranslationCache.set(pair[0], pair[1]);
-          }
+  // Defer bounded IndexedDB warm hydration (500 most recent paragraphs) to idle callback
+  const hydrateFromIdb = () => {
+    void idbLoadRecent<string>('paras', 500).then((rows) => {
+      for (const [k, v] of rows) {
+        if (!paraTranslationCache.has(k) && typeof v === 'string') {
+          paraTranslationCache.set(k, v);
+        }
+      }
+    });
+  };
+  const winWithIdle = window as Window & {
+    requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+  };
+  if (typeof winWithIdle.requestIdleCallback === 'function') {
+    winWithIdle.requestIdleCallback(hydrateFromIdb, { timeout: 1500 });
+  } else {
+    globalThis.setTimeout(hydrateFromIdb, 350);
+  }
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      scannedMangaPageCache.trimToRatio(0.5);
+      terminateAllWarmTesseractWorkers();
+      if (paraTranslationCache.size > Math.floor(MAX_PARA_CACHE_MEM * 0.5)) {
+        const target = Math.floor(MAX_PARA_CACHE_MEM * 0.5);
+        while (paraTranslationCache.size > target) {
+          const oldest = paraTranslationCache.keys().next().value;
+          if (oldest === undefined) break;
+          paraTranslationCache.delete(oldest);
         }
       }
     }
-  } catch {
-    // Ignore storage read issues
-  }
-  // Background-hydrate up to 2,400 entries from IndexedDB so Web & Installed PWA share instant warm cache
-  void idbLoadRecent<string>('paras', MAX_PARA_CACHE_MEM).then((rows) => {
-    for (const [k, v] of rows) {
-      if (!paraTranslationCache.has(k) && typeof v === 'string') {
-        paraTranslationCache.set(k, v);
-      }
-    }
+  });
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    terminateAllWarmTesseractWorkers();
   });
 }
 
@@ -472,12 +349,6 @@ function scheduleParaCacheFlush(): void {
       const batch = Array.from(pendingIdbParaWrites.entries());
       pendingIdbParaWrites.clear();
       void idbPutMany('paras', batch);
-    }
-    try {
-      const recent = Array.from(paraTranslationCache.entries()).slice(-MAX_PARA_CACHE_LS);
-      window.localStorage.setItem(PARA_CACHE_STORAGE_KEY, JSON.stringify(recent));
-    } catch {
-      // Ignore storage quota errors
     }
   }, 1200);
 }
@@ -515,10 +386,7 @@ function setCachedParaTranslation(key: string, translated: string): void {
   scheduleParaCacheFlush();
 }
 
-// Kick off non-blocking L2 cache hydration immediately on module load
-if (typeof window !== 'undefined') {
-  hydrateParaCacheOnce();
-}
+// L2 cache hydration runs lazily on first translation lookup (0ms module-load side effect)
 
 function hasTranslatableLetters(text: string): boolean {
   return /[\p{L}\p{N}\u3040-\u30ff\u3400-\u9fff]/u.test(text);
@@ -546,11 +414,11 @@ async function fetchWithTimeout(
       outerSignal.addEventListener('abort', onOuterAbort, { once: true });
     }
   }
-  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
+  const timer = globalThis.setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: ctrl.signal });
   } finally {
-    window.clearTimeout(timer);
+    globalThis.clearTimeout(timer);
     if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
   }
 }
@@ -593,10 +461,10 @@ async function requestGtxSingleChunk(
           const data = await resp.json();
           const pieces: string[] = Array.isArray(data?.[0])
             ? data[0]
-                .map((seg: unknown) =>
-                  Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''
-                )
-                .filter(Boolean)
+              .map((seg: unknown) =>
+                Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''
+              )
+              .filter(Boolean)
             : [];
           const serverSrc = String(data?.[2] || '').toLowerCase();
           const detected =
@@ -615,7 +483,7 @@ async function requestGtxSingleChunk(
             break; // Immediately fail over to healthy clients5 edge!
           }
           if (attempt === 0) {
-            await new Promise((r) => window.setTimeout(r, delayMs));
+            await abortableDelay(delayMs, signal);
             continue;
           }
         }
@@ -701,10 +569,10 @@ async function requestGtxSingleChunk(
         const data = await respGet.json();
         const pieces: string[] = Array.isArray(data?.[0])
           ? data[0]
-              .map((seg: unknown) =>
-                Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''
-              )
-              .filter(Boolean)
+            .map((seg: unknown) =>
+              Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''
+            )
+            .filter(Boolean)
           : [];
         return { translated: pieces.join('') };
       }
@@ -803,6 +671,18 @@ async function translateBatchViaGoogleGtx(
       batch.push(work[cursor]);
       charCount += work[cursor].text.length + 12;
       cursor += 1;
+      // Dialogue-preserving boundary split: once >= 72% full, prefer splitting after non-quote complete sentences
+      if (
+        !isFirstFastBatch &&
+        batch.length >= 6 &&
+        charCount >= maxChars * 0.72 &&
+        cursor < work.length &&
+        !/[「『"“]$/.test(batch[batch.length - 1].text) &&
+        !/^[「『"“]/.test(work[cursor].text) &&
+        /[。！？.!?]$/.test(batch[batch.length - 1].text)
+      ) {
+        break;
+      }
     }
     if (batch.length === 0) {
       batch.push(work[cursor]);
@@ -897,6 +777,8 @@ async function translateBatchViaGoogleGtx(
     for (let i = 0; i < retryItems.length; i += 5) {
       miniBatches.push(retryItems.slice(i, i + 5));
     }
+    let failedSingles = 0;
+    let lastSingleErr: unknown = null;
     await runConcurrentPool(miniBatches, Math.min(2, profile.gtxConcurrency), async (mini) => {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const unresolved: Array<{ text: string; slots: number[] }> = [];
@@ -922,12 +804,30 @@ async function translateBatchViaGoogleGtx(
       }
       for (const item of unresolved) {
         if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-        const singleRes = await requestGtxSingleChunk(item.text, src, tgt, signal).catch(() => ({
-          translated: item.text,
-        }));
-        assignSlots(item.slots, singleRes.translated || item.text);
+        try {
+          const singleRes = await requestGtxSingleChunk(item.text, src, tgt, signal);
+          if (singleRes.detected) detected = singleRes.detected;
+          if (singleRes.translated) {
+            assignSlots(item.slots, singleRes.translated);
+          } else {
+            failedSingles += 1;
+            for (const s of item.slots) outputs[s] = item.text;
+          }
+        } catch (err) {
+          if (signal?.aborted || (err as { name?: string })?.name === 'AbortError') {
+            throw err;
+          }
+          failedSingles += 1;
+          lastSingleErr = err;
+          // Leave fallback text in outputs WITHOUT triggering cache callback
+          for (const s of item.slots) outputs[s] = item.text;
+        }
       }
     });
+    // If EVERY single item in the entire job failed, surface real network/offline error instead of silently returning untranslated text
+    if (failedSingles >= work.length && lastSingleErr) {
+      throw lastSingleErr;
+    }
   }
 
   return { outputs, detected };
@@ -938,29 +838,16 @@ async function translateViaGeminiDirect(
   src: SourceLang,
   tgt: TargetLang,
   geminiKey: string,
+  profile: DiscourseProfile,
   signal?: AbortSignal,
   onChunkDone?: (startOffset: number, chunkOutputs: string[]) => void
 ): Promise<string[]> {
-  const langNames: Record<TargetLang, string> = {
-    ja: 'Japanese',
-    id: 'Indonesian',
-    en: 'English',
-  };
-  const srcLabel = src === 'auto' ? 'any detected source language' : langNames[src];
-  const sysPrompt =
-    `You are a literary and technical translator producing fluent, natural, accurate ${langNames[tgt]} without summarizing. ` +
-    `Translate from ${srcLabel} into idiomatic ${langNames[tgt]} with natural dialogue rhythm and consistent pronouns. ` +
-    `Ensure 100% of every output item is written in ${langNames[tgt]}. ` +
-    `Keep any text that is already in ${langNames[tgt]} intact in ${langNames[tgt]} and NEVER translate it into another language. ` +
-    `Keep placeholders like [[E1]] verbatim in their natural grammatical position. Preserve line breaks. ` +
-    `Return strict JSON: {"translations":[{"id":1,"text":"..."}]}`;
-
   if (geminiBreaker.isOpen()) {
     throw new Error('Gemini cooldown active');
   }
 
   // Fast first chunk (16 items) for instant initial stream, followed by dense 55-item chunks (3x fewer RPM calls!)
-  const profile = getDeviceRuntimeProfile();
+  const runtimeProfile = getDeviceRuntimeProfile();
   const chunks: Array<{ start: number; slice: string[] }> = [];
   let pos = 0;
   while (pos < paragraphs.length) {
@@ -969,60 +856,163 @@ async function translateViaGeminiDirect(
     pos += size;
   }
 
+  const temp =
+    profile.register === 'formal_legal_tech' || profile.register === 'formal_academic' ? 0.15 : 0.25;
   const allOut = new Array<string>(paragraphs.length);
-  await runConcurrentPool(chunks, profile.geminiConcurrency, async ({ start, slice }) => {
-    await geminiBucket.acquire(signal);
-    const items = slice.map((text, idx) => ({ id: idx + 1, text }));
-    const resp = await fetchWithTimeout(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': geminiKey,
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: sysPrompt }] },
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: `Input:\n${JSON.stringify(items)}` }],
-            },
-          ],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            temperature: 0.2,
-          },
-        }),
-      },
-      18_000,
-      signal
-    );
-    if (!resp.ok) {
-      if (resp.status === 429 || resp.status >= 500) {
-        const retryMs = computeBackoffDelayMs(0, resp.headers.get('Retry-After'), 2000, 30_000);
-        geminiBucket.onThrottle(retryMs);
-        geminiBreaker.recordFailure(Math.max(retryMs, 25_000));
-      } else {
-        geminiBreaker.recordFailure();
+  const poolCtrl = new AbortController();
+  const onOuterAbort = () => poolCtrl.abort();
+  if (signal?.aborted) {
+    poolCtrl.abort();
+  } else {
+    signal?.addEventListener('abort', onOuterAbort, { once: true });
+  }
+  try {
+    await runConcurrentPool(chunks, runtimeProfile.geminiConcurrency, async ({ start, slice }) => {
+      if (poolCtrl.signal.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
       }
-      throw new Error(`Gemini HTTP ${resp.status}`);
-    }
-    geminiBucket.onSuccess();
-    geminiBreaker.recordSuccess();
-    const raw = await resp.json();
-    const textPart = raw?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-    const parsed = JSON.parse(textPart);
-    const map = new Map<number, string>();
-    for (const row of parsed.translations || []) {
-      map.set(Number(row.id), String(row.text || ''));
-    }
-    const chunkOut = slice.map((orig, idx) => map.get(idx + 1) || orig);
-    chunkOut.forEach((txt, idx) => {
-      allOut[start + idx] = txt;
+      await geminiBucket.acquire(poolCtrl.signal);
+      const sysPrompt = buildLiterarySystemPrompt(src, tgt, profile, slice);
+      const items = slice.map((text, idx) => ({ id: idx + 1, text }));
+
+      // Sliding 2-paragraph lookback context (antar paragraf + antar bab!)
+      const lookbackParts: string[] = [];
+      if (start === 0 && profile.seriesClosingContext.length > 0) {
+        for (const prevPair of profile.seriesClosingContext) {
+          lookbackParts.push(`Prev chapter source: ${prevPair.src}\nPrev chapter translation: ${prevPair.dst}`);
+        }
+      } else if (start > 0) {
+        const prevSlice = paragraphs.slice(Math.max(0, start - 2), start);
+        prevSlice.forEach((p, idx) => {
+          const translatedPrev = allOut[Math.max(0, start - 2) + idx];
+          lookbackParts.push(
+            translatedPrev
+              ? `Prior paragraph: ${p.slice(0, 200)} => ${translatedPrev.slice(0, 200)}`
+              : `Prior paragraph: ${p.slice(0, 200)}`
+          );
+        });
+      }
+      const contextHeader =
+        lookbackParts.length > 0
+          ? `Reference context (DO NOT translate, keep voice/pronouns consistent with this):\n${lookbackParts.join('\n')}\n\n`
+          : '';
+
+      const resp = await fetchWithTimeout(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': geminiKey,
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: sysPrompt }] },
+            contents: [
+              {
+                role: 'user',
+                parts: [{ text: `${contextHeader}Input:\n${JSON.stringify(items)}` }],
+              },
+            ],
+            generationConfig: {
+              responseMimeType: 'application/json',
+              temperature: temp,
+            },
+          }),
+        },
+        18_000,
+        poolCtrl.signal
+      );
+      if (!resp.ok) {
+        if (resp.status === 429 || resp.status >= 500) {
+          const retryMs = computeBackoffDelayMs(0, resp.headers.get('Retry-After'), 2000, 30_000);
+          geminiBucket.onThrottle(retryMs);
+          geminiBreaker.recordFailure(Math.max(retryMs, 25_000));
+        } else {
+          geminiBreaker.recordFailure();
+        }
+        poolCtrl.abort();
+        throw new Error(`Gemini HTTP ${resp.status}`);
+      }
+      geminiBucket.onSuccess();
+      geminiBreaker.recordSuccess();
+      const raw = await resp.json();
+      const rawTextPart = extractGeminiResponseText(raw, '{}');
+      const textPart = rawTextPart.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+      const parsed = JSON.parse(textPart);
+      const map = new Map<number, string>();
+      for (const row of parsed.translations || []) {
+        const txt = String(row?.text || '').trim();
+        if (txt) map.set(Number(row.id), txt);
+      }
+      const missingCount = slice.reduce((acc, _orig, idx) => acc + (map.has(idx + 1) ? 0 : 1), 0);
+      if (map.size === 0 || missingCount > Math.max(2, Math.floor(slice.length * 0.4))) {
+        throw new Error('Respons JSON Gemini tidak lengkap; beralih ke mesin cadangan.');
+      }
+      const chunkOut = slice.map((orig, idx) => map.get(idx + 1) || orig);
+
+      // v5 Reference-Free QE + Bounded Single-Pass MQM Self-Repair (Ki & Carpuat 2024, max 2 critical items/chunk)
+      let repairsInChunk = 0;
+      for (let idx = 0; idx < slice.length && repairsInChunk < 2; idx += 1) {
+        const origLine = slice[idx];
+        const draftLine = chunkOut[idx];
+        const qe = evaluateSourceTargetQe({ srcText: origLine, tgtText: draftLine, profile });
+        if (!qe.needsSelfRepair || geminiBreaker.isOpen() || poolCtrl.signal.aborted) continue;
+        repairsInChunk += 1;
+        try {
+          const repairReq = buildSelfRepairPrompt({
+            srcText: origLine,
+            draftText: draftLine,
+            qeReport: qe,
+            profile,
+          });
+          await geminiBucket.acquire(poolCtrl.signal);
+          const rResp = await fetchWithTimeout(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': geminiKey,
+              },
+              body: JSON.stringify({
+                systemInstruction: { parts: [{ text: repairReq.systemPrompt }] },
+                contents: [{ role: 'user', parts: [{ text: repairReq.userPrompt }] }],
+                generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
+              }),
+            },
+            12_000,
+            poolCtrl.signal
+          );
+          if (rResp.ok) {
+            const rJson = await rResp.json();
+            const rRawPart = extractGeminiResponseText(rJson, '{}');
+            const rTextPart = rRawPart.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+            const repaired = String(JSON.parse(rTextPart)?.text || '').trim();
+            if (repaired) {
+              const nextQe = evaluateSourceTargetQe({ srcText: origLine, tgtText: repaired, profile });
+              if (nextQe.qeRiskScore < qe.qeRiskScore) {
+                chunkOut[idx] = repaired;
+              }
+            }
+          }
+        } catch (err) {
+          if (poolCtrl.signal.aborted || (err as { name?: string })?.name === 'AbortError') throw err;
+          // Keep safe original draft if single-pass repair fails or times out
+        }
+      }
+
+      chunkOut.forEach((txt, idx) => {
+        allOut[start + idx] = txt;
+      });
+      onChunkDone?.(start, chunkOut);
+      await yieldToMain();
     });
-    onChunkDone?.(start, chunkOut);
-  });
+  } catch (err) {
+    poolCtrl.abort();
+    throw err;
+  } finally {
+    signal?.removeEventListener('abort', onOuterAbort);
+  }
   return allOut;
 }
 
@@ -1034,10 +1024,13 @@ async function translateMixedCjkLineToTarget(
   if (tgt === 'ja') {
     const { idScore, enScore } = scoreLatinWords(line);
     const latinSrc: SourceLang = idScore > enScore ? 'id' : enScore > idScore ? 'en' : 'auto';
-    const r = await requestGtxSingleChunk(line, latinSrc, 'ja', signal).catch(() => ({
-      translated: line,
-    }));
-    return r.translated || line;
+    try {
+      const r = await requestGtxSingleChunk(line, latinSrc, 'ja', signal);
+      return r.translated || line;
+    } catch (err) {
+      if (signal?.aborted || (err as { name?: string })?.name === 'AbortError') throw err;
+      return line;
+    }
   }
 
   // Replace every Japanese/CJK span inside the line with its target translation first
@@ -1046,14 +1039,14 @@ async function translateMixedCjkLineToTarget(
     if (!hasTranslatableLetters(match)) return match;
     const idx = spans.length;
     spans.push(match);
-    return `[[C${idx}]]`;
+    return `[[M${idx}]]`;
   });
 
   let merged = tokenLine;
   if (spans.length > 0) {
     const { outputs } = await translateBatchViaGoogleGtx(spans, 'ja', tgt, signal);
     outputs.forEach((tr, idx) => {
-      merged = merged.split(`[[C${idx}]]`).join(tr || spans[idx]);
+      merged = merged.split(`[[M${idx}]]`).join(tr || spans[idx]);
     });
   }
 
@@ -1064,10 +1057,13 @@ async function translateMixedCjkLineToTarget(
     (tgt === 'en' && (restClass === 'id' || restClass === 'mixed-latin'))
   ) {
     const secondSrc: SourceLang = restClass === 'en' ? 'en' : restClass === 'id' ? 'id' : 'auto';
-    const r2 = await requestGtxSingleChunk(merged, secondSrc, tgt, signal).catch(() => ({
-      translated: merged,
-    }));
-    return r2.translated || merged;
+    try {
+      const r2 = await requestGtxSingleChunk(merged, secondSrc, tgt, signal);
+      return r2.translated || merged;
+    } catch (err) {
+      if (signal?.aborted || (err as { name?: string })?.name === 'AbortError') throw err;
+      return merged;
+    }
   }
   return merged;
 }
@@ -1076,6 +1072,8 @@ export async function translateParagraphsDirect(params: {
   paragraphs: string[];
   mode: ModePair;
   titleId?: string;
+  titleKind?: TitleKind;
+  docFormat?: 'txt' | 'md' | 'html' | 'epub' | 'pdf' | 'docx' | 'srt' | 'vtt' | 'image';
   signal?: AbortSignal;
   onProgress?: (partialOutputs: string[], doneCount: number, totalCount: number) => void;
 }): Promise<{
@@ -1134,8 +1132,17 @@ export async function translateParagraphsDirect(params: {
   const combinedGlossaryPairs = Array.from(dedupPairMap.entries()).sort(
     (a, b) => b[0].length - a[0].length
   );
-  // Compact signature of active glossary + engine so cache invalidates automatically on glossary/key change
-  const glossarySig = `${geminiKey ? 'g' : 'x'}${combinedGlossaryPairs.length}:${combinedGlossaryPairs
+  const glossaryValues = combinedGlossaryPairs.map(([, v]) => v);
+  const discourseProfile = profileDocument({
+    paragraphs: params.paragraphs,
+    srcLang: detectedSource,
+    tgtLang: tgt,
+    seriesKey: params.titleId,
+    titleKind: params.titleKind,
+    docFormat: params.docFormat,
+  });
+  // Compact signature of active glossary + engine + discourse profile so cache invalidates automatically on tone/glossary/key change
+  const glossarySig = `${discourseProfile.cacheFingerprint}|${geminiKey ? 'g' : 'x'}${combinedGlossaryPairs.length}:${combinedGlossaryPairs
     .slice(0, 12)
     .map(([k, v]) => `${k}=${v}`)
     .join(',')
@@ -1201,12 +1208,39 @@ export async function translateParagraphsDirect(params: {
     };
   }
 
-  const maskedEntries = toTranslateIdx.map((origIdx) => ({
-    origIdx,
-    cls: paraClasses[origIdx],
-    cacheKey: makeParaCacheKey(src, tgt, glossarySig, params.paragraphs[origIdx].trim()),
-    ...maskWithGlossary(params.paragraphs[origIdx], combinedGlossaryPairs),
-  }));
+  const detectedHonorificNames: Record<string, string> = {};
+  const recentTags: string[] = [];
+  const maskedEntries = toTranslateIdx.map((origIdx) => {
+    const pre = preprocessSourceForMt(params.paragraphs[origIdx], discourseProfile, glossary);
+    Object.assign(detectedHonorificNames, pre.detectedHonorificNames);
+    const gMask = maskWithGlossary(pre.prepared, combinedGlossaryPairs);
+    return {
+      origIdx,
+      cls: paraClasses[origIdx],
+      cacheKey: makeParaCacheKey(src, tgt, glossarySig, params.paragraphs[origIdx].trim()),
+      preRestoreMap: pre.restoreMap,
+      hadJaKeigo: pre.hadJaKeigo,
+      ...gMask,
+    };
+  });
+
+  const finalizeParagraph = (
+    entry: (typeof maskedEntries)[number],
+    rawTranslated: string
+  ): string => {
+    const restored = restorePreMtTokens(
+      unmaskWithGlossary(rawTranslated || entry.masked, entry.map),
+      entry.preRestoreMap
+    );
+    return naturalizeAndVerifyParagraph({
+      srcText: params.paragraphs[entry.origIdx],
+      rawTranslated: restored,
+      profile: discourseProfile,
+      hadJaKeigo: entry.hadJaKeigo,
+      glossaryValues,
+      recentTags,
+    });
+  };
 
   if (geminiKey) {
     try {
@@ -1215,18 +1249,26 @@ export async function translateParagraphsDirect(params: {
         src,
         tgt,
         geminiKey,
+        discourseProfile,
         params.signal,
         (startOffset, chunkOut) => {
           chunkOut.forEach((txt, offset) => {
             const m = maskedEntries[startOffset + offset];
             if (!m) return;
-            const finalTxt = polishTranslatedProse(unmaskWithGlossary(txt || m.masked, m.map), tgt);
+            const finalTxt = finalizeParagraph(m, txt);
             if (!isStillUntranslatedForTarget(params.paragraphs[m.origIdx], finalTxt, tgt)) {
               setCachedParaTranslation(m.cacheKey, finalTxt);
             }
             markDone(m.origIdx, finalTxt, offset === chunkOut.length - 1);
           });
         }
+      );
+      saveSeriesDiscourseMemory(
+        params.titleId,
+        discourseProfile,
+        params.paragraphs,
+        outputs,
+        detectedHonorificNames
       );
       params.onProgress?.(outputs.slice(), totalCount, totalCount);
       return {
@@ -1235,7 +1277,10 @@ export async function translateParagraphsDirect(params: {
         model: 'gemini-2.5-flash-lite',
         matchedChips,
       };
-    } catch {
+    } catch (err) {
+      if (params.signal?.aborted || (err as { name?: string })?.name === 'AbortError') {
+        throw err;
+      }
       // Fall through to Google GTX if Gemini key quota or network fails
     }
   }
@@ -1250,6 +1295,8 @@ export async function translateParagraphsDirect(params: {
   const mixedJaItems: typeof maskedEntries = [];
 
   for (const item of maskedEntries) {
+    // Skip items already completed by earlier Gemini chunks before fallback
+    if (doneFlags[item.origIdx]) continue;
     if (item.cls === 'mixed-ja') {
       mixedJaItems.push(item);
     } else if (item.cls === 'ja' && tgt !== 'ja') {
@@ -1280,10 +1327,7 @@ export async function translateParagraphsDirect(params: {
         (slotIdx, translatedRaw) => {
           const item = items[slotIdx];
           if (!item) return;
-          const finalTxt = polishTranslatedProse(
-            unmaskWithGlossary(translatedRaw || item.masked, item.map),
-            tgt
-          );
+          const finalTxt = finalizeParagraph(item, translatedRaw);
           if (!isStillUntranslatedForTarget(params.paragraphs[item.origIdx], finalTxt, tgt)) {
             setCachedParaTranslation(item.cacheKey, finalTxt);
           }
@@ -1297,13 +1341,9 @@ export async function translateParagraphsDirect(params: {
       }
       items.forEach((item, k) => {
         if (!doneFlags[item.origIdx]) {
-          const finalTxt = polishTranslatedProse(
-            unmaskWithGlossary(batchedRes.outputs[k] || item.masked, item.map),
-            tgt
-          );
-          if (!isStillUntranslatedForTarget(params.paragraphs[item.origIdx], finalTxt, tgt)) {
-            setCachedParaTranslation(item.cacheKey, finalTxt);
-          }
+          const fallbackRaw = batchedRes.outputs[k];
+          const finalTxt = finalizeParagraph(item, fallbackRaw);
+          // Do not poison L1/L2 cache with untranslated fallback strings that were never emitted via onSlotTranslated
           markDone(item.origIdx, finalTxt);
         }
       });
@@ -1313,7 +1353,7 @@ export async function translateParagraphsDirect(params: {
   if (mixedJaItems.length > 0) {
     await runConcurrentPool(mixedJaItems, getDeviceRuntimeProfile().gtxConcurrency, async (item) => {
       const tr = await translateMixedCjkLineToTarget(item.masked, tgt, params.signal);
-      const finalTxt = polishTranslatedProse(unmaskWithGlossary(tr, item.map), tgt);
+      const finalTxt = finalizeParagraph(item, tr);
       if (!isStillUntranslatedForTarget(params.paragraphs[item.origIdx], finalTxt, tgt)) {
         setCachedParaTranslation(item.cacheKey, finalTxt);
       }
@@ -1322,6 +1362,13 @@ export async function translateParagraphsDirect(params: {
     });
   }
 
+  saveSeriesDiscourseMemory(
+    params.titleId,
+    discourseProfile,
+    params.paragraphs,
+    outputs,
+    detectedHonorificNames
+  );
   params.onProgress?.(outputs.slice(), totalCount, totalCount);
   return {
     outputs,
@@ -1339,6 +1386,7 @@ interface CachedWebEntry {
   srcParas: string[];
   detectedSource: TargetLang;
   novelNav: NovelNavigation;
+  comicMeta?: MangaLinkMeta;
   rawHtml?: string;
   rawMarkdown?: string;
   htmlFetchAttempted?: boolean;
@@ -1362,6 +1410,9 @@ const seriesTocCache = new BoundedLruCache<
   { seriesTitle?: string; tocUrl: string; chapters: NovelChapterLink[]; authoritative?: boolean }
 >(24);
 const translatedChapterTitlesCache = new BoundedLruCache<string, Record<string, string>>(24);
+const scannedMangaPageCache = new BoundedLruCache<string, ImageTranslationResult>(
+  initProfile.isConstrained ? 4 : 8
+);
 
 // Release excess RAM caches gracefully when mobile PWA or tab moves to background
 if (typeof document !== 'undefined') {
@@ -1690,57 +1741,7 @@ function deriveKnownTocInfo(rawUrl: string): { tocUrl: string; isTocPage: boolea
   return null;
 }
 
-export function deriveSeriesTitleId(rawUrl: string): string {
-  try {
-    const u = new URL(rawUrl);
-    const host = u.hostname.toLowerCase();
-    const path = u.pathname;
-    const kakuyomu = path.match(/^\/works\/(\d+)/);
-    if (host.includes('kakuyomu.jp') && kakuyomu) {
-      return `t_novel_kakuyomu_${kakuyomu[1]}`;
-    }
-    const syosetu = path.match(/^\/(n[a-z0-9]+)/i);
-    if (host.includes('syosetu.com') && syosetu) {
-      return `t_novel_syosetu_${syosetu[1].toLowerCase()}`;
-    }
-    const hameln = path.match(/^\/novel\/(\d+)/);
-    if (host.includes('syosetu.org') && hameln) {
-      return `t_novel_hameln_${hameln[1]}`;
-    }
-    const alpha = path.match(/^\/novel\/(\d+\/\d+)/);
-    if (host.includes('alphapolis.co.jp') && alpha) {
-      return `t_novel_alpha_${alpha[1].replace(/\//g, '_')}`;
-    }
-    const aozora = path.match(/^\/cards\/(\d+)/);
-    if (host.includes('aozora.gr.jp') && aozora) {
-      return `t_novel_aozora_${aozora[1]}`;
-    }
-    const royal = path.match(/^\/fiction\/(\d+)/);
-    if (host.includes('royalroad.com') && royal) {
-      return `t_novel_rr_${royal[1]}`;
-    }
-    const scribble = path.match(/^\/(?:read|series)\/(\d+)/);
-    if (host.includes('scribblehub.com') && scribble) {
-      return `t_novel_sh_${scribble[1]}`;
-    }
-    const ao3 = path.match(/^\/works\/(\d+)/);
-    if (host.includes('archiveofourown.org') && ao3) {
-      return `t_novel_ao3_${ao3[1]}`;
-    }
-    const ffnet = path.match(/^\/s\/(\d+)/);
-    if (host.includes('fanfiction.net') && ffnet) {
-      return `t_novel_ff_${ffnet[1]}`;
-    }
-    const genericNovel = path.match(/^\/(?:b|book|novel|series|story|light-novel)\/([^/]+)/i);
-    if (genericNovel) {
-      const slug = genericNovel[1].replace(/[^a-z0-9]/gi, '_').slice(0, 28);
-      return `t_novel_${host.replace(/^www\./, '').split('.')[0].slice(0, 12)}_${slug}`;
-    }
-    return `t_web_${host.replace(/[^a-z0-9]/gi, '_').slice(0, 24)}`;
-  } catch {
-    return 't_web_page';
-  }
-}
+// deriveSeriesTitleId is imported & re-exported from ./langUtils
 
 function isKnownNovelUrl(rawUrl: string): boolean {
   try {
@@ -2447,8 +2448,8 @@ function extractNovelNavigationFromHtml(
     isNovel &&
     Boolean(
       nextDataNav?.isTocPage ||
-        (tocInfo?.isTocPage && chapters.length >= 1) ||
-        (chapters.length >= 5 && curIdx === undefined && !prevUrl)
+      (tocInfo?.isTocPage && chapters.length >= 1) ||
+      (chapters.length >= 5 && curIdx === undefined && !prevUrl)
     );
   if (isTocPage && !nextUrl && chapters[0]?.url) {
     nextUrl = chapters[0].url;
@@ -2625,6 +2626,10 @@ async function fetchViaJinaInternal(
   cleanUrl: string,
   options: { format: 'html' | 'markdown'; noCache?: boolean; signal?: AbortSignal }
 ): Promise<JinaFetchResult | null> {
+  // Never forward signed/tokenized URLs to public third-party reader proxies
+  if (HAS_SENSITIVE_QUERY_RE.test(cleanUrl)) {
+    return null;
+  }
   const headers: Record<string, string> = {
     Accept: 'application/json',
     'X-With-Links-Summary': 'true',
@@ -2658,11 +2663,9 @@ async function fetchViaJinaInternal(
     const d = json?.data || {};
     const title = decodeHtmlEntities(String(d.title || '').trim());
     const finalUrl =
-      typeof d.finalUrl === 'string' && d.finalUrl.startsWith('http')
-        ? d.finalUrl
-        : typeof d.url === 'string' && d.url.startsWith('http')
-          ? d.url
-          : cleanUrl;
+      (typeof d.finalUrl === 'string' && toSafeHttpUrl(d.finalUrl)) ||
+      (typeof d.url === 'string' && toSafeHttpUrl(d.url)) ||
+      cleanUrl;
     const html = typeof d.html === 'string' ? d.html : '';
     // Never substitute 1-line meta description as full article body when real HTML is returned
     const content =
@@ -2675,8 +2678,9 @@ async function fetchViaJinaInternal(
       d.links && typeof d.links === 'object' ? (d.links as Record<string, unknown>) : {};
     const links: Array<{ title: string; url: string }> = [];
     for (const [k, v] of Object.entries(linksObj)) {
-      if (typeof v === 'string' && v.startsWith('http')) {
-        links.push({ title: decodeHtmlEntities(k), url: v });
+      const safeLink = typeof v === 'string' ? toSafeHttpUrl(v) : null;
+      if (safeLink) {
+        links.push({ title: decodeHtmlEntities(k), url: safeLink });
       }
     }
     return { title, finalUrl, html, content, links };
@@ -3290,9 +3294,12 @@ function mergeNovelNav(primary: NovelNavigation, secondary?: NovelNavigation | n
 }
 
 async function decodeHtmlResponseWithCharset(resp: Response): Promise<string> {
-  const buf = await resp.arrayBuffer();
-  if (buf.byteLength > 5 * 1024 * 1024) return '';
-  const bytes = new Uint8Array(buf);
+  let bytes: Uint8Array;
+  try {
+    bytes = await readBoundedBytes(resp, 5 * 1024 * 1024, false);
+  } catch {
+    return '';
+  }
   const ctype = resp.headers.get('content-type') || '';
   const headAscii = new TextDecoder('latin1').decode(bytes.subarray(0, Math.min(bytes.length, 2048)));
   const charsetMatch = `${ctype} ${headAscii}`.match(/charset\s*=\s*["']?([a-zA-Z0-9_-]+)/i);
@@ -3314,6 +3321,10 @@ async function fetchRawHtmlViaCorsProxy(
   cleanUrl: string,
   signal?: AbortSignal
 ): Promise<string | null> {
+  // Never forward signed/tokenized URLs to public third-party CORS proxies
+  if (HAS_SENSITIVE_QUERY_RE.test(cleanUrl)) {
+    return null;
+  }
   const proxies: Array<{ key: string; url: string }> = [
     { key: 'allorigins', url: `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}` },
     { key: 'codetabs', url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}` },
@@ -3508,6 +3519,34 @@ async function fetchWebArticleDirectInner(
   const timer = window.setTimeout(() => ctrl.abort(), 24000);
 
   try {
+    // Fast-path: Direct Image URL (manga page / comic strip / social image CDN)
+    if (isLikelyDirectImageUrl(cleanUrl)) {
+      const normalizedImgUrl = normalizeSocialImageUrl(cleanUrl);
+      const fileLabel = safePathFileName(new URL(normalizedImgUrl).pathname, 'Gambar Komik');
+      const comicMeta: MangaLinkMeta = {
+        isComic: true,
+        isDirectImage: true,
+        layout: 'single_image',
+        pageCount: 1,
+        pages: [{ index: 0, url: normalizedImgUrl, alt: fileLabel }],
+        drmProtected: false,
+      };
+      const entry: CachedWebEntry = {
+        url: normalizedImgUrl,
+        host,
+        titleId: deriveSeriesTitleId(normalizedImgUrl),
+        titleSrc: fileLabel,
+        srcParas: [],
+        detectedSource: 'ja',
+        novelNav: sanitizeNovelNav({ isNovel: false }),
+        comicMeta,
+        htmlFetchAttempted: true,
+      };
+      webArticleCache.set(cleanUrl, entry);
+      webArticleCache.set(normalizedImgUrl, entry);
+      return entry;
+    }
+
     let titleSrc = cached?.titleSrc || host;
     let srcParas: string[] = cached?.srcParas || [];
     let finalUrl = cached?.url || cleanUrl;
@@ -3525,38 +3564,38 @@ async function fetchWebArticleDirectInner(
       srcParas.length > 0 && rawHtml
         ? Promise.resolve()
         : (async () => {
-            const res = await fetchViaJinaHtmlAndLinks(cleanUrl, {
-              noCache: Boolean(knownToc?.isTocPage),
-              signal: ctrl.signal,
-            });
-            if (!res) return;
-            const challengeDetected = isChallengeOrBlockedPayload(res.title, res.html, res.content);
-            const mojibakeDetected = hasMojibake(`${res.title}\n${res.html.slice(0, 2000)}`);
-            if (challengeDetected) {
-              hitAntiBotChallenge = true;
-              return;
-            }
-            if (mojibakeDetected) {
-              // Shift_JIS / EUC-JP mojibake in HTML mode -> let Jina Rendered Markdown decode UTF-8 cleanly
-              return;
-            }
-            if (res.title) titleSrc = res.title;
-            if (
-              res.finalUrl &&
-              !isSuspiciousTrackerPayload(cleanUrl, res.title, res.finalUrl, res.html, res.content)
-            ) {
-              finalUrl = res.finalUrl;
-            }
-            if (res.html) rawHtml = res.html;
-            if (res.content) rawMarkdown = res.content;
-            if (res.links.length > 0) jinaLinks = res.links;
-            if (res.content || res.links.length > 0) {
-              navFromMd = extractNovelNavigationFromMarkdown(res.content, finalUrl, res.links);
-            }
-            if (res.content && srcParas.length === 0) {
-              srcParas = cleanReaderMarkdownToParagraphs(res.content, titleSrc);
-            }
-          })();
+          const res = await fetchViaJinaHtmlAndLinks(cleanUrl, {
+            noCache: Boolean(knownToc?.isTocPage),
+            signal: ctrl.signal,
+          });
+          if (!res) return;
+          const challengeDetected = isChallengeOrBlockedPayload(res.title, res.html, res.content);
+          const mojibakeDetected = hasMojibake(`${res.title}\n${res.html.slice(0, 2000)}`);
+          if (challengeDetected) {
+            hitAntiBotChallenge = true;
+            return;
+          }
+          if (mojibakeDetected) {
+            // Shift_JIS / EUC-JP mojibake in HTML mode -> let Jina Rendered Markdown decode UTF-8 cleanly
+            return;
+          }
+          if (res.title) titleSrc = res.title;
+          if (
+            res.finalUrl &&
+            !isSuspiciousTrackerPayload(cleanUrl, res.title, res.finalUrl, res.html, res.content)
+          ) {
+            finalUrl = res.finalUrl;
+          }
+          if (res.html) rawHtml = res.html;
+          if (res.content) rawMarkdown = res.content;
+          if (res.links.length > 0) jinaLinks = res.links;
+          if (res.content || res.links.length > 0) {
+            navFromMd = extractNovelNavigationFromMarkdown(res.content, finalUrl, res.links);
+          }
+          if (res.content && srcParas.length === 0) {
+            srcParas = cleanReaderMarkdownToParagraphs(res.content, titleSrc);
+          }
+        })();
 
     const earlyTocPromise =
       knownToc && !knownToc.isTocPage
@@ -3666,7 +3705,14 @@ async function fetchWebArticleDirectInner(
       hitAntiBotChallenge = true;
     }
 
-    if (srcParas.length === 0) {
+    const proseCharCount = srcParas.reduce((acc, p) => acc + p.length, 0);
+    const comicMeta = extractMangaPagesFromHtml(rawHtml, finalUrl, {
+      proseParagraphCount: srcParas.length,
+      proseCharCount,
+      jinaLinks,
+    });
+
+    if (srcParas.length === 0 && !comicMeta.isComic) {
       if (hitAntiBotChallenge) {
         throw new Error(
           `Situs ${host} memasang verifikasi keamanan / anti-bot (Cloudflare / CloudFront WAF) sehingga konten tidak dapat diambil otomatis. Buka situs asli atau salin teks halaman langsung ke tab Teks.`
@@ -3743,6 +3789,7 @@ async function fetchWebArticleDirectInner(
       srcParas,
       detectedSource,
       novelNav: mergedNav,
+      comicMeta: comicMeta.isComic ? comicMeta : undefined,
       rawHtml: rawHtml || undefined,
       rawMarkdown: rawMarkdown || undefined,
       htmlFetchAttempted: true,
@@ -3780,7 +3827,7 @@ export function prefetchWebArticleDirect(rawUrl?: string | null): void {
   if (!rawUrl || isMockOnlyLocalE2E()) return;
   const safe = toSafeHttpUrl(rawUrl);
   if (!safe || webArticleCache.has(safe)) return;
-  fetchWebArticleDirect(safe).catch(() => {});
+  fetchWebArticleDirect(safe).catch(() => { });
 }
 
 /**
@@ -3794,7 +3841,13 @@ export function prefetchNextChapterTranslatedDirect(
   view: 'reader' | 'site' = 'reader',
   theme?: 'Terang' | 'Gelap'
 ): void {
-  if (!rawUrl || isMockOnlyLocalE2E() || !getDeviceRuntimeProfile().allowBackgroundPrefetch) return;
+  if (
+    !rawUrl ||
+    isMockOnlyLocalE2E() ||
+    shouldShedBackgroundLoad(getStorageHealthSnapshot().usageRatio)
+  ) {
+    return;
+  }
   const safe = toSafeHttpUrl(rawUrl);
   if (!safe) return;
   const cacheKey = `${safe}::${mode}::${view}`;
@@ -3871,13 +3924,13 @@ function prewarmCurrentSiteHtmlDirect(params: {
   translatedParas: string[];
   theme?: 'Terang' | 'Gelap';
 }): void {
-  if (!getDeviceRuntimeProfile().allowBackgroundPrefetch) return;
+  if (shouldShedBackgroundLoad(getStorageHealthSnapshot().usageRatio)) return;
   const cacheKey = `${params.article.url}::${params.mode}::${params.theme || 'auto'}::site`;
   if (translatedSiteHtmlCache.has(cacheKey) || inFlightPreTranslations.has(cacheKey)) return;
   inFlightPreTranslations.add(cacheKey);
   const run = () => {
     void buildTranslatedSiteHtmlDirect(params)
-      .catch(() => {})
+      .catch(() => { })
       .finally(() => {
         inFlightPreTranslations.delete(cacheKey);
       });
@@ -3905,6 +3958,83 @@ export async function directPreviewLink(params: {
   const article = await fetchWebArticleDirect(params.url);
   const tid = params.titleId || article.titleId;
   const mid = `lnk_${Date.now().toString(36)}`;
+
+  // Comic / Manga / Direct-Image Link Path
+  if (article.comicMeta?.isComic) {
+    let firstImageResult: ImageTranslationResult | undefined;
+    let titleDst = article.titleSrc;
+    let detectedSource: TargetLang = article.detectedSource || 'ja';
+
+    if (article.comicMeta.isDirectImage && article.comicMeta.pages[0]) {
+      try {
+        firstImageResult = await directScanRemoteMangaPage({
+          imageUrl: article.comicMeta.pages[0].url,
+          mode: params.mode,
+          titleId: tid,
+          layout: article.comicMeta.layout,
+        });
+      } catch {
+        // Graceful fallback: open visual reader with paste/upload rescue if origin blocks CORS
+      }
+    } else if (article.titleSrc && article.titleSrc !== article.host) {
+      const trTitle = await translateParagraphsDirect({
+        paragraphs: [article.titleSrc],
+        mode: params.mode,
+        titleId: tid,
+        titleKind: 'komik',
+      });
+      titleDst = trTitle.outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
+      detectedSource = trTitle.detectedSource;
+    }
+
+    const excerptSrc = firstImageResult?.fullSrc.slice(0, 260) || '';
+    const excerptDst =
+      firstImageResult?.fullDst.slice(0, 320) ||
+      `Terdeteksi ${article.comicMeta.pageCount} halaman komik/manga. Buka Pembaca Komik Visual untuk memindai dan menerjemahkan dialog di atas gambar.`;
+
+    const preview: LinkPreviewPayload = {
+      mid,
+      cid: params.cid,
+      titleId: tid,
+      url: article.url,
+      host: article.host,
+      isAozora: false,
+      titleSrc: article.titleSrc,
+      titleDst,
+      excerptSrc,
+      excerptDst,
+      paragraphCount: firstImageResult ? firstImageResult.blocks.length : article.comicMeta.pageCount,
+      lockedNames: 0,
+      readerSupported: true,
+      novelNav: article.novelNav,
+      comicMeta: article.comicMeta,
+      firstImageResult,
+    };
+
+    await Promise.all([
+      upsertConversationMeta(params.cid, {
+        title: titleDst,
+        titleId: tid,
+        mode: params.mode,
+        detectedSource,
+        activeTab: 'link',
+        preview: excerptDst || titleDst,
+      }),
+      saveTurnMessageDirect(params.cid, mid, {
+        role: 'assistant',
+        kind: 'link',
+        mode: params.mode,
+        detectedSource,
+        titleId: tid,
+        srcText: article.url,
+        text: firstImageResult?.fullDst || excerptDst,
+        linkPreview: preview,
+        state: 'done',
+      }),
+    ]);
+
+    return preview;
+  }
 
   const cappedParas = article.srcParas.slice(0, 160);
   const fullInputs = [article.titleSrc, ...cappedParas];
@@ -3998,7 +4128,8 @@ function escapeHtml(s: string): string {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function buildTranxWebHref(
@@ -4046,58 +4177,79 @@ async function buildTranslatedSiteHtmlDirect(params: {
   const navButtonsHtml =
     nav.prevUrl || nav.nextUrl || nav.tocUrl
       ? `<div class="tranx-site-nav-bar" style="position:sticky;bottom:0;z-index:9999;background:#141917;color:#FAFBFA;padding:12px 16px;display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;border-top:1px solid #2B3230;font-family:Inter,-apple-system,sans-serif;font-size:14px;">
-          ${
-            nav.prevUrl
-              ? `<a href="${escapeHtml(buildTranxWebHref(nav.prevUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">&#8592; ${navLabels.prev}</a>`
-              : ''
-          }
-          ${
-            nav.tocUrl
-              ? `<a href="${escapeHtml(buildTranxWebHref(nav.tocUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">${navLabels.toc}</a>`
-              : ''
-          }
-          ${
-            nav.nextUrl
-              ? `<a href="${escapeHtml(buildTranxWebHref(nav.nextUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="background:#17695B;color:#FFFFFF;text-decoration:none;padding:8px 16px;border-radius:10px;font-weight:600;">${navLabels.next} &#8594;</a>`
-              : ''
-          }
+          ${nav.prevUrl
+        ? `<a href="${escapeHtml(buildTranxWebHref(nav.prevUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">&#8592; ${navLabels.prev}</a>`
+        : ''
+      }
+          ${nav.tocUrl
+        ? `<a href="${escapeHtml(buildTranxWebHref(nav.tocUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:#E7ECEA;text-decoration:none;padding:8px 14px;border:1px solid #3C4743;border-radius:10px;font-weight:600;">${navLabels.toc}</a>`
+        : ''
+      }
+          ${nav.nextUrl
+        ? `<a href="${escapeHtml(buildTranxWebHref(nav.nextUrl, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="background:#17695B;color:#FFFFFF;text-decoration:none;padding:8px 16px;border-radius:10px;font-weight:600;">${navLabels.next} &#8594;</a>`
+        : ''
+      }
         </div>`
       : '';
 
   if (article.rawHtml && !isChallengeOrBlockedPayload('', article.rawHtml, '')) {
     const doc = new DOMParser().parseFromString(article.rawHtml, 'text/html');
 
-    // Remove all executable/embedded/redirect tags AND JS-only loading curtains that stay white without JS
+    // Remove all executable/embedded/redirect/mXSS tags AND JS-only loading curtains that stay white without JS
     doc
       .querySelectorAll(
-        'script, noscript, iframe, frame, frameset, object, embed, applet, base, meta[http-equiv="refresh" i], meta[http-equiv="content-security-policy" i], meta[http-equiv="set-cookie" i], [id*="preloader"], [class*="preloader"], .page-loader, #loading-screen, .loading-overlay'
+        'script, noscript, iframe, frame, frameset, object, embed, applet, base, template, portal, math, svg, area, map, form, foreignobject, animate, animatemotion, animatetransform, set, use, meta[http-equiv], [id*="preloader"], [class*="preloader"], .page-loader, #loading-screen, .loading-overlay'
       )
       .forEach((el) => el.remove());
 
     // Sanitize attributes and rewrite every safe <a href> into tranX auto-translating /web links
+    const hasUnsafeCssClient = (css: string): boolean => {
+      if (!css) return false;
+      const decoded = css
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\\([0-9a-fA-F]{1,6})[ \t\r\n\f]?/g, (_m, hex: string) => {
+          const cp = parseInt(hex, 16);
+          return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+        })
+        .replace(/\\([^\r\n\f0-9a-fA-F])/g, '$1');
+      return /(?:@import\b|expression\s*\(|-moz-binding\s*:|behavior\s*:|\burl\s*\(|\bimage-set\s*\()/i.test(decoded);
+    };
+    const articleHost = (() => {
+      try {
+        return new URL(article.url).hostname.toLowerCase();
+      } catch {
+        return '';
+      }
+    })();
     const allElements = Array.from(doc.querySelectorAll('*'));
     for (const el of allElements) {
-      if (el.tagName === 'STYLE') {
+      const tag = el.tagName.toUpperCase();
+      if (tag === 'STYLE') {
         const cssText = el.textContent || '';
-        el.textContent = cssText
-          .replace(/@import[^;]+;?/gi, '')
-          .replace(/expression\s*\([^)]*\)/gi, '')
-          .replace(/url\s*\(\s*['"]?\s*(?:javascript|vbscript|data\s*:\s*text\/html|data\s*:\s*image\/svg)[^)]*\)/gi, 'none');
+        if (hasUnsafeCssClient(cssText)) {
+          el.remove();
+        }
         continue;
       }
 
       for (const attr of Array.from(el.attributes)) {
         const name = attr.name.toLowerCase();
-        if (name.startsWith('on') || name === 'srcdoc' || name === 'formaction') {
+        if (
+          name.startsWith('on') ||
+          name === 'srcdoc' ||
+          name === 'formaction' ||
+          name === 'ping' ||
+          name === 'srcset' ||
+          name === 'imagesrcset' ||
+          name === 'dynsrc' ||
+          name === 'lowsrc' ||
+          name === 'background'
+        ) {
           el.removeAttribute(attr.name);
           continue;
         }
         if (name === 'style') {
-          if (
-            /expression\s*\(|javascript\s*:|vbscript\s*:|@import|url\s*\(\s*['"]?\s*(?:javascript|vbscript|data\s*:\s*text\/html|data\s*:\s*image\/svg)/i.test(
-              attr.value
-            )
-          ) {
+          if (hasUnsafeCssClient(attr.value)) {
             el.removeAttribute(attr.name);
           }
           continue;
@@ -4113,8 +4265,11 @@ async function buildTranslatedSiteHtmlDirect(params: {
           if (
             cleanedVal.startsWith('javascript:') ||
             cleanedVal.startsWith('vbscript:') ||
+            cleanedVal.startsWith('file:') ||
+            cleanedVal.startsWith('blob:') ||
             cleanedVal.startsWith('data:text/html') ||
-            cleanedVal.startsWith('data:image/svg')
+            cleanedVal.startsWith('data:image/svg') ||
+            cleanedVal.startsWith('data:application/')
           ) {
             el.removeAttribute(attr.name);
           }
@@ -4122,6 +4277,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
       }
 
       if (el.tagName === 'A') {
+        el.removeAttribute('target');
         const rawHref = el.getAttribute('href') || '';
         const safeAbs = resolveSafeSiblingUrl(rawHref, article.url);
         if (safeAbs) {
@@ -4139,7 +4295,16 @@ async function buildTranslatedSiteHtmlDirect(params: {
         }
         const rawHref = el.getAttribute('href') || '';
         const safeAbs = resolveSafeSiblingUrl(rawHref, article.url);
+        let sameHostHttps = false;
         if (safeAbs) {
+          try {
+            const u = new URL(safeAbs);
+            sameHostHttps = u.protocol === 'https:' && (!articleHost || u.hostname.toLowerCase() === articleHost);
+          } catch {
+            sameHostHttps = false;
+          }
+        }
+        if (safeAbs && sameHostHttps) {
           el.setAttribute('href', safeAbs);
         } else {
           el.remove();
@@ -4159,14 +4324,22 @@ async function buildTranslatedSiteHtmlDirect(params: {
         ).trim();
         const isPlaceholderDataUri = /^data:image\/(gif|svg\+xml);/i.test(currentSrc);
         const rawSrc = (!currentSrc || isPlaceholderDataUri) && lazySrc ? lazySrc : currentSrc || lazySrc;
-        if (rawSrc && !rawSrc.startsWith('data:')) {
-          const safeAbs = resolveSafeSiblingUrl(rawSrc, article.url);
-          if (safeAbs) el.setAttribute('src', safeAbs);
+        if (rawSrc) {
+          if (rawSrc.toLowerCase().startsWith('data:')) {
+            if (!/^data:image\/(?:png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i.test(rawSrc)) {
+              el.removeAttribute('src');
+            }
+          } else {
+            const safeAbs = resolveSafeSiblingUrl(rawSrc, article.url);
+            if (safeAbs) el.setAttribute('src', safeAbs);
+            else el.removeAttribute('src');
+          }
         }
         const rawPoster = el.getAttribute('poster') || '';
         if (rawPoster) {
           const safePoster = resolveSafeSiblingUrl(rawPoster, article.url);
           if (safePoster) el.setAttribute('poster', safePoster);
+          else el.removeAttribute('poster');
         }
         const rawSrcset = el.getAttribute('srcset') || el.getAttribute('data-srcset') || '';
         if (rawSrcset) {
@@ -4304,6 +4477,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
         }
       });
 
+      const MAX_SITE_SYNC_NODES = 300;
       const pendingNodes: Text[] = [];
       const pendingTexts: string[] = [];
       for (const tn of textNodes) {
@@ -4311,7 +4485,7 @@ async function buildTranslatedSiteHtmlDirect(params: {
         const hit = ebookReuseMap.get(cleaned);
         if (hit) {
           tn.nodeValue = hit;
-        } else {
+        } else if (pendingTexts.length < MAX_SITE_SYNC_NODES) {
           pendingNodes.push(tn);
           pendingTexts.push((tn.nodeValue || '').trim());
         }
@@ -4389,12 +4563,13 @@ async function buildTranslatedSiteHtmlDirect(params: {
   const translatedChapMap =
     nav.chapters && nav.chapters.length > 0
       ? await translateChapterTitlesDirect({
-          chapters: nav.chapters,
-          mode,
-          titleId: params.titleId || article.titleId,
-          tocKey: nav.tocUrl || article.url,
-          seriesTitle: nav.seriesTitle,
-        })
+        chapters: nav.chapters,
+        mode,
+        titleId: params.titleId || article.titleId,
+        tocKey: nav.tocUrl || article.url,
+        seriesTitle: nav.seriesTitle,
+        signal,
+      })
       : {};
 
   const chaptersHtml =
@@ -4403,11 +4578,11 @@ async function buildTranslatedSiteHtmlDirect(params: {
           <h2 style="font-family:Inter,-apple-system,sans-serif;font-size:16px;">${navLabels.toc} (${nav.chapters.length})</h2>
           <ul style="list-style:none;padding:0;margin:12px 0;display:flex;flex-direction:column;gap:8px;font-family:Inter,-apple-system,sans-serif;font-size:14px;">
             ${nav.chapters
-              .map(
-                (ch) =>
-                  `<li><a href="${escapeHtml(buildTranxWebHref(ch.url, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:${linkHex};font-weight:${ch.current ? '700' : '500'};text-decoration:none;">${escapeHtml(translatedChapMap[ch.url] || ch.titleDst || ch.title)}</a></li>`
-              )
-              .join('')}
+        .map(
+          (ch) =>
+            `<li><a href="${escapeHtml(buildTranxWebHref(ch.url, mode, 'site', params.titleId))}" target="_top" rel="noopener noreferrer" style="color:${linkHex};font-weight:${ch.current ? '700' : '500'};text-decoration:none;">${escapeHtml(translatedChapMap[ch.url] || ch.titleDst || ch.title)}</a></li>`
+        )
+        .join('')}
           </ul>
         </section>`
       : '';
@@ -4421,11 +4596,10 @@ async function buildTranslatedSiteHtmlDirect(params: {
 <style>
   :root { color-scheme: ${isDarkFallback ? 'dark' : 'light dark'}; }
   body { margin: 0; padding: 24px 18px 24px; background: ${bgHex}; color: ${textHex}; font-family: ${fontStack}; font-size: 18px; line-height: 1.78; word-break: break-word; overflow-wrap: anywhere; }
-  ${
-    !theme
+  ${!theme
       ? '@media (prefers-color-scheme: dark) { body { background: #171B1A; color: #E7ECEA; } header { border-bottom-color: #2B3230 !important; } .meta { color: #A5AEAA !important; } }'
       : ''
-  }
+    }
   article { max-width: 700px; margin: 0 auto 32px; }
   header { margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid ${borderHex}; }
   h1 { font-size: clamp(20px, 5.2vw, 26px); line-height: 1.32; margin: 0 0 8px 0; }
@@ -4470,15 +4644,51 @@ export async function directFetchWebReaderBundle(params: {
   let titleDst = article.titleSrc;
   let translatedParas = cappedSrc;
 
+  if (article.comicMeta?.isComic && cappedSrc.length < 15) {
+    let comicTitleDst = article.titleSrc;
+    if (params.view !== 'original' && article.titleSrc && article.titleSrc !== article.host && !article.comicMeta.isDirectImage) {
+      const tr = await translateParagraphsDirect({
+        paragraphs: [article.titleSrc],
+        mode: params.mode,
+        titleId: tid,
+        titleKind: 'komik',
+        signal: params.signal,
+      });
+      comicTitleDst = tr.outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
+    }
+    const firstUrl = article.comicMeta.pages[0]?.url;
+    const cachedFirst = firstUrl ? scannedMangaPageCache.get(`${firstUrl}::${params.mode}`) : undefined;
+    return {
+      url: article.url,
+      host: article.host,
+      titleId: tid,
+      detectedSource: article.detectedSource,
+      titleSrc: article.titleSrc,
+      titleDst: comicTitleDst,
+      sentences: [],
+      novelNav: article.novelNav,
+      comicMeta: article.comicMeta,
+      firstImageResult: cachedFirst,
+    };
+  }
+
   if (params.view !== 'original') {
     const cacheKey1 = `${article.url}::${params.mode}`;
     const cacheKey2 = `${normalizeWebUrl(params.url)}::${params.mode}`;
     let preTranslated = translatedWebCache.get(cacheKey1) || translatedWebCache.get(cacheKey2);
-    if (preTranslated && isBlockedArticleOrTranslation(preTranslated.heading, preTranslated.paras)) {
-      translatedWebCache.delete(cacheKey1);
-      translatedWebCache.delete(cacheKey2);
-      void idbDelete('articles', `tr::${cacheKey1}`);
-      void idbDelete('articles', `tr::${cacheKey2}`);
+    if (
+      preTranslated &&
+      (isBlockedArticleOrTranslation(preTranslated.heading, preTranslated.paras) ||
+        !Array.isArray(preTranslated.paras) ||
+        preTranslated.paras.length < cappedSrc.length ||
+        cappedSrc.some((s, i) => isStillUntranslatedForTarget(s, preTranslated!.paras[i] || '', tgt)))
+    ) {
+      if (isBlockedArticleOrTranslation(preTranslated.heading, preTranslated.paras)) {
+        translatedWebCache.delete(cacheKey1);
+        translatedWebCache.delete(cacheKey2);
+        void idbDelete('articles', `tr::${cacheKey1}`);
+        void idbDelete('articles', `tr::${cacheKey2}`);
+      }
       preTranslated = undefined;
     }
     if (!preTranslated) {
@@ -4490,10 +4700,10 @@ export async function directFetchWebReaderBundle(params: {
         )) ||
         (cacheKey2 !== cacheKey1
           ? await idbGet<{ heading: string; paras: string[] }>(
-              'articles',
-              `tr::${cacheKey2}`,
-              12 * 60 * 60 * 1000
-            )
+            'articles',
+            `tr::${cacheKey2}`,
+            12 * 60 * 60 * 1000
+          )
           : undefined);
       if (idbTr && isBlockedArticleOrTranslation(idbTr.heading, idbTr.paras)) {
         void idbDelete('articles', `tr::${cacheKey1}`);
@@ -4523,43 +4733,43 @@ export async function directFetchWebReaderBundle(params: {
         onProgress:
           params.onProgress && params.view === 'reader'
             ? (partialOutputs, doneCount, totalCount) => {
-                // Emit longest contiguous translated prefix starting at index 0 so the reader streams cleanly top-to-bottom without untranslated flicker
-                let prefixLen = 0;
-                for (let idx = 0; idx < cappedSrc.length; idx += 1) {
-                  if (partialOutputs[idx + 1]) {
-                    prefixLen = idx + 1;
-                  } else {
-                    break;
-                  }
+              // Emit longest contiguous translated prefix starting at index 0 so the reader streams cleanly top-to-bottom without untranslated flicker
+              let prefixLen = 0;
+              for (let idx = 0; idx < cappedSrc.length; idx += 1) {
+                if (partialOutputs[idx + 1]) {
+                  prefixLen = idx + 1;
+                } else {
+                  break;
                 }
-                if (prefixLen === 0 || (prefixLen === lastStreamedPrefixLen && doneCount < totalCount)) {
-                  return;
-                }
-                lastStreamedPrefixLen = prefixLen;
-                const partialTitle =
-                  partialOutputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
-                const partialSentences: SentencePair[] = cappedSrc
-                  .slice(0, prefixLen)
-                  .map((srcLine, idx) => ({
-                    i: idx,
-                    src: srcLine.replace(/^#{1,6}\s+/, ''),
-                    dst: (partialOutputs[idx + 1] || srcLine).replace(/^#{1,6}\s+/, ''),
-                  }));
-                params.onProgress?.(
-                  {
-                    url: article.url,
-                    host: article.host,
-                    titleId: tid,
-                    detectedSource: article.detectedSource,
-                    titleSrc: article.titleSrc,
-                    titleDst: partialTitle,
-                    sentences: partialSentences,
-                    novelNav: article.novelNav,
-                  },
-                  Math.max(prefixLen, doneCount - 1),
-                  cappedSrc.length
-                );
               }
+              if (prefixLen === 0 || (prefixLen === lastStreamedPrefixLen && doneCount < totalCount)) {
+                return;
+              }
+              lastStreamedPrefixLen = prefixLen;
+              const partialTitle =
+                partialOutputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
+              const partialSentences: SentencePair[] = cappedSrc
+                .slice(0, prefixLen)
+                .map((srcLine, idx) => ({
+                  i: idx,
+                  src: srcLine.replace(/^#{1,6}\s+/, ''),
+                  dst: (partialOutputs[idx + 1] || srcLine).replace(/^#{1,6}\s+/, ''),
+                }));
+              params.onProgress?.(
+                {
+                  url: article.url,
+                  host: article.host,
+                  titleId: tid,
+                  detectedSource: article.detectedSource,
+                  titleSrc: article.titleSrc,
+                  titleDst: partialTitle,
+                  sentences: partialSentences,
+                  novelNav: article.novelNav,
+                },
+                Math.max(prefixLen, doneCount - 1),
+                cappedSrc.length
+              );
+            }
             : undefined,
       });
       titleDst = outputs[0]?.replace(/^#{1,6}\s+/, '') || article.titleSrc;
@@ -4632,6 +4842,7 @@ export async function directFetchWebReaderBundle(params: {
     titleDst,
     sentences,
     novelNav: article.novelNav,
+    comicMeta: article.comicMeta,
     siteHtml,
   };
 }
@@ -4720,6 +4931,27 @@ async function extractZipTextEntries(
   let cdOffset = view.getUint32(eocdOffset + 16, true);
   let totalUncompressed = 0;
 
+  const SAFE_EPUB_DOCTYPE_RE =
+    /^<!doctype\s+(?:html\s*>|(?:html|ncx)\s+public\s+["'](?:-\/\/w3c\/\/dtd\s+x?html\s+[0-9.]+(?:\s+(?:strict|transitional|frameset))?\/\/en|-\/\/niso\/\/dtd\s+ncx\s+2005-1\/\/en)["'](?:\s+["']https?:\/\/(?:www\.w3\.org\/tr\/x?html[^"'\[\]<>]*|www\.daisy\.org\/z3986\/2005\/ncx-2005-1\.dtd)["'])?\s*>)$/i;
+
+  const assertSafeArchiveXml = (entryName: string, decodedEntry: string): void => {
+    if (/<!ENTITY\b/i.test(decodedEntry)) {
+      throw new Error('Deklarasi DOCTYPE/entitas XML eksternal (XXE) ditolak demi keamanan.');
+    }
+    const doctypeMatches = decodedEntry.match(/<!DOCTYPE\b[^>]{0,512}>?/gi);
+    if (!doctypeMatches) return;
+    const allowEpubHtmlDoctype = /\.(?:xhtml|html|htm|ncx)$/i.test(entryName);
+    if (!allowEpubHtmlDoctype) {
+      throw new Error('Deklarasi DOCTYPE/entitas XML eksternal (XXE) ditolak demi keamanan.');
+    }
+    for (const frag of doctypeMatches) {
+      if (frag.includes('[') || !SAFE_EPUB_DOCTYPE_RE.test(frag.trim())) {
+        throw new Error('Deklarasi DOCTYPE/entitas XML eksternal (XXE) ditolak demi keamanan.');
+      }
+    }
+  };
+
+  const entrySpans: Array<[number, number]> = [];
   for (let e = 0; e < totalEntries && cdOffset + 46 <= bytes.length; e += 1) {
     if (view.getUint32(cdOffset, true) !== 0x02014b50) break;
     const method = view.getUint16(cdOffset + 10, true);
@@ -4733,15 +4965,21 @@ async function extractZipTextEntries(
     const name = decoder.decode(bytes.subarray(cdOffset + 46, cdOffset + 46 + nameLen));
     cdOffset += 46 + nameLen + extraLen + commentLen;
 
-    if (name.includes('..') || name.startsWith('/') || !predicate(name)) continue;
+    if (name.includes('..') || name.startsWith('/')) continue;
     if (localHeaderOffset + 30 > bytes.length) continue;
-    if (totalUncompressed + uncompSize > MAX_UNCOMPRESSED_BYTES) {
-      throw new Error('Ukuran isi dokumen melebihi batas aman 50 MB.');
+    if (view.getUint32(localHeaderOffset, true) !== 0x04034b50) {
+      throw new Error('Header lokal berkas ZIP tidak sah.');
     }
-
     const lNameLen = view.getUint16(localHeaderOffset + 26, true);
     const lExtraLen = view.getUint16(localHeaderOffset + 28, true);
     const dataStart = localHeaderOffset + 30 + lNameLen + lExtraLen;
+    if (dataStart < 0 || dataStart + compSize > bytes.length) continue;
+    entrySpans.push([localHeaderOffset, dataStart + compSize]);
+
+    if (!predicate(name)) continue;
+    if (totalUncompressed + uncompSize > MAX_UNCOMPRESSED_BYTES) {
+      throw new Error('Ukuran isi dokumen melebihi batas aman 50 MB.');
+    }
     const rawSlice = bytes.subarray(dataStart, dataStart + compSize);
 
     if (method === 0) {
@@ -4750,15 +4988,12 @@ async function extractZipTextEntries(
         throw new Error('Ukuran isi dokumen melebihi batas aman 50 MB.');
       }
       const decodedEntry = decoder.decode(rawSlice);
-      if (/<!ENTITY/i.test(decodedEntry.slice(0, 8192))) {
-        throw new Error('Entitas XML eksternal (XXE) ditolak demi keamanan.');
-      }
+      assertSafeArchiveXml(name, decodedEntry);
       out.set(name, decodedEntry);
     } else if (method === 8 && typeof DecompressionStream !== 'undefined') {
       const ds = new DecompressionStream('deflate-raw');
       const writer = ds.writable.getWriter();
-      writer.write(rawSlice);
-      writer.close();
+      void writer.write(rawSlice).then(() => writer.close()).catch(() => { });
       const reader = ds.readable.getReader();
       const chunks: Uint8Array[] = [];
       let entryBytes = 0;
@@ -4769,7 +5004,7 @@ async function extractZipTextEntries(
           entryBytes += value.byteLength;
           totalUncompressed += value.byteLength;
           if (totalUncompressed > MAX_UNCOMPRESSED_BYTES) {
-            await reader.cancel();
+            await Promise.allSettled([reader.cancel(), writer.abort()]);
             throw new Error('Ukuran isi dokumen melebihi batas aman 50 MB.');
           }
           chunks.push(value);
@@ -4782,96 +5017,20 @@ async function extractZipTextEntries(
         offset += c.byteLength;
       }
       const decodedEntry = decoder.decode(merged);
-      if (/<!ENTITY/i.test(decodedEntry.slice(0, 8192))) {
-        throw new Error('Entitas XML eksternal (XXE) ditolak demi keamanan.');
-      }
+      assertSafeArchiveXml(name, decodedEntry);
       out.set(name, decodedEntry);
+    }
+  }
+  entrySpans.sort((a, b) => a[0] - b[0]);
+  for (let i = 1; i < entrySpans.length; i += 1) {
+    if (entrySpans[i][0] < entrySpans[i - 1][1] && entrySpans[i][0] >= entrySpans[i - 1][0]) {
+      throw new Error('Arsip ZIP memiliki entri tumpang tindih (potensi zip bomb).');
     }
   }
   return out;
 }
 
-export function inspectBinaryMagicBytes(
-  bytes: Uint8Array,
-  ext: string,
-  kind: 'gambar' | 'dokumen'
-): string | null {
-  if (bytes.byteLength === 0) {
-    return 'Berkas kosong dan tidak dapat diproses.';
-  }
-  const cleanExt = ext.toLowerCase();
-
-  if (kind === 'gambar') {
-    const isPng =
-      bytes.byteLength >= 8 &&
-      bytes[0] === 0x89 &&
-      bytes[1] === 0x50 &&
-      bytes[2] === 0x4e &&
-      bytes[3] === 0x47 &&
-      bytes[4] === 0x0d &&
-      bytes[5] === 0x0a &&
-      bytes[6] === 0x1a &&
-      bytes[7] === 0x0a;
-    const isJpeg =
-      bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
-    const isWebp =
-      bytes.byteLength >= 12 &&
-      bytes[0] === 0x52 &&
-      bytes[1] === 0x49 &&
-      bytes[2] === 0x46 &&
-      bytes[3] === 0x46 &&
-      bytes[8] === 0x57 &&
-      bytes[9] === 0x45 &&
-      bytes[10] === 0x42 &&
-      bytes[11] === 0x50;
-    if (!isPng && !isJpeg && !isWebp) {
-      return 'Isi biner berkas bukan gambar PNG, JPG, atau WEBP yang sah.';
-    }
-    return null;
-  }
-
-  if (cleanExt === 'pdf') {
-    const head = new TextDecoder('latin1').decode(bytes.subarray(0, Math.min(bytes.byteLength, 1024)));
-    if (!head.includes('%PDF-')) {
-      return 'Isi biner berkas bukan dokumen PDF yang sah.';
-    }
-    return null;
-  }
-
-  if (cleanExt === 'docx' || cleanExt === 'epub') {
-    const isZip =
-      bytes.byteLength >= 4 &&
-      bytes[0] === 0x50 &&
-      bytes[1] === 0x4b &&
-      (bytes[2] === 0x03 || bytes[2] === 0x05);
-    if (!isZip) {
-      return `Berkas .${cleanExt} rusak atau bukan arsip dokumen yang sah.`;
-    }
-    return null;
-  }
-
-  const hasUtf16Bom =
-    bytes.byteLength >= 2 &&
-    ((bytes[0] === 0xfe && bytes[1] === 0xff) || (bytes[0] === 0xff && bytes[1] === 0xfe));
-  if (!hasUtf16Bom) {
-    const sampleLen = Math.min(bytes.byteLength, 512);
-    for (let i = 0; i < sampleLen; i += 1) {
-      if (bytes[i] === 0x00) {
-        return `Isi biner berkas tidak sesuai dengan format teks .${cleanExt}.`;
-      }
-    }
-  }
-  return null;
-}
-
-export async function validateUploadedFileMagic(
-  file: File,
-  kind: 'gambar' | 'dokumen'
-): Promise<string | null> {
-  const ext = (file.name.split('.').pop() || '').toLowerCase();
-  const sliceBuf = await file.slice(0, 1024).arrayBuffer();
-  return inspectBinaryMagicBytes(new Uint8Array(sliceBuf), ext, kind);
-}
+// inspectBinaryMagicBytes & validateUploadedFileMagic are imported & re-exported from ./langUtils
 
 interface ParsedDocUnit {
   prefix?: string;
@@ -4887,8 +5046,8 @@ async function decompressFlateBytes(
     try {
       const ds = new DecompressionStream(format);
       const writer = ds.writable.getWriter();
-      writer.write(raw).catch(() => {});
-      writer.close().catch(() => {});
+      writer.write(raw).catch(() => { });
+      writer.close().catch(() => { });
       const reader = ds.readable.getReader();
       const chunks: Uint8Array[] = [];
       let total = 0;
@@ -4996,12 +5155,14 @@ function decodeHexToUnicode(hex: string, cmap: Map<string, string>): string {
 }
 
 function parseCMapInto(streamText: string, cmap: Map<string, string>): void {
+  const MAX_CMAP_ENTRIES = 65536;
+  if (cmap.size >= MAX_CMAP_ENTRIES) return;
   const bfcharRe = /beginbfchar([\s\S]*?)endbfchar/g;
   let m: RegExpExecArray | null;
-  while ((m = bfcharRe.exec(streamText)) !== null) {
+  while ((m = bfcharRe.exec(streamText)) !== null && cmap.size < MAX_CMAP_ENTRIES) {
     const pairRe = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g;
     let pm: RegExpExecArray | null;
-    while ((pm = pairRe.exec(m[1])) !== null) {
+    while ((pm = pairRe.exec(m[1])) !== null && cmap.size < MAX_CMAP_ENTRIES) {
       const srcHex = pm[1].toUpperCase();
       const dstHex = pm[2];
       const u16 = new Uint8Array(Math.floor(dstHex.length / 2));
@@ -5012,15 +5173,18 @@ function parseCMapInto(streamText: string, cmap: Map<string, string>): void {
     }
   }
   const bfrangeRe = /beginbfrange([\s\S]*?)endbfrange/g;
-  while ((m = bfrangeRe.exec(streamText)) !== null) {
+  while ((m = bfrangeRe.exec(streamText)) !== null && cmap.size < MAX_CMAP_ENTRIES) {
     const rangeRe = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g;
     let rm: RegExpExecArray | null;
-    while ((rm = rangeRe.exec(m[1])) !== null) {
+    while ((rm = rangeRe.exec(m[1])) !== null && cmap.size < MAX_CMAP_ENTRIES) {
       const start = parseInt(rm[1], 16);
       const end = Math.min(parseInt(rm[2], 16), start + 512);
       let codePoint = parseInt(rm[3], 16);
       const width = rm[1].length;
-      for (let cur = start; cur <= end; cur += 1, codePoint += 1) {
+      for (let cur = start; cur <= end && cmap.size < MAX_CMAP_ENTRIES; cur += 1, codePoint += 1) {
+        if (codePoint < 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+          continue;
+        }
         cmap.set(
           cur.toString(16).toUpperCase().padStart(width, '0'),
           String.fromCodePoint(codePoint)
@@ -5078,6 +5242,8 @@ function extractTextFromPdfContentStream(content: string, cmap: Map<string, stri
 
     let pendingStr = '';
     const numWindow: number[] = [];
+    const stickyNumRe = /[-+]?\d+(?:\.\d+)?/y;
+    const stickyTokRe = /[^\s()<>[\]/%]+/y;
 
     while (idx < block.length) {
       const ch = block[idx];
@@ -5104,20 +5270,35 @@ function extractTextFromPdfContentStream(content: string, cmap: Map<string, stri
         while (idx < block.length && block[idx] !== ']') {
           if (block[idx] === '(') arrText += readParen();
           else if (block[idx] === '<' && block[idx + 1] !== '<') arrText += readHex();
-          else idx += 1;
+          else if (/[-+\d.]/.test(block[idx])) {
+            stickyNumRe.lastIndex = idx;
+            const numMatch = stickyNumRe.exec(block);
+            if (numMatch) {
+              const kern = Number(numMatch[0]);
+              if (kern <= -180 && arrText && !arrText.endsWith(' ') && !CJK_RE.test(arrText.slice(-1))) {
+                arrText += ' ';
+              }
+              idx = stickyNumRe.lastIndex;
+            } else {
+              idx += 1;
+            }
+          } else {
+            idx += 1;
+          }
         }
         if (block[idx] === ']') idx += 1;
         pendingStr = arrText;
         continue;
       }
 
-      const tokMatch = block.slice(idx).match(/^([^\s()<>[\]/%]+)/);
+      stickyTokRe.lastIndex = idx;
+      const tokMatch = stickyTokRe.exec(block);
       if (!tokMatch) {
         idx += 1;
         continue;
       }
-      const tok = tokMatch[1];
-      idx += tok.length;
+      const tok = tokMatch[0];
+      idx = stickyTokRe.lastIndex;
 
       const asNum = Number(tok);
       if (!Number.isNaN(asNum)) {
@@ -5256,17 +5437,36 @@ interface WarmTesseractSlot {
 }
 
 const warmTesseractWorkers = new Map<string, WarmTesseractSlot>();
-const TESSERACT_IDLE_TTL_MS = 120_000;
+
+function getTesseractIdleTtlMs(): number {
+  return getDeviceRuntimeProfile().isConstrained ? 25_000 : 60_000;
+}
+
+function terminateAllWarmTesseractWorkers(): void {
+  for (const [, slot] of warmTesseractWorkers.entries()) {
+    if (slot.idleTimer !== null) {
+      globalThis.clearTimeout(slot.idleTimer);
+      slot.idleTimer = null;
+    }
+    slot.workerPromise.then((w) => w.terminate()).catch(() => { });
+  }
+  warmTesseractWorkers.clear();
+}
 
 async function getWarmTesseractSlot(langs: string[]): Promise<WarmTesseractSlot> {
   const key = langs.join('+');
   const existing = warmTesseractWorkers.get(key);
   if (existing) {
-    if (existing.idleTimer !== null && typeof window !== 'undefined') {
-      window.clearTimeout(existing.idleTimer);
+    if (existing.idleTimer !== null) {
+      globalThis.clearTimeout(existing.idleTimer);
       existing.idleTimer = null;
     }
     return existing;
+  }
+
+  // Cap resident WASM OCR workers strictly to 1 (~60-110 MB each) so mobile PWA never hits OOM
+  if (warmTesseractWorkers.size >= 1) {
+    terminateAllWarmTesseractWorkers();
   }
 
   const workerPromise = (async () => {
@@ -5281,7 +5481,7 @@ async function getWarmTesseractSlot(langs: string[]): Promise<WarmTesseractSlot>
     return createWorker(langs, 1, {
       workerPath: resolvedWorkerUrl,
       workerBlobURL: false,
-      logger: () => {},
+      logger: () => { },
     });
   })();
 
@@ -5302,14 +5502,123 @@ async function getWarmTesseractSlot(langs: string[]): Promise<WarmTesseractSlot>
 
 function scheduleTesseractIdleCleanup(key: string, slot: WarmTesseractSlot): void {
   if (typeof window === 'undefined') return;
-  if (slot.idleTimer !== null) window.clearTimeout(slot.idleTimer);
-  slot.idleTimer = window.setTimeout(() => {
+  if (slot.idleTimer !== null) globalThis.clearTimeout(slot.idleTimer);
+  slot.idleTimer = globalThis.setTimeout(() => {
     if (warmTesseractWorkers.get(key) !== slot) return;
     warmTesseractWorkers.delete(key);
     slot.workerPromise
       .then((w) => w.terminate())
-      .catch(() => {});
-  }, TESSERACT_IDLE_TTL_MS);
+      .catch(() => { });
+  }, getTesseractIdleTtlMs()) as unknown as number;
+}
+
+async function preprocessImageForTesseract(
+  imageSource: string | HTMLCanvasElement,
+  imgW: number,
+  imgH: number
+): Promise<{ source: string | HTMLCanvasElement; scale: number; dispose: () => void }> {
+  if (typeof document === 'undefined' || imgW <= 0 || imgH <= 0) {
+    return { source: imageSource, scale: 1, dispose: () => { } };
+  }
+  const baseScale = Math.max(imgW, imgH) < 1100 ? 2 : 1;
+  // Single uniform scale across both axes preserves aspect ratio & exact Tesseract OCR box coordinates
+  const effScale = Math.min(baseScale, 2400 / imgW, 3200 / imgH);
+  const targetW = Math.max(1, Math.round(imgW * effScale));
+  const targetH = Math.max(1, Math.round(imgH * effScale));
+  if (targetW * targetH > 6_400_000) {
+    return { source: imageSource, scale: 1, dispose: () => { } };
+  }
+  try {
+    let drawSource: CanvasImageSource;
+    if (typeof imageSource === 'string') {
+      drawSource = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = () => reject(new Error('load failed'));
+        im.src = imageSource;
+      });
+    } else {
+      drawSource = imageSource;
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) {
+      canvas.width = 0;
+      canvas.height = 0;
+      return { source: imageSource, scale: 1, dispose: () => { } };
+    }
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(drawSource, 0, 0, targetW, targetH);
+
+    // Rec. 709 grayscale + 2%-98% contrast stretch + dark-bubble auto-inversion + mild 3x3 unsharp boost
+    const imgData = ctx.getImageData(0, 0, targetW, targetH);
+    const d = imgData.data;
+    const hist = new Uint32Array(256);
+    const lum = new Uint8Array(targetW * targetH);
+    for (let i = 0, p = 0; i < d.length; i += 4, p += 1) {
+      const y = Math.round(0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]);
+      lum[p] = y;
+      hist[y] += 1;
+    }
+    const totalPx = targetW * targetH;
+    let acc = 0;
+    let p02 = -1;
+    let p50 = -1;
+    let p98 = 255;
+    for (let v = 0; v < 256; v += 1) {
+      acc += hist[v];
+      if (p02 === -1 && acc >= totalPx * 0.02) p02 = v;
+      if (p50 === -1 && acc >= totalPx * 0.5) p50 = v;
+      if (acc >= totalPx * 0.98) {
+        p98 = v;
+        break;
+      }
+    }
+    if (p02 < 0) p02 = 0;
+    if (p50 < 0) p50 = 128;
+    const span = Math.max(16, p98 - p02);
+    const invertDark = p50 < 110;
+    const stretched = new Uint8Array(totalPx);
+    for (let p = 0; p < totalPx; p += 1) {
+      let val = Math.max(0, Math.min(255, Math.round(((lum[p] - p02) * 255) / span)));
+      if (invertDark) val = 255 - val;
+      stretched[p] = val;
+    }
+    // Lightweight 3x3 unsharp mask on interior pixels (amount=0.45)
+    for (let y = 1; y < targetH - 1; y += 1) {
+      const rowOff = y * targetW;
+      for (let x = 1; x < targetW - 1; x += 1) {
+        const idx = rowOff + x;
+        const blur =
+          (stretched[idx - targetW] +
+            stretched[idx + targetW] +
+            stretched[idx - 1] +
+            stretched[idx + 1] +
+            stretched[idx] * 2) /
+          6;
+        const sharp = Math.max(0, Math.min(255, Math.round(stretched[idx] + 0.45 * (stretched[idx] - blur))));
+        const o = idx * 4;
+        d[o] = sharp;
+        d[o + 1] = sharp;
+        d[o + 2] = sharp;
+        d[o + 3] = 255;
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+    return {
+      source: canvas,
+      scale: effScale,
+      dispose: () => {
+        canvas.width = 0;
+        canvas.height = 0;
+      },
+    };
+  } catch {
+    return { source: imageSource, scale: 1, dispose: () => { } };
+  }
 }
 
 async function runTesseractOcrBoxes(
@@ -5334,10 +5643,13 @@ async function runTesseractOcrBoxes(
       window.clearTimeout(slot.idleTimer);
       slot.idleTimer = null;
     }
+    const prep = await preprocessImageForTesseract(imageSource, imgW, imgH);
+    const effW = imgW * prep.scale;
+    const effH = imgH * prep.scale;
     try {
       const worker = await slot.workerPromise;
       const { data } = await worker.recognize(
-        imageSource,
+        prep.source,
         {},
         { text: true, blocks: true }
       );
@@ -5347,14 +5659,17 @@ async function runTesseractOcrBoxes(
       for (const blk of blocks) {
         const paras = Array.isArray(blk.paragraphs) ? blk.paragraphs : [];
         for (const para of paras) {
+          if (typeof para.confidence === 'number' && para.confidence > 0 && para.confidence < 38) {
+            continue;
+          }
           const cleaned = cleanCjkSpacing((para.text || '').replace(/\s+/g, ' ').trim());
           if (!cleaned || !hasTranslatableLetters(cleaned)) continue;
           const bb = para.bbox || blk.bbox;
           if (bb) {
-            const ymin = Math.max(0, Math.min(1000, Math.round((bb.y0 / imgH) * 1000)));
-            const xmin = Math.max(0, Math.min(1000, Math.round((bb.x0 / imgW) * 1000)));
-            const ymax = Math.max(0, Math.min(1000, Math.round((bb.y1 / imgH) * 1000)));
-            const xmax = Math.max(0, Math.min(1000, Math.round((bb.x1 / imgW) * 1000)));
+            const ymin = Math.max(0, Math.min(1000, Math.round((bb.y0 / effH) * 1000)));
+            const xmin = Math.max(0, Math.min(1000, Math.round((bb.x0 / effW) * 1000)));
+            const ymax = Math.max(0, Math.min(1000, Math.round((bb.y1 / effH) * 1000)));
+            const xmax = Math.max(0, Math.min(1000, Math.round((bb.x1 / effW) * 1000)));
             out.push({ id: out.length + 1, box_2d: [ymin, xmin, ymax, xmax], text: cleaned });
           }
         }
@@ -5380,14 +5695,16 @@ async function runTesseractOcrBoxes(
         warmTesseractWorkers.delete(key);
         slot.workerPromise
           .then((w) => w.terminate())
-          .catch(() => {});
+          .catch(() => { });
       }
       throw err;
+    } finally {
+      prep.dispose();
     }
   };
 
   const resultPromise = slot.queue.then(runRecognize, runRecognize);
-  slot.queue = resultPromise.catch(() => {});
+  slot.queue = resultPromise.catch(() => { });
   return resultPromise;
 }
 
@@ -5402,87 +5719,216 @@ async function extractPdfUnitsWithPdfJs(
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrlMod.default;
 
   const loadingTask = pdfjs.getDocument({
-    data: new Uint8Array(buffer.slice(0)),
+    data: new Uint8Array(buffer),
     cMapUrl: `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjs.version}/cmaps/`,
     cMapPacked: true,
     standardFontDataUrl: `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjs.version}/standard_fonts/`,
   });
-  const pdf = await loadingTask.promise;
+  try {
+    const pdf = await loadingTask.promise;
 
-  if (pdf.numPages > 500) {
-    throw new Error(`PDF memiliki ${pdf.numPages} halaman (batas maksimum 500 halaman).`);
-  }
+    if (pdf.numPages > 500) {
+      throw new Error(`PDF memiliki ${pdf.numPages} halaman (batas maksimum 500 halaman).`);
+    }
 
-  const units: ParsedDocUnit[] = [];
-  const maxPages = Math.min(pdf.numPages, 120);
+    const maxPages = Math.min(pdf.numPages, 120);
+    const pageLineGroups: string[][] = [];
 
-  for (let p = 1; p <= maxPages; p += 1) {
-    const page = await pdf.getPage(p);
-    const textContent = await page.getTextContent();
-    const lines: string[] = [];
-    let curLine = '';
-    let prevY: number | null = null;
+    for (let p = 1; p <= maxPages; p += 1) {
+      const page = await pdf.getPage(p);
+      try {
+        const viewport = page.getViewport({ scale: 1 });
+        const pageW = Math.max(100, viewport.width || 612);
+        const textContent = await page.getTextContent();
 
-    for (const rawItem of textContent.items) {
-      if (!('str' in rawItem)) continue;
-      const str = rawItem.str || '';
-      const tx = Array.isArray(rawItem.transform) ? Number(rawItem.transform[5]) : null;
-      if (prevY !== null && tx !== null && Math.abs(tx - prevY) > 4) {
-        if (curLine.trim()) lines.push(cleanCjkSpacing(curLine.trim()));
-        curLine = str;
-      } else {
-        curLine += curLine && !curLine.endsWith(' ') && !CJK_RE.test(str) ? ` ${str}` : str;
-      }
-      if (tx !== null) prevY = tx;
-      if (rawItem.hasEOL && curLine.trim()) {
-        lines.push(cleanCjkSpacing(curLine.trim()));
-        curLine = '';
-        prevY = null;
+        type PdfGlyphSpan = { str: string; x: number; y: number; w: number; h: number };
+        const spans: PdfGlyphSpan[] = [];
+        for (const rawItem of textContent.items) {
+          if (!('str' in rawItem)) continue;
+          const s = rawItem.str || '';
+          if (!s.trim()) continue;
+          const x = Array.isArray(rawItem.transform) ? Number(rawItem.transform[4]) : 0;
+          const y = Array.isArray(rawItem.transform) ? Number(rawItem.transform[5]) : 0;
+          const h = Array.isArray(rawItem.transform)
+            ? Math.max(8, Math.abs(Number(rawItem.transform[3]) || Number(rawItem.transform[0]) || 11))
+            : 11;
+          const w = typeof rawItem.width === 'number' && rawItem.width > 0 ? rawItem.width : s.length * (h * 0.48);
+          spans.push({ str: s, x, y, w, h });
+        }
+
+        // Step 1: Strictly transitive Y-baseline clustering -> merge horizontally adjacent word spans into logical segments
+        type PdfSegment = { text: string; x1: number; x2: number; y: number };
+        const sortedByY = [...spans].sort((a, b) => b.y - a.y || a.x - b.x);
+        const rows: PdfGlyphSpan[][] = [];
+        for (const sp of sortedByY) {
+          const lastRow = rows[rows.length - 1];
+          if (!lastRow || Math.abs(lastRow[0].y - sp.y) > 4.5) {
+            rows.push([sp]);
+          } else {
+            lastRow.push(sp);
+          }
+        }
+        const mergedSegments: PdfSegment[] = [];
+        for (const row of rows) {
+          row.sort((a, b) => a.x - b.x);
+          let segText = '';
+          let segX1 = 0;
+          let segX2 = 0;
+          let segY = row[0].y;
+          for (const sp of row) {
+            if (!segText) {
+              segText = sp.str;
+              segX1 = sp.x;
+              segX2 = sp.x + sp.w;
+              segY = sp.y;
+              continue;
+            }
+            const hGap = sp.x - segX2;
+            const gutterThresh = Math.max(18, sp.h * 1.8);
+            if (hGap > gutterThresh) {
+              mergedSegments.push({ text: cleanCjkSpacing(segText.trim()), x1: segX1, x2: segX2, y: segY });
+              segText = sp.str;
+              segX1 = sp.x;
+              segX2 = sp.x + sp.w;
+            } else {
+              const needsSpace = hGap > Math.max(1.2, sp.h * 0.14) && !segText.endsWith(' ') && !CJK_RE.test(sp.str);
+              segText += needsSpace ? ` ${sp.str}` : sp.str;
+              segX2 = Math.max(segX2, sp.x + sp.w);
+            }
+          }
+          if (segText.trim()) {
+            mergedSegments.push({ text: cleanCjkSpacing(segText.trim()), x1: segX1, x2: segX2, y: segY });
+          }
+        }
+
+        // Step 2: Detect genuine 2-column gutter ONLY on merged line segments (never splits single-column word runs!)
+        const gutterL = pageW * 0.45;
+        const gutterR = pageW * 0.55;
+        const crossingGutter = mergedSegments.filter((seg) => seg.x1 < gutterL && seg.x2 > gutterR);
+        const leftSegs = mergedSegments.filter((seg) => seg.x2 <= gutterR);
+        const rightSegs = mergedSegments.filter((seg) => seg.x1 >= gutterL);
+        let dualRowCount = 0;
+        for (const lSeg of leftSegs) {
+          if (rightSegs.some((rSeg) => Math.abs(rSeg.y - lSeg.y) <= 6)) dualRowCount += 1;
+        }
+        const isTwoColumn =
+          dualRowCount >= 4 &&
+          leftSegs.length >= 4 &&
+          rightSegs.length >= 4 &&
+          crossingGutter.length <= Math.max(2, Math.floor(mergedSegments.length * 0.12));
+
+        let pageLines: string[];
+        if (isTwoColumn) {
+          const colTop = Math.max(...leftSegs.map((s) => s.y), ...rightSegs.map((s) => s.y));
+          const fullTop = crossingGutter.filter((s) => s.y > colTop + 6).map((s) => s.text);
+          const fullBottom = crossingGutter.filter((s) => s.y <= colTop + 6).map((s) => s.text);
+          pageLines = [
+            ...fullTop,
+            ...leftSegs.map((s) => s.text),
+            ...rightSegs.map((s) => s.text),
+            ...fullBottom,
+          ];
+        } else {
+          pageLines = mergedSegments.map((s) => s.text);
+        }
+
+        pageLineGroups.push(pageLines);
+      } finally {
+        page.cleanup?.();
+        prevY = sp.y;
       }
     }
-    if (curLine.trim()) lines.push(cleanCjkSpacing(curLine.trim()));
 
-    let paraBuf: string[] = [];
-    for (const ln of lines) {
-      if (!ln) continue;
-      paraBuf.push(ln);
-      if (/[.!?。！？」』]$/.test(ln) || paraBuf.join(' ').length >= 260) {
-        const sep = CJK_RE.test(ln) ? '' : ' ';
-        units.push({ text: cleanCjkSpacing(paraBuf.join(sep).trim()) });
+    // Strip repeated running headers & footers appearing on >= 40% of pages (when >= 3 pages)
+    const repeatedEdgeLines = new Set<string>();
+    if (pageLineGroups.length >= 3) {
+      const edgeFreq = new Map<string, number>();
+      for (const pl of pageLineGroups) {
+        if (pl.length < 3) continue;
+        const norm = (s: string) => s.replace(/\d+/g, '#').trim().toLowerCase();
+        const first = norm(pl[0]);
+        const last = norm(pl[pl.length - 1]);
+        if (first.length <= 90) edgeFreq.set(first, (edgeFreq.get(first) || 0) + 1);
+        if (last.length <= 90 && last !== first) edgeFreq.set(last, (edgeFreq.get(last) || 0) + 1);
+      }
+      const minPages = Math.max(2, Math.ceil(pageLineGroups.length * 0.4));
+      for (const [key, cnt] of edgeFreq.entries()) {
+        if (cnt >= minPages) repeatedEdgeLines.add(key);
+      }
+    }
+
+    const units: ParsedDocUnit[] = [];
+    for (const pl of pageLineGroups) {
+      const filtered = pl.filter((ln, idx) => {
+        if ((idx === 0 || idx === pl.length - 1) && repeatedEdgeLines.size > 0) {
+          const key = ln.replace(/\d+/g, '#').trim().toLowerCase();
+          if (repeatedEdgeLines.has(key)) return false;
+        }
+        return Boolean(ln);
+      });
+      let paraBuf: string[] = [];
+      const flushPara = () => {
+        if (paraBuf.length === 0) return;
+        let joined = paraBuf[0];
+        for (let li = 1; li < paraBuf.length; li += 1) {
+          const prev = paraBuf[li - 1];
+          const next = paraBuf[li];
+          if (/[A-Za-z]{2,}[-\u00AD]$/.test(prev) && /^[a-z]{2,}/.test(next)) {
+            joined = joined.replace(/[-\u00AD]$/, '') + next;
+          } else if (CJK_RE.test(prev.slice(-1)) && CJK_RE.test(next.slice(0, 1))) {
+            joined += next;
+          } else {
+            joined += ` ${next}`;
+          }
+        }
+        units.push({ text: cleanCjkSpacing(joined.trim()) });
         paraBuf = [];
+      };
+      for (const ln of filtered) {
+        paraBuf.push(ln);
+        if (/[.!?。！？」』]$/.test(ln) || paraBuf.join(' ').length >= 260) {
+          flushPara();
+        }
+      }
+      flushPara();
+    }
+
+    if (units.length > 0) {
+      if (pdf.numPages > maxPages) {
+        units.push({
+          text: `[Catatan tranX: PDF memiliki ${pdf.numPages} halaman; mode peramban memproses ${maxPages} halaman pertama.]`,
+        });
+      }
+      return units;
+    }
+
+    // Scanned image-only PDF: render pages to canvas and OCR via Tesseract (strict GPU cleanup in finally)
+    const { src } = parseModePair(mode);
+    const ocrPages = Math.min(pdf.numPages, 6);
+    for (let p = 1; p <= ocrPages; p += 1) {
+      const page = await pdf.getPage(p);
+      const viewport = page.getViewport({ scale: 1.7 });
+      const canvas = document.createElement('canvas');
+      try {
+        canvas.width = Math.max(1, Math.floor(viewport.width));
+        canvas.height = Math.max(1, Math.floor(viewport.height));
+        const ctx = canvas.getContext('2d');
+        if (!ctx) continue;
+        await page.render({ canvasContext: ctx, canvas, viewport }).promise;
+        const boxes = await runTesseractOcrBoxes(canvas, canvas.width, canvas.height, src);
+        for (const b of boxes) {
+          if (b.text.trim()) units.push({ text: b.text.trim() });
+        }
+      } finally {
+        canvas.width = 0;
+        canvas.height = 0;
+        page.cleanup?.();
       }
     }
-    if (paraBuf.length > 0) {
-      const joined = paraBuf.join(' ');
-      units.push({ text: cleanCjkSpacing(joined.trim()) });
-    }
-  }
-
-  if (units.length > 0) {
-    await loadingTask.destroy().catch(() => {});
     return units;
+  } finally {
+    await loadingTask.destroy().catch(() => { });
   }
-
-  // Scanned image-only PDF: render pages to canvas and OCR via Tesseract
-  const { src } = parseModePair(mode);
-  const ocrPages = Math.min(pdf.numPages, 6);
-  for (let p = 1; p <= ocrPages; p += 1) {
-    const page = await pdf.getPage(p);
-    const viewport = page.getViewport({ scale: 1.7 });
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.floor(viewport.width));
-    canvas.height = Math.max(1, Math.floor(viewport.height));
-    const ctx = canvas.getContext('2d');
-    if (!ctx) continue;
-    await page.render({ canvasContext: ctx, canvas, viewport }).promise;
-    const boxes = await runTesseractOcrBoxes(canvas, canvas.width, canvas.height, src);
-    for (const b of boxes) {
-      if (b.text.trim()) units.push({ text: b.text.trim() });
-    }
-  }
-
-  await loadingTask.destroy().catch(() => {});
-  return units;
 }
 
 function parseAssSubtitleUnits(rawText: string): {
@@ -5575,18 +6021,75 @@ async function parseDocumentUnitsInBrowser(
   }
 
   if (ext === 'epub') {
+    // EPUB 3.3 compliant OPF <spine> reading order + <rt>/<rp> furigana stripping
     const entries = await extractZipTextEntries(
       fullBuf,
-      (n) => /\.(xhtml|html|htm)$/i.test(n) && !n.toLowerCase().includes('nav')
+      (n) => /\.(?:xhtml|html|htm|opf|xml)$/i.test(n)
     );
+    let orderedNames: string[] = [];
+    const containerXml = entries.get('META-INF/container.xml') || '';
+    const opfPathMatch = containerXml.match(/full-path=["']([^"']+\.opf)["']/i);
+    const opfPath = opfPathMatch?.[1] || Array.from(entries.keys()).find((k) => /\.opf$/i.test(k)) || '';
+    const opfXml = opfPath ? entries.get(opfPath) || '' : '';
+    if (opfXml) {
+      const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/') + 1) : '';
+      const opfDom = new DOMParser().parseFromString(opfXml, 'application/xml');
+      const manifestMap = new Map<string, string>();
+      const itemNodes = Array.from(opfDom.getElementsByTagNameNS('*', 'item'));
+      itemNodes.forEach((el) => {
+        const id = el.getAttribute('id') || '';
+        const href = el.getAttribute('href') || '';
+        const props = el.getAttribute('properties') || '';
+        if (id && href && !/\bnav\b/i.test(props)) {
+          try {
+            const resolvedUrl = new URL(href, `https://epub.local/${opfDir}`);
+            const rawPath = resolvedUrl.pathname.replace(/^\/+/, '');
+            let normPath = rawPath;
+            try {
+              normPath = decodeURIComponent(rawPath);
+            } catch {
+              // keep raw encoded path if malformed percent sequence
+            }
+            manifestMap.set(id, normPath);
+          } catch {
+            // ignore invalid manifest href
+          }
+        }
+      });
+      Array.from(opfDom.getElementsByTagNameNS('*', 'itemref')).forEach((el) => {
+        const idref = el.getAttribute('idref') || '';
+        const resolved = manifestMap.get(idref);
+        if (resolved && entries.has(resolved)) {
+          orderedNames.push(resolved);
+        }
+      });
+    }
+    if (orderedNames.length === 0) {
+      orderedNames = Array.from(entries.keys())
+        .filter((n) => /\.(xhtml|html|htm)$/i.test(n) && !n.toLowerCase().includes('nav'))
+        .sort();
+    }
+
     const units: ParsedDocUnit[] = [];
-    const sortedNames = Array.from(entries.keys()).sort();
-    for (const name of sortedNames) {
+    for (const name of orderedNames) {
       const doc = new DOMParser().parseFromString(entries.get(name) || '', 'text/html');
-      const blocks = Array.from(doc.querySelectorAll('h1, h2, h3, p'));
-      for (const b of blocks) {
-        const txt = (b.textContent || '').trim();
-        if (txt) units.push({ text: txt });
+      // Remove ruby reading annotations (<rt>/<rp>) so Japanese novels translate base text cleanly
+      doc.querySelectorAll('rt, rp').forEach((n) => n.remove());
+      const blocks = Array.from(doc.querySelectorAll('h1, h2, h3, h4, h5, h6, p, li, blockquote'));
+      if (blocks.length > 0) {
+        for (const b of blocks) {
+          const txt = (b.textContent || '').trim();
+          if (txt) units.push({ text: txt });
+        }
+      } else {
+        // Fallback for non-semantic EPUB chapters wrapped exclusively in leaf <div> blocks
+        const leafDivs = Array.from(doc.querySelectorAll('div')).filter(
+          (d) => d.querySelector('div, p, h1, h2, h3, h4, h5, h6, li, blockquote') === null
+        );
+        for (const d of leafDivs) {
+          const txt = (d.textContent || '').trim();
+          if (txt) units.push({ text: txt });
+        }
       }
     }
     return { fmt: 'epub', units };
@@ -5648,7 +6151,7 @@ async function parseDocumentUnitsInBrowser(
   return { fmt: ext, units: paras };
 }
 
-const directExportCache = new Map<
+const directExportCache = new BoundedLruCache<
   string,
   {
     fileName: string;
@@ -5656,7 +6159,7 @@ const directExportCache = new Map<
     headerDoc?: string;
     units: Array<{ prefix?: string; src: string; dst: string }>;
   }
->();
+>(6);
 
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -5718,28 +6221,28 @@ function buildDocxArchiveBytes(
       '[Content_Types].xml',
       enc.encode(
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
-          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
-          '<Default Extension="xml" ContentType="application/xml"/>' +
-          '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
-          '</Types>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+        '</Types>'
       ),
     ],
     [
       '_rels/.rels',
       enc.encode(
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-          '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
-          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
-          '</Relationships>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
+        '</Relationships>'
       ),
     ],
     [
       'word/document.xml',
       enc.encode(
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-          '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
-          `<w:body>${bodyParas.join('')}<w:sectPr/></w:body></w:document>`
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+        `<w:body>${bodyParas.join('')}<w:sectPr/></w:body></w:document>`
       ),
     ],
   ];
@@ -5856,80 +6359,115 @@ export async function directTranslateDocumentFile(params: {
     }),
   ]);
 
-  const { outputs, detectedSource } = await translateParagraphsDirect({
-    paragraphs: cappedUnits.map((u) => u.text),
-    mode: params.mode,
-    titleId: params.titleId,
-    onProgress: (_, done, total) => {
-      const pct = Math.min(98, Math.max(8, Math.round((done / Math.max(1, total)) * 100)));
-      params.onProgress?.(pct);
-    },
-  });
-
-  const translatedRows: Array<{ prefix?: string; src: string; dst: string }> = cappedUnits.map(
-    (u, idx) => ({
-      prefix: u.prefix,
-      src: u.text,
-      dst: outputs[idx] || u.text,
-    })
-  );
-  const detected: TargetLang = detectedSource;
-
-  directExportCache.set(`${params.cid}:${params.mid}`, {
-    fileName: params.file.name,
-    fmt,
-    headerDoc,
-    units: translatedRows,
-  });
-
-  const sentences: SentencePair[] = translatedRows.map((r, i) => ({
-    i,
-    src: r.src,
-    dst: r.dst,
-  }));
-  const fullDst = translatedRows.map((r) => r.dst).join('\n\n');
-
-  await Promise.all([
-    saveDirectJobRecord({
-      id: jobId,
-      cid: params.cid,
-      mid: params.mid,
-      titleId: params.titleId,
-      fileName: params.file.name,
-      fileSize: params.file.size,
-      fmt,
-      state: 'done',
-      doneParas: translatedRows.length,
-      totalParas: cappedUnits.length,
-      updatedAt: Date.now(),
-    }),
-    saveTurnMessageDirect(params.cid, params.mid, {
-      role: 'assistant',
-      kind: 'document',
+  try {
+    const { outputs, detectedSource } = await translateParagraphsDirect({
+      paragraphs: cappedUnits.map((u) => u.text),
       mode: params.mode,
-      detectedSource: detected,
       titleId: params.titleId,
+      onProgress: (_, done, total) => {
+        const pct = Math.min(98, Math.max(8, Math.round((done / Math.max(1, total)) * 100)));
+        params.onProgress?.(pct);
+      },
+    });
+
+    const translatedRows: Array<{ prefix?: string; src: string; dst: string }> = cappedUnits.map(
+      (u, idx) => ({
+        prefix: u.prefix,
+        src: u.text,
+        dst: outputs[idx] || u.text,
+      })
+    );
+    const detected: TargetLang = detectedSource;
+
+    directExportCache.set(`${params.cid}:${params.mid}`, {
       fileName: params.file.name,
       fmt,
-      jobId,
-      done: translatedRows.length,
-      total: cappedUnits.length,
-      text: fullDst,
-      sentences,
-      state: 'done',
-    }),
-    upsertConversationMeta(params.cid, {
-      title: params.file.name,
-      titleId: params.titleId || '',
-      mode: params.mode,
-      detectedSource: detected,
-      activeTab: 'dokumen',
-      preview: fullDst.slice(0, 180),
-    }),
-  ]);
-  params.onProgress?.(100);
+      headerDoc,
+      units: translatedRows,
+    });
 
-  return jobId;
+    const sentences: SentencePair[] = translatedRows.map((r, i) => ({
+      i,
+      src: r.src,
+      dst: r.dst,
+    }));
+    const fullDst = translatedRows.map((r) => r.dst).join('\n\n');
+
+    await Promise.all([
+      saveDirectJobRecord({
+        id: jobId,
+        cid: params.cid,
+        mid: params.mid,
+        titleId: params.titleId,
+        fileName: params.file.name,
+        fileSize: params.file.size,
+        fmt,
+        state: 'done',
+        doneParas: translatedRows.length,
+        totalParas: cappedUnits.length,
+        updatedAt: Date.now(),
+      }),
+      saveTurnMessageDirect(params.cid, params.mid, {
+        role: 'assistant',
+        kind: 'document',
+        mode: params.mode,
+        detectedSource: detected,
+        titleId: params.titleId,
+        fileName: params.file.name,
+        fmt,
+        jobId,
+        done: translatedRows.length,
+        total: cappedUnits.length,
+        text: fullDst,
+        sentences,
+        state: 'done',
+      }),
+      upsertConversationMeta(params.cid, {
+        title: params.file.name,
+        titleId: params.titleId || '',
+        mode: params.mode,
+        detectedSource: detected,
+        activeTab: 'dokumen',
+        preview: fullDst.slice(0, 180),
+      }),
+    ]);
+    params.onProgress?.(100);
+
+    return jobId;
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : 'Gagal menerjemahkan dokumen.';
+    await Promise.allSettled([
+      saveDirectJobRecord({
+        id: jobId,
+        cid: params.cid,
+        mid: params.mid,
+        titleId: params.titleId,
+        fileName: params.file.name,
+        fileSize: params.file.size,
+        fmt,
+        state: 'error',
+        doneParas: 0,
+        totalParas: cappedUnits.length,
+        message: errMsg.slice(0, 500),
+        updatedAt: Date.now(),
+      }),
+      saveTurnMessageDirect(params.cid, params.mid, {
+        role: 'assistant',
+        kind: 'document',
+        mode: params.mode,
+        titleId: params.titleId,
+        fileName: params.file.name,
+        fmt,
+        jobId,
+        done: 0,
+        total: cappedUnits.length,
+        text: '',
+        error: errMsg.slice(0, 500),
+        state: 'error',
+      }),
+    ]);
+    throw err;
+  }
 }
 
 export function buildDirectExportBlob(params: {
@@ -5943,12 +6481,59 @@ export function buildDirectExportBlob(params: {
 }): { blob: Blob; filename: string } {
   const cached = directExportCache.get(`${params.cid}:${params.mid}`);
   const rows: Array<{ src: string; dst: string; prefix?: string }> =
-    cached?.units ||
-    (params.fallbackSentences || []).map((s) => ({ src: s.src, dst: s.dst })) ||
-    [{ src: '', dst: params.fallbackText || '' }];
+    cached?.units?.length
+      ? cached.units
+      : params.fallbackSentences?.length
+        ? params.fallbackSentences.map((s) => ({ src: s.src, dst: s.dst }))
+        : [{ src: '', dst: params.fallbackText || '' }];
 
-  const ext = params.fmt.toLowerCase() === 'ssa' ? 'ass' : params.fmt.toLowerCase();
-  const baseStem = (cached?.fileName || `tranx-${params.mid}`).replace(/\.[^.]+$/, '');
+  const fmtSubtitleClock = (sec: number, sep: ',' | '.') => {
+    const h = String(Math.floor(sec / 3600)).padStart(2, '0');
+    const m = String(Math.floor((sec % 3600) / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    return `${h}:${m}:${s}${sep}`;
+  };
+
+  // Balanced 2-line broadcast subtitle CPL wrapper (<= 42 CPL Latin / <= 18 CPL CJK, Netflix/BBC norms)
+  const wrapSubtitleBalanced = (raw: string): string => {
+    const clean = (raw || '').replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!clean) return clean;
+    const isCjk = CJK_RE.test(clean);
+    const maxCpl = isCjk ? 18 : 42;
+    if (clean.length <= maxCpl) return clean;
+    const mid = Math.floor(clean.length / 2);
+    if (isCjk) {
+      const punctRe = /[、。！？]/g;
+      let best = mid;
+      let bestDist = Infinity;
+      let pm: RegExpExecArray | null;
+      while ((pm = punctRe.exec(clean)) !== null) {
+        const idx = pm.index + 1;
+        if (idx >= 6 && clean.length - idx >= 4 && Math.abs(idx - mid) < bestDist) {
+          bestDist = Math.abs(idx - mid);
+          best = idx;
+        }
+      }
+      return `${clean.slice(0, best).trim()}\n${clean.slice(best).trim()}`;
+    }
+    const leftSp = clean.lastIndexOf(' ', mid);
+    const rightSp = clean.indexOf(' ', mid);
+    const splitAt =
+      leftSp > 8 && (rightSp === -1 || mid - leftSp <= rightSp - mid)
+        ? leftSp
+        : rightSp > 8
+          ? rightSp
+          : -1;
+    if (splitAt === -1) return clean;
+    return `${clean.slice(0, splitAt).trim()}\n${clean.slice(splitAt + 1).trim()}`;
+  };
+
+  const ALLOWED_EXPORT_EXTS = new Set(['txt', 'html', 'srt', 'vtt', 'ass', 'docx', 'md', 'json']);
+  const rawExt = params.fmt.toLowerCase().replace(/^\.+/, '');
+  const mappedExt = rawExt === 'ssa' ? 'ass' : rawExt;
+  const ext = ALLOWED_EXPORT_EXTS.has(mappedExt) ? mappedExt : 'txt';
+  const rawStem = (cached?.fileName || `tranx-${params.mid}`).replace(/\.[^.]+$/, '');
+  const baseStem = safePathFileName(rawStem, 'tranx-export');
 
   if (ext === 'docx') {
     const docxBytes = buildDocxArchiveBytes(baseStem, rows, params.bilingual);
@@ -5990,7 +6575,7 @@ export function buildDirectExportBlob(params: {
           r.prefix && /^dialogue\s*:/i.test(r.prefix)
             ? r.prefix
             : `Dialogue: 0,${fmtAssTime(startSec)},${fmtAssTime(endSec)},Default,,0,0,0,,`;
-        const body = (params.bilingual && r.src ? `${r.src}\n${r.dst}` : r.dst).replace(
+        const body = (params.bilingual && r.src ? `${r.src}\n${r.dst}` : wrapSubtitleBalanced(r.dst)).replace(
           /\r?\n/g,
           '\\N'
         );
@@ -6006,12 +6591,11 @@ export function buildDirectExportBlob(params: {
   if (ext === 'vtt') {
     const cues = rows
       .map((r, idx) => {
+        const startSec = idx * 3;
         const header = r.prefix
           ? r.prefix.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')
-          : `00:00:${String((idx * 3) % 60).padStart(2, '0')}.000 --> 00:00:${String(
-              ((idx * 3) % 60) + 2
-            ).padStart(2, '0')}.500`;
-        return `${header}\n${params.bilingual && r.src ? `${r.src}\n${r.dst}` : r.dst}`;
+          : `${fmtSubtitleClock(startSec, '.')}000 --> ${fmtSubtitleClock(startSec + 2, '.')}500`;
+        return `${header}\n${params.bilingual && r.src ? `${r.src}\n${r.dst}` : wrapSubtitleBalanced(r.dst)}`;
       })
       .join('\n\n');
     return {
@@ -6023,12 +6607,11 @@ export function buildDirectExportBlob(params: {
   if (ext === 'srt') {
     const srt = rows
       .map((r, idx) => {
+        const startSec = idx * 3;
         const header =
           r.prefix ||
-          `${idx + 1}\n00:00:${String((idx * 3) % 60).padStart(2, '0')},000 --> 00:00:${String(
-            ((idx * 3) % 60) + 2
-          ).padStart(2, '0')},500`;
-        return `${header}\n${params.bilingual && r.src ? `${r.src}\n${r.dst}` : r.dst}`;
+          `${idx + 1}\n${fmtSubtitleClock(startSec, ',')}000 --> ${fmtSubtitleClock(startSec + 2, ',')}500`;
+        return `${header}\n${params.bilingual && r.src ? `${r.src}\n${r.dst}` : wrapSubtitleBalanced(r.dst)}`;
       })
       .join('\n\n');
     return {
@@ -6042,21 +6625,19 @@ export function buildDirectExportBlob(params: {
       .map((r) =>
         params.bilingual && r.src
           ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:10px 0;border-bottom:1px solid #DEE3E0"><div>${escapeHtml(
-              r.src
-            )}</div><div>${escapeHtml(r.dst)}</div></div>`
+            r.src
+          )}</div><div>${escapeHtml(r.dst)}</div></div>`
           : `<p>${escapeHtml(r.dst)}</p>`
       )
       .join('\n');
     const isDark = params.theme === 'Gelap';
-    const html = `<!doctype html><html lang="id" data-tranx-v3="${
-      params.theme || 'Terang'
-    }"><head><meta charset="utf-8"><title>${escapeHtml(
+    const safeTheme = isDark ? 'Gelap' : 'Terang';
+    const html = `<!doctype html><html lang="id" data-tranx-v3="${safeTheme}"><head><meta charset="utf-8"><title>${escapeHtml(
       baseStem
-    )}</title><style>body{font-family:Charter,Georgia,serif;max-width:860px;margin:28px auto;padding:0 20px;line-height:1.75;background:${
-      isDark ? '#171B1A' : '#FAFBFA'
-    };color:${isDark ? '#E7ECEA' : '#141917'}}</style></head><body><h1>${escapeHtml(
-      baseStem
-    )}</h1>${body}</body></html>`;
+    )}</title><style>body{font-family:Charter,Georgia,serif;max-width:860px;margin:28px auto;padding:0 20px;line-height:1.75;background:${isDark ? '#171B1A' : '#FAFBFA'
+      };color:${isDark ? '#E7ECEA' : '#141917'}}</style></head><body><h1>${escapeHtml(
+        baseStem
+      )}</h1>${body}</body></html>`;
     return {
       blob: new Blob([html], { type: 'text/html;charset=utf-8' }),
       filename: `${baseStem}.html`,
@@ -6072,26 +6653,539 @@ export function buildDirectExportBlob(params: {
   };
 }
 
+const MAX_REMOTE_IMAGE_BYTES = 15 * 1024 * 1024; // 15 MB
+const HAS_SENSITIVE_QUERY_RE =
+  /[?&](?:token|sig|signature|hm|auth|auth_token|id_token|refresh_token|jwt|session|sid|cookie|secret|password|passwd|pwd|credential|key|apikey|api_key|access_token|code|state|nonce|x-amz-[^=]+|x-goog-[^=]+|expires)=/i;
+
+function safePathFileName(pathname: string, fallback: string): string {
+  const rawSeg = pathname.split('/').pop() || fallback;
+  let decoded = rawSeg;
+  try {
+    decoded = decodeURIComponent(rawSeg);
+  } catch {
+    decoded = rawSeg;
+  }
+  return (
+    decoded
+      .replace(/[\x00-\x1f\x7f\\/:*?"<>|\u202a-\u202e\u2066-\u2069]/g, '_')
+      .slice(0, 80) || fallback
+  );
+}
+
+function detectMimeFromMagicBytes(bytes: Uint8Array): string | null {
+  if (bytes.length < 12) return null;
+  // Full 8-byte PNG signature
+  if (
+    bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+    bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a
+  ) {
+    return 'image/png';
+  }
+  // JPEG
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  // Full 6-byte GIF87a / GIF89a signature
+  if (
+    bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38 &&
+    (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61
+  ) {
+    return 'image/gif';
+  }
+  // WEBP (RIFF....WEBP)
+  if (
+    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+  return null;
+}
+
+async function readBoundedBytes(
+  resp: Response,
+  maxBytes: number,
+  requireImageMagic: boolean
+): Promise<Uint8Array> {
+  const cLen = Number(resp.headers.get('content-length') || 0);
+  if (cLen > maxBytes) {
+    throw new Error('Ukuran berkas melebihi batas aman.');
+  }
+  if (!resp.body) {
+    const buf = new Uint8Array(await resp.arrayBuffer());
+    if (buf.byteLength > maxBytes) throw new Error('Ukuran berkas melebihi batas aman.');
+    if (requireImageMagic && !detectMimeFromMagicBytes(buf)) {
+      throw new Error('Respons tautan bukan berkas gambar PNG/JPG/WEBP/GIF yang sah.');
+    }
+    return buf;
+  }
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let checkedMagic = !requireImageMagic;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error('Ukuran berkas melebihi batas aman.');
+      }
+      chunks.push(value);
+      if (!checkedMagic && total >= 12) {
+        const head = new Uint8Array(12);
+        let pos = 0;
+        for (const c of chunks) {
+          const take = Math.min(c.byteLength, 12 - pos);
+          head.set(c.subarray(0, take), pos);
+          pos += take;
+          if (pos >= 12) break;
+        }
+        if (!detectMimeFromMagicBytes(head)) {
+          await reader.cancel();
+          throw new Error('Respons tautan bukan berkas gambar PNG/JPG/WEBP/GIF yang sah.');
+        }
+        checkedMagic = true;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+async function loadCorsImageViaImgElement(
+  cleanUrl: string,
+  signal?: AbortSignal
+): Promise<{ dataUrl: string; mime: string }> {
+  if (typeof document === 'undefined' || typeof Image === 'undefined') {
+    throw new Error('no_dom');
+  }
+  if (/\.svg(?:$|[?#])|[?&]format=svg\b/i.test(cleanUrl)) {
+    throw new Error('svg_not_raster');
+  }
+  return new Promise<{ dataUrl: string; mime: string }>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.referrerPolicy = 'no-referrer';
+    let settled = false;
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      img.onload = null;
+      img.onerror = null;
+    };
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      img.src = '';
+      reject(err);
+    };
+    const onAbort = () => fail(new DOMException('Aborted', 'AbortError'));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const timer = window.setTimeout(() => fail(new Error('timeout')), 12_000);
+
+    img.onload = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const nw = img.naturalWidth || 0;
+      const nh = img.naturalHeight || 0;
+      if (nw <= 0 || nh <= 0 || nw > 8192 || nh > 65536 || nw * nh > 36_000_000) {
+        reject(new Error('Resolusi gambar melampaui batas aman 36 megapiksel.'));
+        return;
+      }
+      // Keep offscreen canvas safely within browser GPU limits while preserving aspect ratio
+      let scale = 1;
+      if (nw > 12_000) scale = Math.min(scale, 12_000 / nw);
+      if (nh > 12_000) scale = Math.min(scale, 12_000 / nh);
+      if (nw * nh * scale * scale > 16_777_216) {
+        scale = Math.min(scale, Math.sqrt(16_777_216 / (nw * nh)));
+      }
+      const cw = Math.max(1, Math.round(nw * scale));
+      const ch = Math.max(1, Math.round(nh * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = cw;
+      canvas.height = ch;
+      try {
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('canvas_ctx_unavailable');
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, cw, ch);
+        ctx.drawImage(img, 0, 0, cw, ch);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+        if (!dataUrl || dataUrl.length < 32) throw new Error('empty_canvas_export');
+        resolve({ dataUrl, mime: 'image/jpeg' });
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error('cors_tainted'));
+      } finally {
+        canvas.width = 0;
+        canvas.height = 0;
+        img.src = '';
+      }
+    };
+    img.onerror = () => fail(new Error('img_cors_error'));
+    img.src = cleanUrl;
+  });
+}
+
+/**
+ * Anti-SSRF remote image fetcher (validates URL with normalizeWebUrl, uses CSP-clean CORS <img> stage
+ * before falling back to allowlisted proxies with 15 MB stream cap & magic-byte validation).
+ * Refuses leaking signed URLs/tokens to public third-party proxies.
+ */
+export async function fetchRemoteImageAsDataUrl(
+  rawUrl: string,
+  signal?: AbortSignal
+): Promise<{ dataUrl: string; mime: string; fileName: string }> {
+  if (/^data:image\/(?:png|jpeg|jpg|webp|gif);base64,/i.test(rawUrl.trim())) {
+    const trimmed = rawUrl.trim();
+    if (trimmed.length > Math.ceil(MAX_REMOTE_IMAGE_BYTES * 1.38)) {
+      throw new Error('Ukuran gambar melebihi batas aman 15 MB.');
+    }
+    const mimeMatch = trimmed.match(/^data:([^;]+);base64,/i);
+    return {
+      dataUrl: trimmed,
+      mime: mimeMatch ? mimeMatch[1].toLowerCase() : 'image/png',
+      fileName: 'gambar-komik.png',
+    };
+  }
+  const cleanUrl = normalizeSocialImageUrl(normalizeWebUrl(rawUrl));
+  const parsed = new URL(cleanUrl);
+  const fileName = safePathFileName(parsed.pathname, 'halaman-komik.png');
+  const isSameOrigin = typeof window !== 'undefined' && parsed.origin === window.location.origin;
+
+  // Stage 1: For cross-origin HTTPS images, load via <img crossOrigin="anonymous"> (governed by img-src https:,
+  // avoiding connect-src CSP violations on live Hosting and keeping signed URLs strictly off third-party proxies!)
+  if (!isSameOrigin && typeof document !== 'undefined') {
+    try {
+      const viaImg = await loadCorsImageViaImgElement(cleanUrl, signal);
+      return { dataUrl: viaImg.dataUrl, mime: viaImg.mime, fileName };
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError' && signal?.aborted) throw err;
+      if (err instanceof Error && err.message.includes('batas aman')) throw err;
+    }
+  }
+
+  // Stage 2: Same-origin fetch or allowlisted CORS proxies (never forwarding signed/auth URLs!)
+  const candidates: string[] = [];
+  if (isSameOrigin || typeof document === 'undefined') {
+    candidates.push(cleanUrl);
+  }
+  if (!HAS_SENSITIVE_QUERY_RE.test(cleanUrl)) {
+    candidates.push(
+      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`
+    );
+  }
+
+  let lastErr = 'Situs gambar membatasi pengambilan langsung (CORS / proteksi hotlink).';
+  for (const target of candidates) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const timer = window.setTimeout(() => ctrl.abort(), 14_000);
+    try {
+      const resp = await fetch(target, {
+        method: 'GET',
+        mode: 'cors',
+        credentials: 'omit',
+        referrerPolicy: 'no-referrer',
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) {
+        lastErr = `Gagal memuat gambar (HTTP ${resp.status}).`;
+        continue;
+      }
+      const bytes = await readBoundedBytes(resp, MAX_REMOTE_IMAGE_BYTES, true);
+      if (bytes.byteLength === 0) {
+        lastErr = 'Berkas gambar kosong.';
+        continue;
+      }
+      const detectedMime = detectMimeFromMagicBytes(bytes);
+      if (!detectedMime) {
+        lastErr = 'Respons tautan bukan berkas gambar PNG/JPG/WEBP/GIF yang sah.';
+        continue;
+      }
+      const b64 = uint8ToBase64(bytes);
+      return {
+        dataUrl: `data:${detectedMime};base64,${b64}`,
+        mime: detectedMime,
+        fileName,
+      };
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError' && signal?.aborted) throw err;
+      if (err instanceof Error && err.message.includes('batas aman')) throw err;
+    } finally {
+      window.clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    }
+  }
+  throw new Error(lastErr);
+}
+
+const VALID_BLOCK_KINDS = new Set<VisionBlockKind>([
+  'dialogue',
+  'thought',
+  'shout',
+  'narration',
+  'sfx',
+  'status_window',
+  'caption',
+  'aside',
+  'sign',
+]);
+const VALID_BLOCK_SHAPES = new Set<VisionBlockShape>(['oval', 'rect', 'jagged', 'cloud', 'unbordered']);
+const VALID_BG_TONES = new Set<VisionBgTone>(['light', 'dark', 'artwork', 'colored']);
+const VALID_SFX_IMPORTANCE = new Set<NonNullable<VisionBlock['sfxImportance']>>([
+  'none',
+  'ambient',
+  'impact',
+  'narrative',
+  'major',
+  'minor',
+  'plot_critical',
+]);
+
+interface RichVisionBubble {
+  id?: number;
+  box_2d: number[];
+  text: string;
+  kind?: VisionBlockKind;
+  shape?: VisionBlockShape;
+  bgTone?: VisionBgTone;
+  writingDir?: 'vertical' | 'horizontal';
+  sfxImportance?: VisionBlock['sfxImportance'];
+}
+
+async function detectVisionBubblesOnSource(params: {
+  dataUrl: string;
+  mime: string;
+  b64: string;
+  imgEl: HTMLImageElement | HTMLCanvasElement;
+  w: number;
+  h: number;
+  srcLang: SourceLang;
+  geminiKey: string | null;
+  signal?: AbortSignal;
+}): Promise<{ bubbles: RichVisionBubble[]; model: string }> {
+  const { geminiKey, imgEl, w, h, srcLang, dataUrl, mime, b64, signal } = params;
+  if (geminiKey) {
+    try {
+      const visionPrompt =
+        'Extract ALL visible manga/comic speech bubbles, narration boxes, RPG status windows, and major sound effects (SFX) in natural reading order. ' +
+        'Ignore tiny Japanese furigana glosses beside kanji. ' +
+        'Return strict JSON: {"bubbles":[{"id":1,"box_2d":[ymin,xmin,ymax,xmax],"text":"...","kind":"dialogue|thought|shout|narration|sfx|status_window|caption|aside|sign","shape":"oval|rect|jagged|cloud|unbordered","bgTone":"light|dark|artwork|colored","writingDir":"vertical|horizontal","sfxImportance":"plot_critical|ambient"}]} ' +
+        'with integer coordinates normalized 0..1000.';
+
+      const reqCtrl = new AbortController();
+      const onOuter = () => reqCtrl.abort();
+      signal?.addEventListener('abort', onOuter, { once: true });
+      const reqTimer = window.setTimeout(() => reqCtrl.abort(), 45_000);
+      let resp: Response;
+      try {
+        resp = await fetch(
+          'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+          {
+            method: 'POST',
+            signal: reqCtrl.signal,
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': geminiKey,
+            },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: visionPrompt }] },
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    { inlineData: { mimeType: mime, data: b64 } },
+                    { text: 'Detect all comic speech bubbles, captions, status windows, and SFX.' },
+                  ],
+                },
+              ],
+              generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
+            }),
+          }
+        );
+      } finally {
+        window.clearTimeout(reqTimer);
+        signal?.removeEventListener('abort', onOuter);
+      }
+      if (!resp.ok) {
+        throw new Error(`Gemini Vision HTTP ${resp.status}`);
+      }
+      const raw = await resp.json();
+      let rawJsonText = extractGeminiResponseText(raw, '{}');
+      const fence = rawJsonText.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (fence) rawJsonText = fence[1].trim();
+      const parsed = JSON.parse(rawJsonText) as { bubbles?: unknown };
+      const bubbles: Array<Record<string, unknown>> = Array.isArray(parsed.bubbles) ? parsed.bubbles : [];
+      const valid = bubbles
+        .filter(
+          (b) =>
+            typeof b.text === 'string' &&
+            Boolean(b.text.trim()) &&
+            Array.isArray(b.box_2d) &&
+            b.box_2d.length === 4 &&
+            (b.box_2d as unknown[]).every((n) => Number.isFinite(Number(n)))
+        )
+        .map((b, idx): RichVisionBubble => ({
+          id: typeof b.id === 'number' ? b.id : idx + 1,
+          box_2d: (b.box_2d as number[]).map((n) => Number(n)),
+          text: String(b.text).trim(),
+          kind: VALID_BLOCK_KINDS.has(b.kind as VisionBlockKind) ? (b.kind as VisionBlockKind) : undefined,
+          shape: VALID_BLOCK_SHAPES.has(b.shape as VisionBlockShape) ? (b.shape as VisionBlockShape) : undefined,
+          bgTone: VALID_BG_TONES.has(b.bgTone as VisionBgTone) ? (b.bgTone as VisionBgTone) : undefined,
+          writingDir: b.writingDir === 'vertical' || b.writingDir === 'horizontal' ? b.writingDir : undefined,
+          sfxImportance: VALID_SFX_IMPORTANCE.has(b.sfxImportance as NonNullable<VisionBlock['sfxImportance']>)
+            ? (b.sfxImportance as VisionBlock['sfxImportance'])
+            : undefined,
+        }));
+      return { bubbles: valid, model: 'gemini-2.5-flash' };
+    } catch (err) {
+      if (signal?.aborted || (err as { name?: string })?.name === 'AbortError') throw err;
+      // Graceful fallback to local browser OCR / Tesseract WASM when Gemini Vision fails (429/5xx/bad key)
+    }
+  }
+
+  let validBubbles: RichVisionBubble[] = [];
+  let usedModel = 'browser-text-detector';
+  const DetectorCtor = (
+    window as unknown as {
+      TextDetector?: new () => {
+        detect: (
+          src: HTMLImageElement | HTMLCanvasElement
+        ) => Promise<
+          Array<{
+            rawValue?: string;
+            boundingBox?: { x: number; y: number; width: number; height: number };
+          }>
+        >;
+      };
+    }
+  ).TextDetector;
+  if (DetectorCtor) {
+    try {
+      const detector = new DetectorCtor();
+      const detectedBoxes = await detector.detect(imgEl);
+      validBubbles = detectedBoxes
+        .filter((d) => typeof d.rawValue === 'string' && d.rawValue.trim() && d.boundingBox)
+        .map((d, idx) => {
+          const bb = d.boundingBox!;
+          const ymin = Math.round((bb.y / h) * 1000);
+          const xmin = Math.round((bb.x / w) * 1000);
+          const ymax = Math.round(((bb.y + bb.height) / h) * 1000);
+          const xmax = Math.round(((bb.x + bb.width) / w) * 1000);
+          return {
+            id: idx + 1,
+            box_2d: [ymin, xmin, ymax, xmax],
+            text: d.rawValue!.trim(),
+          };
+        });
+    } catch {
+      validBubbles = [];
+    }
+  }
+
+  if (validBubbles.length === 0) {
+    usedModel = 'tesseract-wasm-ocr';
+    validBubbles = await runTesseractOcrBoxes(dataUrl, w, h, srcLang);
+  }
+  return { bubbles: validBubbles, model: usedModel };
+}
+
+export async function directScanRemoteMangaPage(params: {
+  imageUrl: string;
+  mode: ModePair;
+  titleId?: string;
+  layout?: ComicLayoutMode;
+  signal?: AbortSignal;
+}): Promise<ImageTranslationResult> {
+  const cacheKey = `${params.imageUrl}::${params.mode}`;
+  const cached = scannedMangaPageCache.get(cacheKey);
+  if (cached) return cached;
+
+  const { dataUrl, fileName } = await fetchRemoteImageAsDataUrl(params.imageUrl, params.signal);
+  const res = await directTranslateImage({
+    cid: `c_comic_${Date.now().toString(36)}`,
+    mode: params.mode,
+    fileName,
+    imageDataUrl: dataUrl,
+    titleId: params.titleId,
+    layout: params.layout,
+    persistMessage: false,
+    signal: params.signal,
+  });
+  const out: ImageTranslationResult = {
+    width: res.width,
+    height: res.height,
+    blocks: res.blocks,
+    fullSrc: res.fullSrc,
+    fullDst: res.fullDst,
+    model: res.model,
+    dataUrl: res.dataUrl,
+    comicLayout: res.comicLayout,
+    readingDir: res.readingDir,
+    isSpread: res.isSpread,
+  };
+  scannedMangaPageCache.set(cacheKey, out);
+  return out;
+}
+
 export async function directTranslateImage(params: {
   cid: string;
   mode: ModePair;
   fileName: string;
   imageDataUrl: string;
   titleId?: string;
+  layout?: ComicLayoutMode;
+  persistMessage?: boolean;
+  signal?: AbortSignal;
 }): Promise<{ cid: string; mid: string; titleId: string } & ImageTranslationResult> {
   const [dataHeader, rawB64 = ''] = params.imageDataUrl.split(',', 2);
-  let binaryStr = '';
+  if (rawB64.length > Math.ceil(MAX_REMOTE_IMAGE_BYTES * 1.38)) {
+    throw new Error('Ukuran gambar melebihi batas aman 15 MB.');
+  }
+  const cleanPrefix = rawB64.replace(/\s+/g, '').slice(0, 64);
+  const headLen = cleanPrefix.length - (cleanPrefix.length % 4);
+  if (headLen < 4) {
+    throw new Error('Data gambar tidak sah atau rusak.');
+  }
+  let headStr = '';
   try {
-    binaryStr = atob(rawB64);
+    headStr = atob(cleanPrefix.slice(0, headLen));
   } catch {
     throw new Error('Data gambar tidak sah atau rusak.');
   }
-  const rawBytes = new Uint8Array(binaryStr.length);
-  for (let i = 0; i < binaryStr.length; i += 1) {
-    rawBytes[i] = binaryStr.charCodeAt(i) & 0xff;
+  const headBytes = new Uint8Array(headStr.length);
+  for (let i = 0; i < headStr.length; i += 1) {
+    headBytes[i] = headStr.charCodeAt(i) & 0xff;
   }
   const ext = (params.fileName.split('.').pop() || 'png').toLowerCase();
-  const magicErr = inspectBinaryMagicBytes(rawBytes, ext, 'gambar');
+  const magicMime = detectMimeFromMagicBytes(headBytes);
+  const magicErr = magicMime ? null : inspectBinaryMagicBytes(headBytes, ext, 'gambar');
   if (magicErr) {
     throw new Error(magicErr);
   }
@@ -6108,14 +7202,14 @@ export async function directTranslateImage(params: {
     img.onload = () => {
       const w = img.naturalWidth || 640;
       const h = img.naturalHeight || 480;
-      if (w > 8192 || h > 8192 || w * h > 25_000_000) {
-        reject(new Error('Resolusi gambar melampaui batas aman 8192x8192 piksel (25 MP).'));
+      if (w > 8192 || h > MAX_MANGA_STRIP_HEIGHT || w * h > MAX_MANGA_STRIP_PIXELS) {
+        reject(new Error('Resolusi gambar melampaui batas aman 36 megapiksel (tinggi maks 65.536 px).'));
         return;
       }
       resolve({
         w,
         h,
-        mime: mimeMatch ? mimeMatch[1] : 'image/png',
+        mime: magicMime || (mimeMatch ? mimeMatch[1] : 'image/png'),
         b64: rawB64,
         imgEl: img,
       });
@@ -6124,137 +7218,209 @@ export async function directTranslateImage(params: {
     img.src = params.imageDataUrl;
   });
 
+  const { src } = parseModePair(params.mode);
   const geminiKey = await getOwnerGeminiKey();
-  let validBubbles: Array<{ id?: number; box_2d: number[]; text: string }> = [];
+  let rawPixelBoxes: RawOcrBox[] = [];
   let usedModel = 'gemini-2.5-flash';
 
-  if (geminiKey) {
-    const visionPrompt =
-      'Extract all visible text blocks or speech bubbles in reading order. ' +
-      'Return strict JSON: {"bubbles":[{"id":1,"box_2d":[ymin,xmin,ymax,xmax],"text":"..."}]} ' +
-      'with integer coordinates normalized 0..1000.';
-
-    const resp = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': geminiKey,
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: visionPrompt }] },
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                { inlineData: { mimeType: imgDims.mime, data: imgDims.b64 } },
-                { text: 'Detect all visible text regions.' },
-              ],
-            },
-          ],
-          generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
-        }),
-      }
-    );
-    if (!resp.ok) {
-      throw new Error(`Gemini Vision mengembalikan status HTTP ${resp.status}.`);
-    }
-    const raw = await resp.json();
-    const parsed = JSON.parse(raw?.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
-    const bubbles: Array<{ id?: number; box_2d?: number[]; text?: string }> = Array.isArray(
-      parsed.bubbles
-    )
-      ? parsed.bubbles
-      : [];
-    validBubbles = bubbles
-      .filter(
-        (b): b is { id?: number; box_2d: number[]; text: string } =>
-          typeof b.text === 'string' &&
-          Boolean(b.text.trim()) &&
-          Array.isArray(b.box_2d) &&
-          b.box_2d.length === 4
-      )
-      .map((b) => ({ id: b.id, box_2d: b.box_2d, text: b.text.trim() }));
-  } else {
-    const DetectorCtor = (
-      window as unknown as {
-        TextDetector?: new () => {
-          detect: (
-            src: HTMLImageElement
-          ) => Promise<
-            Array<{
-              rawValue?: string;
-              boundingBox?: { x: number; y: number; width: number; height: number };
-            }>
-          >;
-        };
-      }
-    ).TextDetector;
-    if (DetectorCtor) {
+  try {
+    const isConstrained = getDeviceRuntimeProfile().isConstrained;
+    // Build lightweight 96px-wide Rec. 709 horizontal row-variance probe for tall webtoon gutter seam snapping
+    let rowVarianceFn: ((y: number) => number) | undefined;
+    if (imgDims.h > (isConstrained ? 1500 : 2100) && typeof document !== 'undefined') {
+      const probeW = Math.min(96, imgDims.w);
+      const maxProbeH = isConstrained ? 2048 : 4096;
+      const probeScaleY = Math.min(1, maxProbeH / imgDims.h);
+      const probeH = Math.max(1, Math.round(imgDims.h * probeScaleY));
+      const probeCanvas = document.createElement('canvas');
       try {
-        const detector = new DetectorCtor();
-        const detectedBoxes = await detector.detect(imgDims.imgEl);
-        usedModel = 'browser-text-detector';
-        validBubbles = detectedBoxes
-          .filter((d) => typeof d.rawValue === 'string' && d.rawValue.trim() && d.boundingBox)
-          .map((d, idx) => {
-            const bb = d.boundingBox!;
-            const ymin = Math.round((bb.y / imgDims.h) * 1000);
-            const xmin = Math.round((bb.x / imgDims.w) * 1000);
-            const ymax = Math.round(((bb.y + bb.height) / imgDims.h) * 1000);
-            const xmax = Math.round(((bb.x + bb.width) / imgDims.w) * 1000);
-            return {
-              id: idx + 1,
-              box_2d: [ymin, xmin, ymax, xmax],
-              text: d.rawValue!.trim(),
-            };
-          });
+        probeCanvas.width = probeW;
+        probeCanvas.height = probeH;
+        const pCtx = probeCanvas.getContext('2d', { willReadFrequently: true });
+        if (pCtx) {
+          pCtx.drawImage(imgDims.imgEl, 0, 0, probeW, probeH);
+          const pData = pCtx.getImageData(0, 0, probeW, probeH).data;
+          const rowVars = new Float32Array(probeH);
+          for (let py = 0; py < probeH; py += 1) {
+            let sum = 0;
+            let sumSq = 0;
+            const base = py * probeW * 4;
+            for (let px = 0; px < probeW; px += 1) {
+              const o = base + px * 4;
+              const lum = 0.2126 * pData[o] + 0.7152 * pData[o + 1] + 0.0722 * pData[o + 2];
+              sum += lum;
+              sumSq += lum * lum;
+            }
+            const mean = sum / probeW;
+            rowVars[py] = Math.max(0, sumSq / probeW - mean * mean);
+          }
+          rowVarianceFn = (origY: number) => {
+            const py = Math.max(0, Math.min(probeH - 1, Math.round(origY * probeScaleY)));
+            return rowVars[py];
+          };
+        }
       } catch {
-        validBubbles = [];
+        rowVarianceFn = undefined;
+      } finally {
+        probeCanvas.width = 0;
+        probeCanvas.height = 0;
       }
     }
+    const tiles = planVerticalStripTiles(imgDims.w, imgDims.h, { isConstrained, rowVarianceFn });
 
-    if (validBubbles.length === 0) {
-      const { src } = parseModePair(params.mode);
-      usedModel = 'tesseract-wasm-ocr';
-      validBubbles = await runTesseractOcrBoxes(
-        params.imageDataUrl,
-        imgDims.w,
-        imgDims.h,
-        src
-      );
+    if (tiles.length === 1) {
+      const det = await detectVisionBubblesOnSource({
+        dataUrl: params.imageDataUrl,
+        mime: imgDims.mime,
+        b64: imgDims.b64,
+        imgEl: imgDims.imgEl,
+        w: imgDims.w,
+        h: imgDims.h,
+        srcLang: src,
+        geminiKey,
+        signal: params.signal,
+      });
+      usedModel = det.model;
+      rawPixelBoxes = det.bubbles.map((b, idx) => {
+        const [ymin, xmin, ymax, xmax] = b.box_2d.map((v) =>
+          Number.isFinite(v) ? Math.max(0, Math.min(1000, v)) : 0
+        );
+        const x = Math.max(0, Math.min(imgDims.w - 1, Math.round((Math.min(xmin, xmax) / 1000) * imgDims.w)));
+        const y = Math.max(0, Math.min(imgDims.h - 1, Math.round((Math.min(ymin, ymax) / 1000) * imgDims.h)));
+        const bw = Math.max(24, Math.min(imgDims.w - x, Math.round((Math.abs(xmax - xmin) / 1000) * imgDims.w)));
+        const bh = Math.max(20, Math.min(imgDims.h - y, Math.round((Math.abs(ymax - ymin) / 1000) * imgDims.h)));
+        return {
+          id: idx + 1,
+          box: [x, y, bw, bh],
+          text: b.text.trim(),
+          kind: b.kind,
+          shape: b.shape,
+          bgTone: b.bgTone,
+          writingDir: b.writingDir,
+          sfxImportance: b.sfxImportance,
+        };
+      });
+    } else {
+      // Tall webtoon / manhwa strip: slice into bounded tiles & stitch cross-seam detections (GPU-safe cleanup)
+      const tileCanvas = document.createElement('canvas');
+      const tCtx = tileCanvas.getContext('2d');
+      const stitchedInput: Array<RawOcrBox & { src: string }> = [];
+      try {
+        for (const tile of tiles) {
+          if (params.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+          tileCanvas.width = imgDims.w;
+          tileCanvas.height = tile.height;
+          if (tCtx) {
+            tCtx.clearRect(0, 0, tileCanvas.width, tileCanvas.height);
+            tCtx.drawImage(
+              imgDims.imgEl,
+              0,
+              tile.yStart,
+              imgDims.w,
+              tile.height,
+              0,
+              0,
+              imgDims.w,
+              tile.height
+            );
+          }
+          const tileDataUrl = tileCanvas.toDataURL('image/jpeg', 0.9);
+          const tileB64 = tileDataUrl.split(',', 2)[1] || '';
+          const det = await detectVisionBubblesOnSource({
+            dataUrl: tileDataUrl,
+            mime: 'image/jpeg',
+            b64: tileB64,
+            imgEl: tileCanvas,
+            w: imgDims.w,
+            h: tile.height,
+            srcLang: src,
+            geminiKey,
+            signal: params.signal,
+          });
+          usedModel = det.model;
+          for (const b of det.bubbles) {
+            const [ymin, xmin, ymax, xmax] = b.box_2d.map((v) =>
+              Number.isFinite(v) ? Math.max(0, Math.min(1000, v)) : 0
+            );
+            const x = Math.max(0, Math.min(imgDims.w - 1, Math.round((Math.min(xmin, xmax) / 1000) * imgDims.w)));
+            const y = Math.max(
+              0,
+              Math.min(imgDims.h - 1, tile.yStart + Math.round((Math.min(ymin, ymax) / 1000) * tile.height))
+            );
+            const bw = Math.max(24, Math.min(imgDims.w - x, Math.round((Math.abs(xmax - xmin) / 1000) * imgDims.w)));
+            const bh = Math.max(20, Math.min(imgDims.h - y, Math.round((Math.abs(ymax - ymin) / 1000) * tile.height)));
+            stitchedInput.push({
+              id: stitchedInput.length + 1,
+              box: [x, y, bw, bh],
+              text: b.text.trim(),
+              src: b.text.trim(),
+              kind: b.kind,
+              shape: b.shape,
+              bgTone: b.bgTone,
+              writingDir: b.writingDir,
+              sfxImportance: b.sfxImportance,
+            });
+          }
+        }
+      } finally {
+        tileCanvas.width = 0;
+        tileCanvas.height = 0;
+      }
+      rawPixelBoxes = dedupeAndStitchTileBlocks(stitchedInput);
     }
-
-    if (validBubbles.length === 0) {
-      throw new Error('Tidak ditemukan teks yang dapat dibaca pada gambar ini.');
-    }
+  } finally {
+    // Release decoded bitmap memory immediately after OCR completes or fails
+    imgDims.imgEl.src = '';
   }
 
-  const { outputs, detectedSource } = validBubbles.length
+  if (rawPixelBoxes.length === 0 && !geminiKey) {
+    throw new Error('Tidak ditemukan teks yang dapat dibaca pada gambar ini.');
+  }
+
+  // Cluster line-level OCR fragments into unified speech bubbles (only when using line-based fallback OCR)
+  const clustered =
+    usedModel === 'gemini-2.5-flash'
+      ? rawPixelBoxes
+      : clusterOcrBoxes(rawPixelBoxes, src === 'ja' ? 'vertical' : 'horizontal');
+
+  const inferredLayout: ComicLayoutMode =
+    params.layout ||
+    (imgDims.h / Math.max(1, imgDims.w) >= 2.5
+      ? 'webtoon_strip'
+      : src === 'ja' || clustered.some((b) => CJK_RE.test(b.text))
+        ? 'rtl_manga'
+        : 'ltr_comic');
+
+  const orderedBoxes = sortMangaReadingOrder(clustered, inferredLayout, imgDims.w, imgDims.h);
+  const preparedInputs = orderedBoxes.map((b) => normalizeComicAllCaps(b.text.trim()));
+
+  const { outputs, detectedSource } = orderedBoxes.length
     ? await translateParagraphsDirect({
-        paragraphs: validBubbles.map((b) => b.text!.trim()),
-        mode: params.mode,
-        titleId: params.titleId,
-      })
+      paragraphs: preparedInputs,
+      mode: params.mode,
+      titleId: params.titleId,
+      titleKind: 'komik',
+      docFormat: 'image',
+      signal: params.signal,
+    })
     : { outputs: [], detectedSource: 'ja' as TargetLang };
 
-  const blocks: VisionBlock[] = validBubbles.map((b, idx) => {
-    const [ymin, xmin, ymax, xmax] = b.box_2d!;
-    const x = Math.max(0, Math.round((Math.min(xmin, xmax) / 1000) * imgDims.w));
-    const y = Math.max(0, Math.round((Math.min(ymin, ymax) / 1000) * imgDims.h));
-    const w = Math.max(24, Math.round((Math.abs(xmax - xmin) / 1000) * imgDims.w));
-    const h = Math.max(20, Math.round((Math.abs(ymax - ymin) / 1000) * imgDims.h));
-    return {
-      id: idx + 1,
-      box: [x, y, w, h],
-      src: b.text!.trim(),
-      dst: outputs[idx] || b.text!.trim(),
-    };
-  });
+  const blocks: VisionBlock[] = orderedBoxes.map((b, idx) => ({
+    id: idx + 1,
+    box: b.box,
+    src: b.text.trim(),
+    dst: outputs[idx] || b.text.trim(),
+    kind: b.kind,
+    shape: b.shape,
+    bgTone: b.bgTone,
+    writingDir: b.writingDir,
+    sfxImportance: b.sfxImportance,
+  }));
 
   const tid = params.titleId || 't_gambar';
   const mid = `img_${Date.now().toString(36)}`;
+  const isSpread = inferredLayout === 'rtl_manga' && imgDims.w > imgDims.h * 1.15;
+  const canonicalDataUrl = `data:${imgDims.mime};base64,${imgDims.b64}`;
   const res: ImageTranslationResult = {
     width: imgDims.w,
     height: imgDims.h,
@@ -6262,31 +7428,36 @@ export async function directTranslateImage(params: {
     fullSrc: blocks.map((b) => b.src).join('\n'),
     fullDst: blocks.map((b) => b.dst).join('\n'),
     model: usedModel,
-    dataUrl: params.imageDataUrl,
+    dataUrl: canonicalDataUrl,
+    comicLayout: inferredLayout,
+    readingDir: inferredLayout === 'rtl_manga' || inferredLayout === 'four_koma' ? 'rtl' : inferredLayout === 'webtoon_strip' ? 'vertical' : 'ltr',
+    isSpread,
   };
 
-  await Promise.all([
-    upsertConversationMeta(params.cid, {
-      title: params.fileName,
-      titleId: tid,
-      mode: params.mode,
-      detectedSource,
-      activeTab: 'gambar',
-      preview: res.fullDst.slice(0, 180) || params.fileName,
-    }),
-    saveTurnMessageDirect(params.cid, mid, {
-      role: 'assistant',
-      kind: 'image',
-      mode: params.mode,
-      detectedSource,
-      titleId: tid,
-      fileName: params.fileName,
-      text: res.fullDst,
-      imageResult: res,
-      state: 'done',
-      model: usedModel,
-    }),
-  ]);
+  if (params.persistMessage !== false) {
+    await Promise.all([
+      upsertConversationMeta(params.cid, {
+        title: params.fileName,
+        titleId: tid,
+        mode: params.mode,
+        detectedSource,
+        activeTab: 'gambar',
+        preview: res.fullDst.slice(0, 180) || params.fileName,
+      }),
+      saveTurnMessageDirect(params.cid, mid, {
+        role: 'assistant',
+        kind: 'image',
+        mode: params.mode,
+        detectedSource,
+        titleId: tid,
+        fileName: params.fileName,
+        text: res.fullDst,
+        imageResult: res,
+        state: 'done',
+        model: usedModel,
+      }),
+    ]);
+  }
 
   return { cid: params.cid, mid, titleId: tid, ...res };
 }
