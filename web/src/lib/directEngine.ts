@@ -34,6 +34,7 @@ import {
 import {
   getOwnerGeminiKey,
   loadGlossaryEntriesOnce,
+  registerLocalCacheResetHook,
   saveDirectJobRecord,
   saveTurnMessageDirect,
   upsertConversationMeta,
@@ -49,6 +50,7 @@ import {
 import {
   buildLiterarySystemPrompt,
   buildSelfRepairPrompt,
+  clearSeriesDiscourseMemory,
   evaluateSourceTargetQe,
   naturalizeAndVerifyParagraph,
   preprocessSourceForMt,
@@ -5835,7 +5837,6 @@ async function extractPdfUnitsWithPdfJs(
         pageLineGroups.push(pageLines);
       } finally {
         page.cleanup?.();
-        prevY = sp.y;
       }
     }
 

@@ -98,7 +98,23 @@ const SHARED_DEVICE_USER_CACHE_KEYS = [
   'tranx_translation_tone_v1',
 ];
 
+const localCacheResetHooks = new Set<() => void>();
+
+export function registerLocalCacheResetHook(hook: () => void): () => void {
+  localCacheResetHooks.add(hook);
+  return () => {
+    localCacheResetHooks.delete(hook);
+  };
+}
+
 export function clearLocalUserCaches(): void {
+  for (const hook of localCacheResetHooks) {
+    try {
+      hook();
+    } catch {
+      // ignore individual cache reset hook failures
+    }
+  }
   if (typeof window === 'undefined') return;
   for (const key of SHARED_DEVICE_USER_CACHE_KEYS) {
     try {
