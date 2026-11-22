@@ -506,7 +506,9 @@ export function planVerticalStripTiles(
   }
 
   const tiles: StripTileSpec[] = [];
-  const maxTiles = Math.min(96, Math.ceil(height / Math.max(200, maxTileH - overlap)) + 2);
+  const snapBackMax = options?.rowVarianceFn ? 120 : 0;
+  const minStep = Math.max(200, maxTileH - snapBackMax - overlap);
+  const maxTiles = Math.min(128, Math.ceil(height / minStep) + 2);
   let y = 0;
   let idx = 0;
   while (y < height && idx < maxTiles) {
