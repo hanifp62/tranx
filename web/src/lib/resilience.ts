@@ -117,9 +117,11 @@ export class BoundedLruCache<K, V> {
     return this.store.entries();
   }
 
-  /** Trim oldest entries down to target fraction (e.g. 0.5 when mobile PWA goes to background). */
+  /** Trim oldest entries down to target fraction of current size (e.g. 0.5 when mobile PWA goes to background). */
   trimToRatio(ratio: number): void {
-    const target = Math.max(2, Math.floor(this.maxEntries * Math.max(0.1, Math.min(1, ratio))));
+    if (this.store.size === 0) return;
+    const clamped = Math.max(0, Math.min(1, ratio));
+    const target = Math.floor(this.store.size * clamped);
     while (this.store.size > target) {
       const oldest = this.store.keys().next().value;
       if (oldest === undefined) break;
@@ -165,10 +167,10 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   }
   return new Promise<void>((resolve, reject) => {
     const onAbort = () => {
-      window.clearTimeout(timer);
+      globalThis.clearTimeout(timer);
       reject(new DOMException('Aborted', 'AbortError'));
     };
-    const timer = window.setTimeout(() => {
+    const timer = globalThis.setTimeout(() => {
       signal?.removeEventListener('abort', onAbort);
       resolve();
     }, ms);
@@ -205,9 +207,29 @@ export class AdaptiveTokenBucket {
     if (signal?.aborted) {
       throw new DOMException('Aborted', 'AbortError');
     }
-    const ticket = this.queue.then(() => this.acquireOnce(signal));
-    this.queue = ticket.catch(() => undefined);
-    return ticket;
+    const waitTurn = this.queue.then(() => this.acquireOnce(signal));
+    this.queue = waitTurn.catch(() => undefined);
+    if (!signal) return waitTurn;
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+      waitTurn.then(
+        () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        },
+        (err) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        }
+      );
+    });
   }
 
   onThrottle(retryAfterMs?: number): void {
@@ -249,23 +271,70 @@ export class AdaptiveTokenBucket {
 }
 
 /**
- * Lightweight Circuit Breaker per upstream endpoint.
+ * Lightweight Circuit Breaker per upstream endpoint with explicit closed/open/half-open telemetry.
  * Prevents cascading latency spikes when an upstream CDN/proxy/API returns 403/429/5xx.
  */
+export type CircuitBreakerState = 'closed' | 'open' | 'half-open';
+
+export interface CircuitBreakerTelemetry {
+  name: string;
+  state: CircuitBreakerState;
+  failures: number;
+  openTransitions: number;
+  cooldownRemainingMs: number;
+}
+
+const breakerRegistry = new Map<string, EndpointCircuitBreaker>();
+
 export class EndpointCircuitBreaker {
   private failures = 0;
   private openUntilMs = 0;
+  private halfOpenProbe = false;
+  private halfOpenProbeUntilMs = 0;
+  private openTransitions = 0;
+  readonly name: string;
 
   constructor(
     private readonly failureThreshold = 2,
-    private readonly cooldownMs = 30_000
-  ) {}
+    private readonly cooldownMs = 30_000,
+    name?: string
+  ) {
+    this.name = name || `endpoint_${breakerRegistry.size + 1}`;
+    breakerRegistry.set(this.name, this);
+  }
+
+  dispose(): void {
+    if (breakerRegistry.get(this.name) === this) {
+      breakerRegistry.delete(this.name);
+    }
+  }
+
+  getState(): CircuitBreakerState {
+    if (this.openUntilMs === 0) {
+      if (this.halfOpenProbe && Date.now() < this.halfOpenProbeUntilMs) {
+        return 'half-open';
+      }
+      return 'closed';
+    }
+    if (Date.now() >= this.openUntilMs) {
+      return 'half-open';
+    }
+    return 'open';
+  }
 
   isOpen(): boolean {
+    const now = Date.now();
+    // Gate concurrent callers while a single half-open probe is still in flight (prevents stampede)
+    if (this.halfOpenProbe) {
+      if (now < this.halfOpenProbeUntilMs) return true;
+      this.halfOpenProbe = false;
+    }
     if (this.openUntilMs === 0) return false;
-    if (Date.now() >= this.openUntilMs) {
-      // Half-open: allow probe request
+    if (now >= this.openUntilMs) {
+      // Half-open: admit exactly ONE probe caller (15s safety ceiling in case probe is aborted)
       this.openUntilMs = 0;
+      this.halfOpenProbe = true;
+      this.halfOpenProbeUntilMs = now + 15_000;
       this.failures = Math.max(0, this.failureThreshold - 1);
       return false;
     }
@@ -275,11 +344,16 @@ export class EndpointCircuitBreaker {
   recordSuccess(): void {
     this.failures = 0;
     this.openUntilMs = 0;
+    this.halfOpenProbe = false;
+    this.halfOpenProbeUntilMs = 0;
   }
 
   recordFailure(customCooldownMs?: number): void {
     this.failures += 1;
+    this.halfOpenProbe = false;
+    this.halfOpenProbeUntilMs = 0;
     if (this.failures >= this.failureThreshold) {
+      this.openTransitions += 1;
       this.openUntilMs = Date.now() + Math.max(2000, customCooldownMs || this.cooldownMs);
     }
   }
@@ -287,5 +361,66 @@ export class EndpointCircuitBreaker {
   reset(): void {
     this.failures = 0;
     this.openUntilMs = 0;
+    this.halfOpenProbe = false;
+    this.halfOpenProbeUntilMs = 0;
   }
+
+  getTelemetry(): CircuitBreakerTelemetry {
+    const state = this.getState();
+    return {
+      name: this.name,
+      state,
+      failures: this.failures,
+      openTransitions: this.openTransitions,
+      cooldownRemainingMs: state === 'open' ? Math.max(0, this.openUntilMs - Date.now()) : 0,
+    };
+  }
+}
+
+export interface RuntimeHealthSnapshot {
+  online: boolean;
+  isConstrained: boolean;
+  allowBackgroundPrefetch: boolean;
+  openBreakerCount: number;
+  breakers: CircuitBreakerTelemetry[];
+  checkedAt: number;
+}
+
+export function getRuntimeHealthSnapshot(): RuntimeHealthSnapshot {
+  const profile = getDeviceRuntimeProfile();
+  const breakers = Array.from(breakerRegistry.values()).map((b) => b.getTelemetry());
+  const openBreakerCount = breakers.filter((b) => b.state === 'open').length;
+  return {
+    online: profile.online,
+    isConstrained: profile.isConstrained,
+    allowBackgroundPrefetch: profile.allowBackgroundPrefetch && openBreakerCount === 0,
+    openBreakerCount,
+    breakers,
+    checkedAt: Date.now(),
+  };
+}
+
+export function shouldShedBackgroundLoad(storageRatio = 0): boolean {
+  const snap = getRuntimeHealthSnapshot();
+  return !snap.allowBackgroundPrefetch || snap.openBreakerCount > 0 || storageRatio >= 0.85;
+}
+
+/**
+ * Cooperative main-thread yield keeping INP responsive during heavy batch parsing/naturalization.
+ * Uses Chrome 129+ `scheduler.yield()` with a universal `setTimeout(0)` fallback.
+ */
+export async function yieldToMain(): Promise<void> {
+  if (typeof globalThis === 'undefined') return;
+  const sched = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+  if (typeof sched?.yield === 'function') {
+    try {
+      await sched.yield();
+      return;
+    } catch {
+      // fall through to macrotask yield
+    }
+  }
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
 }

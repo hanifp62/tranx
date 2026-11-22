@@ -26,9 +26,9 @@ function createFlatePdfBuffer(englishParagraph: string): Buffer {
   const deflated = zlib.deflateSync(Buffer.from(contentStream, 'latin1'));
   const head = Buffer.from(
     `%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n` +
-      `2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n` +
-      `3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n` +
-      `4 0 obj\n<< /Length ${deflated.length} /Filter /FlateDecode >>\nstream\n`,
+    `2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n` +
+    `3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n` +
+    `4 0 obj\n<< /Length ${deflated.length} /Filter /FlateDecode >>\nstream\n`,
     'latin1'
   );
   const tail = Buffer.from(`\nendstream\nendobj\n%%EOF\n`, 'latin1');
@@ -124,9 +124,9 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
       path: qaArtifactPath('qa_desktop_terang.png'),
     });
 
-    // 6. Verify Voice Dictation (Dikte suara) inside K/Composer
+    // 6. Verify Voice Dictation (Dikte suara) inside K/Composer (v2.5.1: final transcript must override interim!)
     await page.getByRole('button', { name: 'Dikte suara' }).click();
-    await expect(page.locator('textarea.composer-textarea')).toHaveValue(/千早/, {
+    await expect(page.locator('textarea.composer-textarea')).toHaveValue('千早は小さく笑った。', {
       timeout: 4000,
     });
     await page.locator('textarea.composer-textarea').fill('');
@@ -297,8 +297,9 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await expect(page.getByRole('dialog')).toBeVisible();
     await page.getByRole('dialog').getByRole('button', { name: /Bab 1: Hujan di Rashomon/ }).click();
     await expect(page.getByRole('heading', { name: 'Bab 1: Hujan di Rashomon' })).toBeVisible();
-    // Switch to Situs Terjemahan via "Buka web terjemahan otomatis" -> stays strictly inside the SAME app tab (0 new tabs!)
+    // Switch to Situs Terjemahan via Progressive Disclosure "Alat baca" -> "Buka web terjemahan otomatis" (0 new tabs!)
     const pagesBeforeAutoSite = page.context().pages().length;
+    await page.getByRole('button', { name: 'Alat baca' }).click();
     await page.getByRole('button', { name: 'Buka web terjemahan otomatis' }).click();
     await expect(page).toHaveURL(/view=site/);
     expect(page.context().pages().length).toBe(pagesBeforeAutoSite);
@@ -522,19 +523,19 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
           code: 200,
           data: isCh2
             ? {
-                title: 'Chapter 2: The Lanterns of Kyoto',
-                url: 'https://www.aozora.gr.jp/cards/2.html',
-                finalUrl: 'https://www.aozora.gr.jp/cards/2.html',
-                html: `<!doctype html><html><head><title>Chapter 2: The Lanterns of Kyoto</title></head><body><h1>Chapter 2: The Lanterns of Kyoto</h1><p>Lantern light swayed quietly across the wet stone alley.</p><nav><a rel="prev" href="/cards/1.html">Previous Chapter</a></nav></body></html>`,
-                links: { 'Previous Chapter': 'https://www.aozora.gr.jp/cards/1.html' },
-              }
+              title: 'Chapter 2: The Lanterns of Kyoto',
+              url: 'https://www.aozora.gr.jp/cards/2.html',
+              finalUrl: 'https://www.aozora.gr.jp/cards/2.html',
+              html: `<!doctype html><html><head><title>Chapter 2: The Lanterns of Kyoto</title></head><body><h1>Chapter 2: The Lanterns of Kyoto</h1><p>Lantern light swayed quietly across the wet stone alley.</p><nav><a rel="prev" href="/cards/1.html">Previous Chapter</a></nav></body></html>`,
+              links: { 'Previous Chapter': 'https://www.aozora.gr.jp/cards/1.html' },
+            }
             : {
-                title: 'The Rainy Gate of Kyoto',
-                url: 'https://www.aozora.gr.jp/cards/1.html',
-                finalUrl: 'https://www.aozora.gr.jp/cards/1.html',
-                html: `<!doctype html><html><head><title>The Rainy Gate of Kyoto</title><script>window.__xss=91234;</script></head><body onload="window.__xss=91234"><h1>The Rainy Gate of Kyoto</h1><p>Chihaya stood quietly under the wooden gate while listening to the rain.</p><p>「…………」</p><p>She opened her notebook and read the letter from Tokyo.</p><nav><a rel="next" href="/cards/2.html" onclick="window.__xss=91234">Next Chapter</a></nav></body></html>`,
-                links: { 'Next Chapter': 'https://www.aozora.gr.jp/cards/2.html' },
-              },
+              title: 'The Rainy Gate of Kyoto',
+              url: 'https://www.aozora.gr.jp/cards/1.html',
+              finalUrl: 'https://www.aozora.gr.jp/cards/1.html',
+              html: `<!doctype html><html><head><title>The Rainy Gate of Kyoto</title><script>window.__xss=91234;</script></head><body onload="window.__xss=91234"><h1>The Rainy Gate of Kyoto</h1><p>Chihaya stood quietly under the wooden gate while listening to the rain.</p><p>「…………」</p><p>She opened her notebook and read the letter from Tokyo.</p><nav><a rel="next" href="/cards/2.html" onclick="window.__xss=91234">Next Chapter</a></nav></body></html>`,
+              links: { 'Next Chapter': 'https://www.aozora.gr.jp/cards/2.html' },
+            },
         }),
       });
     });
@@ -1464,18 +1465,18 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
             isHtmlMode
               ? { code: 200, data: { title: '', html: '', url: 'https://ncode.syosetu.com/n9669bk/1/' } }
               : {
-                  code: 200,
-                  data: {
-                    title: 'Mushoku Tensei - Prologue',
-                    url: 'https://ncode.syosetu.com/n9669bk/1/',
-                    content:
-                      'I am a 34-year-old jobless recluse.\n\nA bright flash appeared right before the truck hit.',
-                    links: {
-                      '次へ': 'https://ncode.syosetu.com/n9669bk/2/',
-                      '目次': 'https://ncode.syosetu.com/n9669bk/',
-                    },
+                code: 200,
+                data: {
+                  title: 'Mushoku Tensei - Prologue',
+                  url: 'https://ncode.syosetu.com/n9669bk/1/',
+                  content:
+                    'I am a 34-year-old jobless recluse.\n\nA bright flash appeared right before the truck hit.',
+                  links: {
+                    '次へ': 'https://ncode.syosetu.com/n9669bk/2/',
+                    '目次': 'https://ncode.syosetu.com/n9669bk/',
                   },
-                }
+                },
+              }
           ),
         });
         return;
@@ -1489,14 +1490,14 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
             isHtmlMode
               ? { code: 200, data: { title: '', html: '', url: 'https://ncode.syosetu.com/n9669bk/2/' } }
               : {
-                  code: 200,
-                  data: {
-                    title: 'Mushoku Tensei - Chapter 2: A New World',
-                    url: 'https://ncode.syosetu.com/n9669bk/2/',
-                    content: 'When I opened my eyes, I was staring at a wooden ceiling.',
-                    links: { '前へ': 'https://ncode.syosetu.com/n9669bk/1/' },
-                  },
-                }
+                code: 200,
+                data: {
+                  title: 'Mushoku Tensei - Chapter 2: A New World',
+                  url: 'https://ncode.syosetu.com/n9669bk/2/',
+                  content: 'When I opened my eyes, I was staring at a wooden ceiling.',
+                  links: { '前へ': 'https://ncode.syosetu.com/n9669bk/1/' },
+                },
+              }
           ),
         });
         return;
@@ -1531,25 +1532,25 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
           body: JSON.stringify(
             isHtmlMode
               ? {
-                  code: 200,
-                  data: {
-                    title: 'Just a moment...',
-                    html: '<html><head><title>Just a moment...</title></head><body>Enable JavaScript and cookies to continue</body></html>',
-                  },
-                }
+                code: 200,
+                data: {
+                  title: 'Just a moment...',
+                  html: '<html><head><title>Just a moment...</title></head><body>Enable JavaScript and cookies to continue</body></html>',
+                },
+              }
               : {
-                  code: 200,
-                  data: {
-                    title: '1. Good Morning Brother - Mother of Learning',
-                    url: 'https://www.royalroad.com/fiction/21220/mother-of-learning/chapter/301778/1-good-morning-brother',
-                    content:
-                      '**Chapter 001****Good Morning Brother**\n\nZorian opened his eyes and heard _MORNING_ shouted loudly.',
-                    links: {
-                      'Next Chapter':
-                        'https://www.royalroad.com/fiction/21220/mother-of-learning/chapter/301780/2-life-and-times',
-                    },
+                code: 200,
+                data: {
+                  title: '1. Good Morning Brother - Mother of Learning',
+                  url: 'https://www.royalroad.com/fiction/21220/mother-of-learning/chapter/301778/1-good-morning-brother',
+                  content:
+                    '**Chapter 001****Good Morning Brother**\n\nZorian opened his eyes and heard _MORNING_ shouted loudly.',
+                  links: {
+                    'Next Chapter':
+                      'https://www.royalroad.com/fiction/21220/mother-of-learning/chapter/301780/2-life-and-times',
                   },
-                }
+                },
+              }
           ),
         });
         return;
@@ -1579,20 +1580,20 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
           body: JSON.stringify(
             isHtmlMode
               ? {
-                  code: 200,
-                  data: {
-                    title: '\uFFFDH\uFFFDV\uFFFD',
-                    html: '<html><body><div class="main_text">\uFFFD\uFFFD\uFFFD\uFFFD</div></body></html>',
-                  },
-                }
+                code: 200,
+                data: {
+                  title: '\uFFFDH\uFFFDV\uFFFD',
+                  html: '<html><body><div class="main_text">\uFFFD\uFFFD\uFFFD\uFFFD</div></body></html>',
+                },
+              }
               : {
-                  code: 200,
-                  data: {
-                    title: 'Rashomon',
-                    url: 'https://www.aozora.gr.jp/cards/000879/files/127_15260.html',
-                    content: 'One evening a servant waited for the rain to stop under the Rashomon gate.',
-                  },
-                }
+                code: 200,
+                data: {
+                  title: 'Rashomon',
+                  url: 'https://www.aozora.gr.jp/cards/000879/files/127_15260.html',
+                  content: 'One evening a servant waited for the rain to stop under the Rashomon gate.',
+                },
+              }
           ),
         });
         return;
@@ -2010,7 +2011,7 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
         prompt?: () => Promise<void>;
         userChoice?: Promise<{ outcome: 'dismissed'; platform: string }>;
       };
-      ev.prompt = async () => {};
+      ev.prompt = async () => { };
       ev.userChoice = Promise.resolve({ outcome: 'dismissed', platform: 'web' });
       window.dispatchEvent(ev);
     });
@@ -2346,5 +2347,1279 @@ test.describe('tranX v3 Full Click-Through, Multilingual Matrix, Direct Engine &
     await page.screenshot({
       path: qaArtifactPath('qa_mobile_kakuyomu_84ch_rescue_390.png'),
     });
+  });
+
+  test('Strict 404 & Malformed Path Protection (///, /..., /.env, /laravel, /c/.., /web/extra)', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    const invalidPaths = [
+      'http://127.0.0.1:4173///?e2e=1',
+      '/web//?e2e=1',
+      '/...?e2e=1',
+      '/.env?e2e=1',
+      '/laravel?e2e=1',
+      '/wp-admin?e2e=1',
+      '/foo.bar?e2e=1',
+      '/c/abc%2fdef?e2e=1',
+      '/c/%252e%252e?e2e=1',
+      '/web/extra?e2e=1',
+      '/berkas/?e2e=1',
+      '/r/laravel?e2e=1',
+    ];
+
+    for (const badPath of invalidPaths) {
+      await page.goto(badPath);
+      await expect(
+        page.getByRole('heading', { name: 'Halaman tidak ditemukan' }),
+        `Expected 404 heading for ${badPath} (resolved url=${page.url()})`
+      ).toBeVisible();
+      await expect(page.getByLabel('HTTP 404')).toBeVisible();
+      await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toHaveCount(0);
+    }
+
+    const axe404 = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axe404.violations).toEqual([]);
+
+    await page.screenshot({
+      path: qaArtifactPath('qa_404_not_found_1280.png'),
+    });
+
+    // Clicking Back to Home returns cleanly to tranX workspace
+    await page.getByRole('button', { name: 'Kembali ke Beranda' }).click();
+    await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toBeVisible();
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('Natural Literary Translation Engine (Word/Sentence/Paragraph/Chapter Cohesion + Formal Guard + 0 Em-Dash)', async ({
+    page,
+  }) => {
+    await page.route('**/v1/healthz', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
+
+    // Simulate stiff raw Google Translate GTX output to prove tranX naturalizer transforms it cleanly!
+    await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const reqUrl = new URL(route.request().url());
+      const q = postParams.get('q') || reqUrl.searchParams.get('q') || '';
+      const lines = q.split('\n');
+      const translatedLines = lines.map((line) => {
+        let out = line;
+        out = out
+          .replace(
+            /教室の窓際で、椎名さんは苦笑いを浮かべながら首を傾げた。/,
+            'Di dekat jendela kelas, Nyonya Shiina tertawa pahit sambil memiringkan kepalanya.'
+          )
+          .replace(/思わず息を呑んだ。/, 'Tanpa berpikir, saya menelan napas.')
+          .replace(/「大丈夫だよ(?:……|――)」/, '"Tidak apa-apa\u2014"');
+        if (out.includes('This is the cafe where we met')) {
+          out = out.replace(
+            /This is the cafe where we met[\s\S]*/,
+            'Ini adalah merupakan kafe di mana kita bertemu, yang mana membawa sebuah perasaan hangat. Dia memiliki mata gelap dan rambut panjang. Pintu itu dibuka olehnya. Dia tidak bisa membantu tetapi tersenyum. Dia telah tidak pernah merasa seperti itu. "Aku mengerti." katanya.'
+          );
+        }
+        if (out.includes('Article 1')) {
+          out = out.replace(
+            /Article 1[\s\S]*/,
+            'Pasal 1 Ayat (2) Undang-Undang menetapkan kewajiban pengendali. Oleh karena itu, Saya dan Anda wajib mematuhinya.'
+          );
+        }
+        return out;
+      });
+      const segments = translatedLines.map((t, idx) => [
+        idx < translatedLines.length - 1 ? `${t}\n` : t,
+        lines[idx] || '',
+      ]);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([segments, null, 'ja']),
+      });
+    });
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto('/?e2e=1&direct=1');
+
+    // 1. Japanese school-novel passage: Nyonya Shiina -> Shiina-san, tertawa pahit -> tersenyum kecut, menelan napas -> tersentak menahan napas, 0 em-dash!
+    const textarea = page.locator('textarea.composer-textarea');
+    await textarea.fill(
+      '教室の窓際で、椎名さんは苦笑いを浮かべながら首を傾げた。\n\n思わず息を呑んだ。\n\n「大丈夫だよ――」'
+    );
+    await textarea.press('Enter');
+    const jaResult = page.locator('.assistant-prose').first();
+    await expect(jaResult).toContainText('Shiina-san');
+    await expect(jaResult).not.toContainText('Nyonya Shiina');
+    await expect(jaResult).toContainText('tersenyum kecut');
+    await expect(jaResult).toContainText('tersentak menahan napas');
+    const jaText = (await jaResult.textContent()) || '';
+    expect(jaText).not.toContain('\u2014');
+
+    // 2. English fiction anti-translationese test: eliminates di mana, yang mana, adalah merupakan, sebuah perasaan, memiliki mata, dibuka olehnya, telah tidak pernah, EYD V quote comma!
+    await page.getByRole('button', { name: 'Baru' }).click();
+    await page.locator('textarea.composer-textarea').fill(
+      'This is the cafe where we met in silence with a warm feeling and dark eyes.'
+    );
+    await page.locator('textarea.composer-textarea').press('Enter');
+    const enResult = page.locator('.assistant-prose').first();
+    await expect(enResult).toContainText('kafe tempat kita bertemu');
+    await expect(enResult).not.toContainText('adalah merupakan');
+    await expect(enResult).not.toContainText('yang mana');
+    await expect(enResult).not.toContainText('sebuah perasaan');
+    await expect(enResult).toContainText('bermata gelap');
+    await expect(enResult).toContainText('dibukanya');
+    await expect(enResult).toContainText('belum pernah');
+    await expect(enResult).toContainText('"Aku mengerti," katanya.');
+
+    // 3. Formal Legal Guard: must NEVER casualize Saya/Anda or Oleh karena itu in legal statutes!
+    await page.getByRole('button', { name: 'Baru' }).click();
+    await page.locator('textarea.composer-textarea').fill(
+      'Article 1 Section (2) Undang-Undang Pasal 1 Ayat (2) requires compliance.'
+    );
+    await page.locator('textarea.composer-textarea').press('Enter');
+    const legalResult = page.locator('.assistant-prose').first();
+    await expect(legalResult).toContainText('Oleh karena itu,');
+    await expect(legalResult).toContainText('Saya');
+    await expect(legalResult).toContainText('Anda');
+  });
+
+  test('Ebook Reader HCI Upgrade: 6 Eye-Comfort Themes, 14 Curated Fonts, Slide & 3D Book-Flip Animations, Zen Mode & Mobile Sheet', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.route('**/v1/healthz', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
+
+    const longParagraphs = Array.from(
+      { length: 18 },
+      (_, idx) =>
+        `<p>Paragraph ${idx + 1}: Morning rain tapped softly against the wooden eaves of the quiet library as lanterns flickered gently across the stone courtyard in Kyoto.</p>`
+    ).join('');
+
+    await page.route('https://r.jina.ai/**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({
+          code: 200,
+          data: {
+            title: 'Chapter 1: The Quiet Library of Kyoto',
+            url: 'https://www.aozora.gr.jp/cards/ebook-test.html',
+            finalUrl: 'https://www.aozora.gr.jp/cards/ebook-test.html',
+            html: `<!doctype html><html><head><title>Chapter 1: The Quiet Library of Kyoto</title></head><body><h1>Chapter 1: The Quiet Library of Kyoto</h1><article>${longParagraphs}</article><a rel="next" href="/cards/ebook-test-2.html">Next Chapter</a></body></html>`,
+            links: { 'Next Chapter': 'https://www.aozora.gr.jp/cards/ebook-test-2.html' },
+          },
+        }),
+      });
+    });
+
+    await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const reqUrl = new URL(route.request().url());
+      const q = postParams.get('q') || reqUrl.searchParams.get('q') || '';
+      const lines = q.split('\n');
+      const translatedLines = lines.map((line) =>
+        line
+          .replace(/Chapter 1: The Quiet Library of Kyoto/gi, 'Bab 1: Perpustakaan Sunyi di Kyoto')
+          .replace(
+            /Paragraph (\d+): Morning rain tapped softly against the wooden eaves of the quiet library as lanterns flickered gently across the stone courtyard in Kyoto\./gi,
+            'Paragraf $1: Hujan pagi mengetuk lembut cucuran atap kayu perpustakaan yang tenang sementara cahaya lentera berkelip pelan di halaman batu Kyoto.'
+          )
+      );
+      const segments = translatedLines.map((t, idx) => [
+        idx < translatedLines.length - 1 ? `${t}\n` : t,
+        lines[idx] || '',
+      ]);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([segments, null, 'en']),
+      });
+    });
+
+    // 1. Desktop 1280x800 Ebook Reader Verification (Calm Progressive Disclosure Topbar)
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fwww.aozora.gr.jp%2Fcards%2Febook-test.html&mode=auto-id&view=reader'
+    );
+    await expect(page.getByRole('heading', { name: 'Bab 1: Perpustakaan Sunyi di Kyoto' })).toBeVisible();
+
+    // Ensure Calm Desktop 1280px Ebook topbar has generous spacing & zero overlap between Left Segmented Bar & Right Controls
+    const segBox = await page.locator('.reader-desktop-seg').boundingBox();
+    const rightZoneBox = await page.locator('.reader-desktop-right').boundingBox();
+    expect(segBox).not.toBeNull();
+    expect(rightZoneBox).not.toBeNull();
+    expect((segBox?.x || 0) + (segBox?.width || 0)).toBeLessThanOrEqual((rightZoneBox?.x || 0) - 16);
+
+    // Open Aa Appearance Popover
+    await page.getByRole('button', { name: 'Tampilan Ebook' }).click();
+    const appearDialog = page.getByRole('dialog', { name: 'Tampilan Ebook' });
+    await expect(appearDialog).toBeVisible();
+
+    // Verify Dual-Slot Adaptive Mode default + 6 themes & 14 curated fonts exist (>= 10 required!)
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-thememode', 'adaptive');
+    await expect(appearDialog.locator('[data-ebook-theme-btn]')).toHaveCount(6);
+    await expect(appearDialog.locator('[data-ebook-font-btn]')).toHaveCount(14);
+
+    // Pick Sepia in Light mode -> updates Day slot while STAYING Adaptive + syncs <meta name="theme-color">!
+    await appearDialog.locator('[data-ebook-theme-btn="sepia"]').click();
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-theme', 'sepia');
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-thememode', 'adaptive');
+    const sepiaMetaColor = await page.evaluate(
+      () => document.querySelector<HTMLMetaElement>('meta[name="theme-color"][data-tranx-dynamic="1"]')?.content || ''
+    );
+    expect(sepiaMetaColor.toUpperCase()).toBe('#F4ECD8');
+
+    // Switch theme to Midnight -> immediately switches & locks Midnight + remembers Midnight as Night slot + Axe AA clean!
+    await appearDialog.locator('[data-ebook-theme-btn="midnight"]').click();
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-theme', 'midnight');
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-thememode', 'locked');
+    const midnightMetaColor = await page.evaluate(
+      () => document.querySelector<HTMLMetaElement>('meta[name="theme-color"][data-tranx-dynamic="1"]')?.content || ''
+    );
+    expect(midnightMetaColor.toUpperCase()).toBe('#141416');
+    await page.screenshot({
+      path: qaArtifactPath('qa_desktop_ebook_midnight_appear_1280.png'),
+    });
+    const axeMidnight = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeMidnight.violations).toEqual([]);
+
+    // Tap "Otomatis Siang/Malam" -> returns cleanly to Adaptive mode, restoring Day=Sepia while remembering Night=Malam OLED!
+    await appearDialog.locator('[data-ebook-thememode-btn="adaptive"]').click();
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-theme', 'sepia');
+    await expect(appearDialog.locator('[data-ebook-theme-status="true"]')).toContainText(/Sepia.*Malam OLED/);
+
+    // Select EB Garamond font + 3D Book Flip mode + Inline Source Peek
+    await appearDialog.locator('[data-ebook-font-btn="eb-garamond"]').click();
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-font', 'eb-garamond');
+    await appearDialog.locator('[data-ebook-pagemode-btn="flip"]').click();
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-pagemode', 'flip');
+    await appearDialog.locator('[data-ebook-inlinepeek-btn="true"]').click();
+
+    // Close Appearance Popover and test paginated book turning (Hal 1 / N -> Hal 2 / N) + Scrubber + Bookmark + Inline Peek!
+    await page.keyboard.press('Escape');
+    const indicator = page.locator('[data-ebook-page-indicator="true"]');
+    await expect(indicator).toBeVisible();
+    await expect(indicator).toContainText(/Hal 1 \/ [2-9]/);
+
+    // Turn page forward with ArrowRight -> Hal 2 / N + GPU flip class + tactile paper-edge cue
+    await page.keyboard.press('ArrowRight');
+    await expect(indicator).toContainText(/Hal 2 \/ [2-9]/);
+    await expect(page.locator('.ebook-book-leaf.anim-flip-next')).toBeVisible();
+    await expect(page.locator('[data-ebook-tap-cue="right"]')).toBeAttached();
+    // Wait for the 360ms GPU book-flip keyframe to settle at opacity:1 before Axe & crisp screenshot
+    await page.waitForTimeout(420);
+
+    // Test Tactile Tap Zone (right edge >= 68% turns page forward, left edge <= 28% turns back!)
+    const stageBox = await page.locator('[data-ebook-book-stage="true"]').boundingBox();
+    expect(stageBox).not.toBeNull();
+    if (stageBox) {
+      await page.mouse.click(stageBox.x + stageBox.width * 0.88, stageBox.y + stageBox.height * 0.45);
+      await expect(indicator).toContainText(/Hal 3 \/ [3-9]/);
+      await page.waitForTimeout(380);
+      await page.mouse.click(stageBox.x + stageBox.width * 0.12, stageBox.y + stageBox.height * 0.45);
+      await expect(indicator).toContainText(/Hal 2 \/ [2-9]/);
+      await page.waitForTimeout(380);
+    }
+
+    // Test Inline Source Peek on a paragraph -> reveals original English sentence directly underneath!
+    await page.locator('.ebook-para-block.is-peekable').first().click();
+    await expect(page.locator('[data-ebook-peek-src="true"]').first()).toContainText('Morning rain tapped softly');
+
+    // Test Bookmark save + view inside Tools Popover -> Markah (1)
+    await page.getByRole('button', { name: 'Simpan markah' }).click();
+    await expect(page.getByRole('button', { name: 'Tersimpan di markah' })).toBeVisible();
+
+    const axeSepiaFlip = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeSepiaFlip.violations).toEqual([]);
+    await page.screenshot({
+      path: qaArtifactPath('qa_desktop_ebook_sepia_flip_1280.png'),
+    });
+
+    // Test Two-Page Physical Book Spread on Wide Desktop (1440x900)
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.getByRole('button', { name: 'Tampilan Ebook' }).click();
+    await page.locator('[data-ebook-spread-btn="auto"]').click();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('[data-ebook-spread-grid="true"]')).toBeVisible();
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-spread', 'two');
+    await page.waitForTimeout(380);
+    await page.screenshot({
+      path: qaArtifactPath('qa_desktop_ebook_spread_1440.png'),
+    });
+    const axeSpread = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeSpread.violations).toEqual([]);
+
+    // Test Grouped Alat Baca Hierarchy + Auto-Gulir (Hands-Free Smooth Scroll) + Podcast Narration Studio!
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.getByRole('button', { name: 'Alat baca' }).click();
+    const toolsDialog = page.getByRole('dialog', { name: 'Alat & Navigasi Ebook' });
+    await expect(toolsDialog).toBeVisible();
+    await expect(toolsDialog).toContainText('Audio & Gulir Otomatis');
+    await expect(toolsDialog).toContainText('Bantuan Baca & Navigasi');
+    await expect(toolsDialog).toContainText('Sumber Halaman');
+
+    // Start Auto-Gulir -> switches cleanly from paginated flip to Scroll mode & reveals Auto-Gulir floating pill!
+    await toolsDialog.locator('[data-ebook-autoscroll-trigger="true"]').click();
+    await expect(page.locator('[data-ebook-autoscroll-bar="true"]')).toBeVisible();
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-pagemode', 'scroll');
+    await expect(page.locator('[data-ebook-autoscroll-speed="true"]')).toHaveText('1.0x');
+    await page.getByRole('button', { name: 'Percepat gulir' }).click();
+    await expect(page.locator('[data-ebook-autoscroll-speed="true"]')).toHaveText('1.5x');
+    await page.waitForTimeout(360);
+    const scrolledDownY = await page.evaluate(() => window.scrollY);
+    expect(scrolledDownY).toBeGreaterThan(0);
+
+    // Start Podcast Audio Narration -> mutually excludes Auto-Gulir (Single Scroll-Owner!) + opens Podcast Studio!
+    await page.getByRole('button', { name: 'Alat baca' }).click();
+    await page.locator('[data-ebook-podcast-trigger="true"]').click();
+    await expect(page.locator('[data-ebook-autoscroll-bar="true"]')).toHaveCount(0);
+    await expect(page.locator('[data-ebook-podcast-bar="true"]')).toBeVisible();
+    await page.locator('[data-ebook-podcast-studio-btn="true"]').click();
+    const studioDialog = page.locator('[data-ebook-podcast-studio="true"]');
+    await expect(studioDialog).toBeVisible();
+    await expect(studioDialog.locator('[data-ebook-podcast-style="podcast_santai"]')).toHaveAttribute(
+      'aria-checked',
+      'true'
+    );
+    await studioDialog.locator('[data-ebook-podcast-style="narasi_buku"]').click();
+    await expect(studioDialog.locator('[data-ebook-podcast-style="narasi_buku"]')).toHaveAttribute(
+      'aria-checked',
+      'true'
+    );
+    await studioDialog.locator('[data-ebook-sleep-btn="15"]').click();
+    await expect(studioDialog.locator('[data-ebook-sleep-btn="15"]')).toHaveAttribute('aria-checked', 'true');
+    await page.getByRole('button', { name: 'Kecepatan 1x' }).click();
+    await expect(page.getByRole('button', { name: 'Kecepatan 1.15x' })).toBeVisible();
+
+    const axePodcast = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axePodcast.violations).toEqual([]);
+    await page.screenshot({
+      path: qaArtifactPath('qa_desktop_ebook_podcast_studio_1280.png'),
+    });
+
+    // Stop Podcast cleanly before continuing mobile checks
+    await page.getByRole('button', { name: 'Berhenti' }).click();
+    await expect(page.locator('[data-ebook-podcast-bar="true"]')).toHaveCount(0);
+
+    // Test Slide mode & Zen Focus Mode (switch to Slide first so spread selector appears, then reset spread to single)
+    await page.getByRole('button', { name: 'Tampilan Ebook' }).click();
+    await page.locator('[data-ebook-pagemode-btn="slide"]').click();
+    await page.locator('[data-ebook-spread-btn="single"]').click();
+    await page.getByRole('button', { name: 'Mode Fokus (Zen)' }).click();
+    await expect(page.getByRole('button', { name: 'Keluar Fokus' })).toBeVisible();
+    await expect(page.locator('.web-viewer-topbar')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Keluar Fokus' }).click();
+    await expect(page.locator('.web-viewer-topbar')).toBeVisible();
+
+    // 2. Tablet 820x1180 Calm Topbar Zero-Overflow Verification
+    await page.setViewportSize({ width: 820, height: 1180 });
+    const tabletOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(tabletOverflow).toBe(false);
+
+    // 3. Mobile 390x844 Ebook Reader Appearance Bottom Sheet & Touch Ergonomics
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator('.reader-mobile-bar')).toBeVisible();
+    await page.getByRole('button', { name: 'Tampilan Ebook' }).click();
+    await expect(page.locator('.ebook-appear-sheet')).toBeVisible();
+    await page.waitForTimeout(280);
+    const mobileOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(mobileOverflow).toBe(false);
+    await page.screenshot({
+      path: qaArtifactPath('qa_mobile_ebook_appear_390.png'),
+    });
+    const axeMobileEbook = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeMobileEbook.violations).toEqual([]);
+
+    // 4. Return Home -> Link tab -> Verify Contextual "Lanjutkan membaca" Shelf shows real saved book!
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: 'Kembali' }).click();
+    await page.getByRole('tab', { name: 'Link' }).click();
+    await expect(page.locator('[data-ebook-continue-shelf="true"]')).toBeVisible();
+    await expect(page.locator('[data-ebook-continue-shelf="true"]')).toContainText(
+      'Bab 1: Perpustakaan Sunyi di Kyoto'
+    );
+
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('Small Phone 320x568 Reflow: Zero Horizontal Overflow, >= 44x44px Touch Targets & Axe WCAG 2.2 AA', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.route('**/v1/healthz', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
+
+    const sampleParas = Array.from(
+      { length: 10 },
+      (_, idx) =>
+        `<p>Paragraph ${idx + 1}: Soft rain fell over the cedar bridge in Kyoto while paper lanterns glowed warmly along the narrow path.</p>`
+    ).join('');
+
+    await page.route('https://r.jina.ai/**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({
+          code: 200,
+          data: {
+            title: 'Chapter 1: Lanterns on the Cedar Bridge',
+            url: 'https://www.aozora.gr.jp/cards/ebook-320.html',
+            finalUrl: 'https://www.aozora.gr.jp/cards/ebook-320.html',
+            html: `<!doctype html><html><head><title>Chapter 1: Lanterns on the Cedar Bridge</title></head><body><h1>Chapter 1: Lanterns on the Cedar Bridge</h1><article>${sampleParas}</article><a rel="next" href="/cards/ebook-320-2.html">Next Chapter</a></body></html>`,
+            links: { 'Next Chapter': 'https://www.aozora.gr.jp/cards/ebook-320-2.html' },
+          },
+        }),
+      });
+    });
+
+    await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const reqUrl = new URL(route.request().url());
+      const q = postParams.get('q') || reqUrl.searchParams.get('q') || '';
+      const lines = q.split('\n');
+      const translatedLines = lines.map((line) =>
+        line
+          .replace(/Chapter 1: Lanterns on the Cedar Bridge/gi, 'Bab 1: Lentera di Jembatan Aras')
+          .replace(
+            /Paragraph (\d+): Soft rain fell over the cedar bridge in Kyoto while paper lanterns glowed warmly along the narrow path\./gi,
+            'Paragraf $1: Hujan lembut turun di atas jembatan kayu aras Kyoto sementara lentera kertas berpendar hangat di sepanjang jalan setapak.'
+          )
+      );
+      const segments = translatedLines.map((t, idx) => [
+        idx < translatedLines.length - 1 ? `${t}\n` : t,
+        lines[idx] || '',
+      ]);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([segments, null, 'en']),
+      });
+    });
+
+    // 1. Home stage at 320x568 small phone -> zero horizontal overflow + WCAG 2.2 AA
+    await page.setViewportSize({ width: 320, height: 568 });
+    await page.goto('/?e2e=1');
+    await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toBeVisible();
+    const homeOverflow320 = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(homeOverflow320).toBe(false);
+    const axeHome320 = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeHome320.violations).toEqual([]);
+
+    // 2. Ebook Reader + Floating Podcast Dock at 320x568 -> zero overflow & every dock button >= 44x44px
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fwww.aozora.gr.jp%2Fcards%2Febook-320.html&mode=auto-id&view=reader'
+    );
+    await expect(page.getByRole('heading', { name: 'Bab 1: Lentera di Jembatan Aras' })).toBeVisible();
+    const readerOverflow320 = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(readerOverflow320).toBe(false);
+
+    await page.getByRole('button', { name: 'Menu pembaca' }).click();
+    await page.locator('[data-ebook-podcast-trigger="true"]').click();
+    const podcastDock = page.locator('[data-ebook-podcast-bar="true"]');
+    await expect(podcastDock).toBeVisible();
+
+    const dockOverflow320 = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(dockOverflow320).toBe(false);
+
+    const dockButtons = podcastDock.locator('button');
+    const btnCount = await dockButtons.count();
+    expect(btnCount).toBeGreaterThanOrEqual(5);
+    for (let i = 0; i < btnCount; i += 1) {
+      const box = await dockButtons.nth(i).boundingBox();
+      expect(box, `Dock button #${i} must be visible`).not.toBeNull();
+      expect(box!.width, `Dock button #${i} width >= 44px at 320px`).toBeGreaterThanOrEqual(44);
+      expect(box!.height, `Dock button #${i} height >= 44px at 320px`).toBeGreaterThanOrEqual(44);
+    }
+
+    await page.screenshot({
+      path: qaArtifactPath('qa_320_ebook_podcast.png'),
+    });
+
+    const axeReader320 = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeReader320.violations).toEqual([]);
+
+    await page.getByRole('button', { name: 'Berhenti' }).click();
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('Mobile 390x844 Live Touch Drag-Follow Swipe Physics & Short-Drag Cancel Snapback', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.route('**/v1/healthz', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
+
+    const longParas = Array.from(
+      { length: 16 },
+      (_, idx) =>
+        `<p>Paragraph ${idx + 1}: Evening bells echoed gently across the quiet temple courtyard while maple leaves drifted onto the stone steps.</p>`
+    ).join('');
+
+    await page.route('https://r.jina.ai/**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({
+          code: 200,
+          data: {
+            title: 'Chapter 1: Temple Courtyard Bells',
+            url: 'https://www.aozora.gr.jp/cards/ebook-swipe.html',
+            finalUrl: 'https://www.aozora.gr.jp/cards/ebook-swipe.html',
+            html: `<!doctype html><html><head><title>Chapter 1: Temple Courtyard Bells</title></head><body><h1>Chapter 1: Temple Courtyard Bells</h1><article>${longParas}</article></body></html>`,
+            links: {},
+          },
+        }),
+      });
+    });
+
+    await page.route('https://translate.googleapis.com/translate_a/single**', async (route) => {
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const reqUrl = new URL(route.request().url());
+      const q = postParams.get('q') || reqUrl.searchParams.get('q') || '';
+      const lines = q.split('\n');
+      const translatedLines = lines.map((line) =>
+        line
+          .replace(/Chapter 1: Temple Courtyard Bells/gi, 'Bab 1: Lonceng Halaman Kuil')
+          .replace(
+            /Paragraph (\d+): Evening bells echoed gently across the quiet temple courtyard while maple leaves drifted onto the stone steps\./gi,
+            'Paragraf $1: Lonceng senja bergema pelan melintasi halaman kuil yang sunyi sementara daun mapel melayang turun ke tangga batu.'
+          )
+      );
+      const segments = translatedLines.map((t, idx) => [
+        idx < translatedLines.length - 1 ? `${t}\n` : t,
+        lines[idx] || '',
+      ]);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([segments, null, 'en']),
+      });
+    });
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fwww.aozora.gr.jp%2Fcards%2Febook-swipe.html&mode=auto-id&view=reader'
+    );
+    await expect(page.getByRole('heading', { name: 'Bab 1: Lonceng Halaman Kuil' })).toBeVisible();
+
+    // Switch to 3D Flip paginated mode via mobile Aa sheet
+    await page.getByRole('button', { name: 'Tampilan Ebook' }).click();
+    await page.locator('[data-ebook-pagemode-btn="flip"]').click();
+    await page.keyboard.press('Escape');
+
+    const indicator = page.locator('[data-ebook-page-indicator="true"]');
+    await expect(indicator).toContainText(/Hal 1 \/ [2-9]/);
+
+    // Helper dispatching real TouchEvent sequence on .ebook-book-stage
+    const dispatchSwipe = async (startX: number, endX: number) => {
+      await page.evaluate(
+        ({ sx, ex }) => {
+          const stage = document.querySelector<HTMLElement>('[data-ebook-book-stage="true"]');
+          if (!stage) throw new Error('Book stage missing');
+          const rect = stage.getBoundingClientRect();
+          const y = rect.top + Math.min(140, rect.height / 2);
+          const mkTouch = (x: number) =>
+            new Touch({
+              identifier: 1,
+              target: stage,
+              clientX: x,
+              clientY: y,
+              pageX: x,
+              pageY: y,
+              radiusX: 4,
+              radiusY: 4,
+              rotationAngle: 0,
+              force: 1,
+            });
+          const t0 = mkTouch(sx);
+          stage.dispatchEvent(
+            new TouchEvent('touchstart', { bubbles: true, cancelable: true, touches: [t0], targetTouches: [t0], changedTouches: [t0] })
+          );
+          const mid = mkTouch(sx + (ex - sx) * 0.5);
+          stage.dispatchEvent(
+            new TouchEvent('touchmove', { bubbles: true, cancelable: true, touches: [mid], targetTouches: [mid], changedTouches: [mid] })
+          );
+          const t1 = mkTouch(ex);
+          stage.dispatchEvent(
+            new TouchEvent('touchmove', { bubbles: true, cancelable: true, touches: [t1], targetTouches: [t1], changedTouches: [t1] })
+          );
+          stage.dispatchEvent(
+            new TouchEvent('touchend', { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [t1] })
+          );
+        },
+        { sx: startX, ex: endX }
+      );
+    };
+
+    // 1. Short 18px drag must snap back cleanly and stay on Page 1
+    await dispatchSwipe(260, 242);
+    await page.waitForTimeout(260);
+    await expect(indicator).toContainText(/Hal 1 \/ [2-9]/);
+
+    // 2. Full 140px left swipe turns cleanly to Page 2
+    await dispatchSwipe(310, 170);
+    await expect(indicator).toContainText(/Hal 2 \/ [2-9]/);
+    await page.waitForTimeout(380);
+
+    // 3. Full 140px right swipe returns cleanly to Page 1
+    await dispatchSwipe(120, 260);
+    await expect(indicator).toContainText(/Hal 1 \/ [2-9]/);
+
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('SideBySideReaderView (/c/c_pinned_demo/m/m_1_r/baca): Unified Appearance Parity, Podcast, Auto-Gulir & Axe AA', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto('/c/c_pinned_demo/m/m_1_r/baca?e2e=1');
+
+    // Verify source + translation cards render cleanly
+    await expect(page.getByText('「千早は小さく笑った。」')).toBeVisible();
+    await expect(page.getByText('“Chihaya tersenyum kecil.”')).toBeVisible();
+
+    // Open Aa Appearance Panel -> verify reader-only controls (pageMode / spread / inlinePeek) are hidden!
+    await page.getByRole('button', { name: 'Tampilan Ebook' }).click();
+    const appearDialog = page.getByRole('dialog', { name: 'Tampilan Ebook' });
+    await expect(appearDialog).toBeVisible();
+    await expect(appearDialog.locator('[data-ebook-pagemode-btn]')).toHaveCount(0);
+    await expect(appearDialog.locator('[data-ebook-inlinepeek-btn]')).toHaveCount(0);
+
+    // Switch theme to Sepia -> updates surface attribute cleanly
+    await appearDialog.locator('[data-ebook-theme-btn="sepia"]').click();
+    await expect(page.locator('.ebook-reader-surface')).toHaveAttribute('data-ebook-theme', 'sepia');
+    await page.keyboard.press('Escape');
+
+    // Test Single Scroll-Owner Invariant between Podcast & Auto-Gulir inside SideBySideReaderView
+    await page.getByRole('button', { name: 'Auto-Gulir (Baca Otomatis)' }).click();
+    await expect(page.locator('[data-ebook-autoscroll-bar="true"]')).toBeVisible();
+
+    await page.getByRole('button', { name: 'Dengarkan bab (Podcast)' }).click();
+    await expect(page.locator('[data-ebook-autoscroll-bar="true"]')).toHaveCount(0);
+    await expect(page.locator('[data-ebook-podcast-bar="true"]')).toBeVisible();
+
+    await page.screenshot({
+      path: qaArtifactPath('qa_side_by_side_1280.png'),
+    });
+
+    const axeSideBySide = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeSideBySide.violations).toEqual([]);
+
+    await page.getByRole('button', { name: 'Berhenti' }).click();
+    await expect(page.locator('[data-ebook-podcast-bar="true"]')).toHaveCount(0);
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('Strict Route Guard Extended: Self-Loop /r/ Block, Encoded Traversal 404 & Percent-Encoded /r/ Redirect', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // Self-host loop & encoded traversal MUST render 404
+    for (const badPath of [
+      '/r/https://tranx-hanif-id.web.app/web?e2e=1',
+      '/r/https://tranx-hanif-id.firebaseapp.com/masuk?e2e=1',
+      '/r/http://127.0.0.1/secret?e2e=1',
+      '/web%2f..%2f.env?e2e=1',
+    ]) {
+      await page.goto(badPath);
+      await expect(
+        page.getByRole('heading', { name: 'Halaman tidak ditemukan' }),
+        `Expected 404 for ${badPath}`
+      ).toBeVisible();
+    }
+
+    // Valid percent-encoded /r/https%3A%2F%2F... redirects cleanly into /web!
+    await page.goto('/r/https%3A%2F%2Fwww.aozora.gr.jp%2Fcards%2F1.html?e2e=1');
+    await expect(page).toHaveURL(/\/web\?url=https%3A%2F%2Fwww\.aozora\.gr\.jp%2Fcards%2F1\.html/);
+  });
+
+  test('Translation Excellence v4: FormatShield (app.py/Node.js/e.g./code), EYD V & KBBI VI, Zero U+2014', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.route(
+      /^https:\/\/(?:translate\.googleapis\.com|clients5\.google\.com)\/translate_a\//,
+      async (route) => {
+        const u = new URL(route.request().url());
+        const postParams = new URLSearchParams(route.request().postData() || '');
+        const q = postParams.get('q') || u.searchParams.get('q') || '';
+        const out = q.includes('app.py')
+          ? 'Dia keluar dari ruangan lalu duduk disini\u2014menguji praktek, resiko, dan sistim di app.py (e.g. Node.js) dengan `npm run build` senilai Rp. 50.000 kepada Tuhan Yang Mahaesa tanpa syarat apapun.'
+          : q;
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify([[[out, q, null, null, 10]], null, 'en']),
+        });
+      }
+    );
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto('/?e2e=1&direct=1');
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Inggris' }).click();
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Indonesia' }).click();
+
+    await page
+      .locator('textarea.composer-textarea')
+      .fill('He exited the room and tested app.py (e.g. Node.js) with `npm run build`.');
+    await page.locator('textarea.composer-textarea').press('Enter');
+
+    const prose = page.locator('.assistant-prose').last();
+    await expect(prose).toContainText('app.py');
+    const rendered = (await prose.textContent()) || '';
+    expect(rendered).toContain('app.py');
+    expect(rendered).not.toContain('app. py');
+    expect(rendered).toContain('Node.js');
+    expect(rendered).not.toContain('Node. js');
+    expect(rendered).toContain('e.g.');
+    expect(rendered).toContain('`npm run build`');
+    expect(rendered).toContain('keluar dari ruangan');
+    expect(rendered).not.toContain('ke luar dari ruangan');
+    expect(rendered).toContain('di sini');
+    expect(rendered).toContain('praktik');
+    expect(rendered).toContain('risiko');
+    expect(rendered).toContain('sistem');
+    expect(rendered).toContain('Rp50.000');
+    expect(rendered).toContain('Maha Esa');
+    expect(rendered).toContain('apa pun');
+    expect(rendered).not.toContain('\u2014');
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('Format-Aware Podcast Narration Studio v2: Auto-Detected Document Format Badge, Override Selector & Axe AA', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.addInitScript(() => {
+      const synthStub = {
+        getVoices: () => [
+          {
+            name: 'Microsoft Gadis Online (Natural) - Indonesian (Indonesia)',
+            lang: 'id-ID',
+            voiceURI: 'Microsoft Gadis Online (Natural)',
+            localService: false,
+            default: true,
+          },
+        ],
+        speak: () => {},
+        cancel: () => {},
+        pause: () => {},
+        resume: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      };
+      Object.defineProperty(window, 'speechSynthesis', { value: synthStub, configurable: true });
+      if (typeof window.SpeechSynthesisUtterance === 'undefined') {
+        (window as unknown as { SpeechSynthesisUtterance: unknown }).SpeechSynthesisUtterance = class {
+          text: string;
+          constructor(t: string) {
+            this.text = t;
+          }
+        };
+      }
+    });
+
+    await page.route('https://r.jina.ai/**', async (route) => {
+      const htmlDoc = [
+        '<!doctype html><html><head><title>REST API Guide</title></head><body><article>',
+        '<h1>REST API Guide</h1>',
+        '<p>Configure the HTTP JSON endpoint payload and CLI SDK for your GraphQL service.</p>',
+        '<p>Run `npm test` with async await and boolean flags before deploying to production.</p>',
+        '</article></body></html>',
+      ].join('');
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          code: 200,
+          status: 20000,
+          data: {
+            title: 'REST API Guide',
+            url: 'https://docs.example.dev/api-guide',
+            html: htmlDoc,
+            content:
+              'REST API Guide\n\nConfigure the HTTP JSON endpoint payload and CLI SDK for your GraphQL service.\n\nRun `npm test` with async await and boolean flags before deploying to production.',
+          },
+        }),
+      });
+    });
+
+    await page.route(
+      /^https:\/\/(?:translate\.googleapis\.com|clients5\.google\.com)\/translate_a\//,
+      async (route) => {
+        const u = new URL(route.request().url());
+        const postParams = new URLSearchParams(route.request().postData() || '');
+        const q = postParams.get('q') || u.searchParams.get('q') || '';
+        const lines = q.split('\n');
+        const translatedLines = lines.map((ln) => {
+          if (ln.includes('REST API Guide')) return ln.replace(/REST API Guide/g, 'Panduan REST API');
+          if (ln.includes('GraphQL')) {
+            return ln.replace(
+              /Configure the HTTP JSON endpoint payload and CLI SDK for your GraphQL service\./g,
+              'Konfigurasikan endpoint HTTP JSON payload dan CLI SDK untuk layanan GraphQL Anda.'
+            );
+          }
+          if (ln.includes('npm test')) {
+            return ln.replace(
+              /Run `npm test` with async await and boolean flags before deploying to production\./g,
+              'Jalankan `npm test` dengan async await dan flag boolean sebelum rilis.'
+            );
+          }
+          return ln;
+        });
+        const segments = translatedLines.map((t, idx) => [
+          idx < translatedLines.length - 1 ? `${t}\n` : t,
+          lines[idx] || '',
+        ]);
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify([segments, null, 'en']),
+        });
+      }
+    );
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fdocs.example.dev%2Fapi-guide&mode=en-id&view=reader'
+    );
+    await expect(page.getByRole('heading', { name: 'Panduan REST API' })).toBeVisible();
+
+    // Start Podcast & open Studio panel
+    await page.getByRole('button', { name: 'Alat baca' }).click();
+    await page.locator('[data-ebook-podcast-trigger="true"]').click();
+    await expect(page.locator('[data-ebook-podcast-bar="true"]')).toBeVisible();
+    await page.locator('[data-ebook-podcast-studio-btn="true"]').click();
+    await expect(page.locator('[data-ebook-podcast-studio="true"]')).toBeVisible();
+
+    // Auto-detected format badge must recognize technical_docs!
+    const fmtBadge = page.locator('[data-ebook-podcast-format-badge]');
+    await expect(fmtBadge).toHaveAttribute('data-ebook-podcast-format-badge', 'technical_docs');
+    await expect(fmtBadge).toContainText('Teknis / Kode');
+
+    // Override format to Poetry -> badge updates cleanly
+    const fmtSelect = page.locator('[data-ebook-podcast-format-select="true"]');
+    await fmtSelect.selectOption('poetry_verse');
+    await expect(fmtBadge).toHaveAttribute('data-ebook-podcast-format-badge', 'poetry_verse');
+    await expect(fmtBadge).toContainText('Puisi / Bait');
+
+    const axePodcast = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axePodcast.violations).toEqual([]);
+
+    await page.getByRole('button', { name: 'Berhenti' }).click();
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('Link Mode Manga & Direct Image Detection, OCR Scanning, Background-Sampled Visual Overlay (1280px, 390px, 320px & Axe AA)', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto('/?e2e=1&direct=1');
+
+    // Generate a real crisp synthetic manga page PNG (white bubble + black bold text) in browser canvas
+    const comicPngB64 = await page.evaluate(() => {
+      const c = document.createElement('canvas');
+      c.width = 720;
+      c.height = 420;
+      const ctx = c.getContext('2d')!;
+      ctx.fillStyle = '#E8E4DC';
+      ctx.fillRect(0, 0, c.width, c.height);
+      // Draw comic panel frame
+      ctx.strokeStyle = '#141917';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(20, 20, 680, 380);
+      // Draw white speech bubble
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath();
+      ctx.ellipse(360, 200, 280, 110, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#000000';
+      ctx.font = 'bold 42px Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('HELLO FROM TOKYO', 360, 200);
+      return c.toDataURL('image/png').split(',')[1];
+    });
+    const comicPngBuf = Buffer.from(comicPngB64, 'base64');
+
+    // Mock direct comic image CDN URL & multi-page manga chapter HTML
+    await page.route('https://cdn.manga.example.org/**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'image/png',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: comicPngBuf,
+      });
+    });
+
+    await page.route('https://r.jina.ai/**', async (route) => {
+      const mangaChapterHtml = [
+        '<!doctype html><html><head><title>Kyoto Blade Chapter 1</title></head><body>',
+        '<header><img class="site-logo" src="https://komik.example.org/logos/site-logo.png" width="120" height="40"></header>',
+        '<img class="ad-banner" src="https://doubleclick.net/banner728x90.jpg" width="728" height="90">',
+        '<div class="reading-content">',
+        '  <img class="wp-manga-chapter-img" data-src="https://cdn.manga.example.org/kyoto-blade/01.png" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">',
+        '  <img class="wp-manga-chapter-img" data-src="https://cdn.manga.example.org/kyoto-blade/02.png" src="/spinner.gif">',
+        '</div></body></html>',
+      ].join('');
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          code: 200,
+          status: 20000,
+          data: {
+            title: 'Kyoto Blade Chapter 1',
+            url: 'https://komik.example.org/manga/kyoto-blade/chapter-1/',
+            html: mangaChapterHtml,
+            content: 'Kyoto Blade Chapter 1',
+          },
+        }),
+      });
+    });
+
+    await page.route(
+      /^https:\/\/(?:translate\.googleapis\.com|clients5\.google\.com)\/translate_a\//,
+      async (route) => {
+        const u = new URL(route.request().url());
+        const postParams = new URLSearchParams(route.request().postData() || '');
+        const q = postParams.get('q') || u.searchParams.get('q') || '';
+        const lines = q.split('\n');
+        const translatedLines = lines.map((ln) => {
+          if (/kyoto blade/i.test(ln)) return ln.replace(/Kyoto Blade Chapter 1/gi, 'Pedang Kyoto Bab 1');
+          if (/tokyo|hello/i.test(ln)) return ln.replace(/HELLO FROM TOKYO/gi, 'Halo dari Tokyo!').replace(/hello from tokyo/gi, 'Halo dari Tokyo!');
+          return ln;
+        });
+        const segments = translatedLines.map((t, idx) => [
+          idx < translatedLines.length - 1 ? `${t}\n` : t,
+          lines[idx] || '',
+        ]);
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify([segments, null, 'en']),
+        });
+      }
+    );
+
+    // Part A: Paste Direct Image URL inside Mode Link -> auto-detects, scans & renders visual overlay inline!
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Inggris' }).click();
+    await page.getByRole('button', { name: /Bahasa tujuan:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Indonesia' }).click();
+    await page.getByRole('tab', { name: 'Link' }).click();
+    await page.getByPlaceholder(/https:\/\//).fill('https://cdn.manga.example.org/chapter-1/page-01.png');
+    await page.getByRole('button', { name: 'Terjemahkan halaman' }).click();
+
+    await expect(page.locator('[data-comic-detected-badge="true"]')).toContainText(
+      'Gambar komik langsung',
+      { timeout: 30000 }
+    );
+    await expect(page.locator('[data-manga-overlay-canvas="true"]').first()).toBeVisible({
+      timeout: 30000,
+    });
+    // Switch inline card to Side-by-Side and verify OCR + comic translation text!
+    await page.getByRole('tab', { name: 'Berdampingan' }).click();
+    await expect(page.getByRole('main')).toContainText('Halo dari Tokyo!');
+    await page.getByRole('tab', { name: 'Hamparan gambar' }).click();
+
+    // Part B: Open Multi-Page Manga Chapter Gallery inside /web MangaLinkReader
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fkomik.example.org%2Fmanga%2Fkyoto-blade%2Fchapter-1%2F&mode=en-id&view=reader'
+    );
+    await expect(page.locator('[data-manga-reader="true"]')).toBeVisible({ timeout: 20000 });
+    await expect(page.getByRole('heading', { name: 'Pedang Kyoto Bab 1' })).toBeVisible();
+    // Strictly 2 chapter page cards (site logo & doubleclick ad filtered out!)
+    await expect(page.locator('[data-manga-page-card]')).toHaveCount(2);
+    // Page 1 auto-scans and renders visual overlay canvas!
+    await expect(page.locator('[data-manga-overlay-canvas="true"][data-manga-page-idx="0"]')).toBeVisible({
+      timeout: 30000,
+    });
+
+    await page.screenshot({
+      path: qaArtifactPath('qa_manga_link_overlay_1280.png'),
+    });
+
+    // Switch to Daftar Dialog tab and verify translated comic dialogue
+    await page.locator('[data-manga-view-tab="list"]').click();
+    await expect(page.locator('[data-manga-reader="true"]')).toContainText('Halo dari Tokyo!');
+    await page.locator('[data-manga-view-tab="overlay"]').click();
+
+    // Axe WCAG 2.2 AA check on Desktop 1280x800 MangaLinkReader
+    const axeMangaDesktop = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeMangaDesktop.violations).toEqual([]);
+
+    // Mobile 390x844 responsive check + screenshot
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator('.reader-mobile-bar')).toBeVisible();
+    await page.waitForTimeout(120);
+    const overflow390 = await page.evaluate(() => {
+      const sw = document.documentElement.scrollWidth;
+      const cw = document.documentElement.clientWidth;
+      if (sw <= cw) return { overflow: false, sw, cw, offenders: [] as string[] };
+      const offenders = Array.from(document.querySelectorAll('*'))
+        .filter((el) => el.getBoundingClientRect().right > cw + 1)
+        .slice(0, 8)
+        .map((el) => `${el.tagName}.${el.className}@${Math.round(el.getBoundingClientRect().right)}`);
+      return { overflow: true, sw, cw, offenders };
+    });
+    expect(overflow390).toEqual({ overflow: false, sw: 390, cw: 390, offenders: [] });
+    await page.screenshot({
+      path: qaArtifactPath('qa_manga_link_mobile_390.png'),
+    });
+
+    // Ultra-narrow 320x568 reflow check + >=44px touch targets
+    await page.setViewportSize({ width: 320, height: 568 });
+    await page.waitForTimeout(120);
+    const overflow320 = await page.evaluate(() => {
+      const sw = document.documentElement.scrollWidth;
+      const cw = document.documentElement.clientWidth;
+      if (sw <= cw) return { overflow: false, sw, cw, offenders: [] as string[] };
+      const offenders = Array.from(document.querySelectorAll('*'))
+        .filter((el) => el.getBoundingClientRect().right > cw + 1)
+        .slice(0, 8)
+        .map((el) => `${el.tagName}.${el.className}@${Math.round(el.getBoundingClientRect().right)}`);
+      return { overflow: true, sw, cw, offenders };
+    });
+    expect(overflow320).toEqual({ overflow: false, sw: 320, cw: 320, offenders: [] });
+    const scanBtnBox = await page.locator('[data-manga-scan-page="0"]').boundingBox();
+    expect(scanBtnBox).not.toBeNull();
+    expect(scanBtnBox!.height).toBeGreaterThanOrEqual(44);
+
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('v2.5.0 WCAG 1.4.12 Dyslexia Preset, Digital Reading Ruler, Podcast Studio Cast & Chaos Fault-Injection Resilience', async ({
+    page,
+    context,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    // 1. Verify RFC 9116 /.well-known/security.txt is served cleanly
+    const secTxtResp = await page.request.get('/.well-known/security.txt');
+    expect(secTxtResp.status()).toBe(200);
+    const secTxtBody = await secTxtResp.text();
+    expect(secTxtBody).toContain('Contact:');
+    expect(secTxtBody).toContain('Expires:');
+
+    // 2. Chaos Test A: Malformed localStorage JSON self-healing on boot (must NOT white-screen!)
+    await page.addInitScript(() => {
+      window.localStorage.setItem('tranx_ebook_prefs_v1', '{BROKEN_JSON!!!');
+      window.localStorage.setItem('tranx_ebook_shelf_v2', '[[[corrupt');
+      window.localStorage.setItem('tranx_para_cache_v3', 'not-valid-json');
+    });
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto('/?e2e=1');
+    await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toBeVisible();
+
+    // 3. Chaos Test B: Offline -> Online graceful resilience banner recovery
+    await context.setOffline(true);
+    await page.evaluate(() => window.dispatchEvent(new Event('offline')));
+    await expect(page.getByText(/Koneksi terputus/i)).toBeVisible({ timeout: 5000 });
+    await context.setOffline(false);
+    await page.evaluate(() => window.dispatchEvent(new Event('online')));
+    await expect(page.getByText(/Koneksi terputus/i)).toBeHidden({ timeout: 5000 });
+
+    // 4. Chaos Test C: HTTP 503 primary GTX circuit-breaker fallback to secondary GTX endpoint
+    let primaryHits = 0;
+    let fallbackHits = 0;
+    await page.route(/^https:\/\/translate\.googleapis\.com\/translate_a\//, async (route) => {
+      primaryHits += 1;
+      await route.fulfill({
+        status: 503,
+        contentType: 'text/plain',
+        headers: { 'Access-Control-Allow-Origin': '*', 'Retry-After': '1' },
+        body: 'Upstream temporarily unavailable',
+      });
+    });
+    await page.route(/^https:\/\/clients5\.google\.com\/translate_a\//, async (route) => {
+      fallbackHits += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([['Halo dunia dari jalur cadangan!', 'en']]),
+      });
+    });
+
+    await page.goto('/?e2e=1&direct=1');
+    await expect(page.getByRole('heading', { name: 'Mau baca apa hari ini?' })).toBeVisible();
+    await page.getByRole('button', { name: /Bahasa sumber:/ }).click();
+    await page.getByRole('menuitemradio', { name: 'Inggris' }).click();
+    const composer = page.locator('textarea.composer-textarea');
+    await composer.fill('Hello world from fallback!');
+    await composer.press('Enter');
+    await expect(page.getByRole('main')).toContainText('Halo dunia dari jalur cadangan!', {
+      timeout: 15000,
+    });
+    expect(primaryHits).toBeGreaterThanOrEqual(1);
+    expect(fallbackHits).toBeGreaterThanOrEqual(1);
+
+    // 5. Ebook v2.5.0 WCAG 1.4.12 Dyslexia Preset, Digital Reading Ruler & Podcast Studio Cast + Voice Preview
+    await page.route(/^https:\/\/r\.jina\.ai\/.*/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          code: 200,
+          status: 20000,
+          data: {
+            title: 'Bab 1: Malam di Kyoto',
+            url: 'https://novel.example.org/kyoto/ch-1',
+            content:
+              '"Kita harus pergi sekarang," kata Ren.\n\n"Tunggu sebentar," sahut Sora sambil memegang lentera.\n\nAngin malam berembus pelan melewati gerbang kuil tua.',
+          },
+        }),
+      });
+    });
+    await page.route(/^https:\/\/clients5\.google\.com\/translate_a\//, async (route) => {
+      const u = new URL(route.request().url());
+      const postParams = new URLSearchParams(route.request().postData() || '');
+      const q = postParams.get('q') || u.searchParams.get('q') || '';
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify([[q, 'en']]),
+      });
+    });
+
+    await page.goto(
+      '/web?e2e=1&direct=1&url=https%3A%2F%2Fnovel.example.org%2Fkyoto%2Fch-1&mode=auto-id&view=reader'
+    );
+    await expect(page.locator('.novel-reader-body')).toBeVisible({ timeout: 15000 });
+
+    // Open lazy-loaded EbookAppearancePanel -> activate Dyslexia Preset + Reading Ruler + wordSpacing -> verify CSS vars & hyphens: none
+    await page.getByRole('button', { name: /Tampilan Ebook/i }).click();
+    await expect(page.locator('[data-ebook-dyslexia-preset="true"]')).toBeVisible({ timeout: 10000 });
+    await page.locator('[data-ebook-dyslexia-preset="true"]').click();
+    await expect(page.locator('[data-ebook-ruler-btn="bar"]')).toHaveAttribute('aria-pressed', 'true');
+    const ebSurface = page.locator('.ebook-reader-surface');
+    const lsVar = await ebSurface.evaluate((el) => getComputedStyle(el).getPropertyValue('--eb-ls').trim());
+    expect(lsVar).toBe('0.120em');
+    const computedHyphens = await page
+      .locator('.novel-reader-body')
+      .evaluate((el) => getComputedStyle(el).hyphens);
+    expect(computedHyphens).toBe('none');
+    await page.keyboard.press('Escape');
+
+    // Verify Axe WCAG 2.2 AA = 0 violations on Desktop & Mobile 390px with v2.5 controls
+    const axeV25 = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'])
+      .analyze();
+    expect(axeV25.violations).toEqual([]);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForTimeout(100);
+    const mobileOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth
+    );
+    expect(mobileOverflow).toBe(false);
+
+    // 6. v2.5.1 Malformed percent-encoding route (/c/%ZZ) must NOT throw uncaught URIError
+    await page.goto('/c/%ZZ?e2e=1');
+    await expect(page.locator('body')).toBeVisible();
+
+    // Filter out intentional 503 chaos network error log from browser console
+    const realErrors = consoleErrors.filter((e) => !/503|Service Unavailable|Failed to load resource/i.test(e));
+    expect(realErrors).toEqual([]);
   });
 });

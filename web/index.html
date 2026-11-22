@@ -16,13 +16,14 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="tranX" />
-    <link rel="preconnect" href="https://translate.googleapis.com" crossorigin />
-    <link rel="preconnect" href="https://clients5.google.com" crossorigin />
-    <link rel="preconnect" href="https://r.jina.ai" crossorigin />
+    <link rel="preload" href="/__/firebase/init.json" as="fetch" crossorigin="anonymous" />
     <link rel="preconnect" href="https://firestore.googleapis.com" crossorigin />
+    <link rel="preconnect" href="https://translate.googleapis.com" crossorigin />
+    <link rel="dns-prefetch" href="https://clients5.google.com" />
+    <link rel="dns-prefetch" href="https://r.jina.ai" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
-    <script src="/pwa-capture.js"></script>
+    <script defer src="/pwa-capture.js"></script>
     <title>tranX</title>
   </head>
   <body>
