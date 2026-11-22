@@ -6105,7 +6105,9 @@ async function parseDocumentUnitsInBrowser(
     } catch (err) {
       if (err instanceof Error && err.message.includes('batas maksimum')) throw err;
     }
-    const nativeUnits = await extractPdfUnitsNative(fullBuf);
+    // pdfjs-dist worker may transfer/detach fullBuf; re-read from File handle only when falling back (0 extra RAM in happy path)
+    const fallbackBuf = fullBuf.byteLength > 0 ? fullBuf : await file.arrayBuffer();
+    const nativeUnits = await extractPdfUnitsNative(fallbackBuf);
     if (nativeUnits.length > 0) {
       return { fmt: 'pdf', units: nativeUnits };
     }
