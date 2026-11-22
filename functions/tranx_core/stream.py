@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
-from jptrans.models import Document, Paragraph, Slot
+from jptrans.models import Document, Slot
 from jptrans.pipeline import Translator
 from jptrans.readers import read_text
 from jptrans.style import Renderer
@@ -15,9 +16,11 @@ from .cache import LayeredTranslationCache
 from .config import AppSettings, TitleStyle, chat_config, long_config
 from .engines import DailyCapExceeded, UsageTracker, build_engine_chain
 from .glossary_store import FirestoreGlossary, glossary_entry_to_dict
+from .literary_polish import profile_document, sanitize_zero_em_dash
 from .multilingual import parse_mode_pair, translate_multilingual_document
 
 DEFAULT_CHUNK_PARAS = 8
+_STREAM_LOGGER = logging.getLogger("tranx.stream")
 
 
 def stream_fast_chat(
@@ -32,6 +35,7 @@ def stream_fast_chat(
     api_key: str | None = None,
     usage_tracker: UsageTracker | None = None,
     llm_transport: Any = None,
+    tone_override: str = "auto",
 ) -> Iterator[dict[str, Any]]:
     """Stream NDJSON events for fast chat (<= 5,000 chars) in a single LLM batch call."""
     clean = (text or "").strip()
@@ -85,6 +89,7 @@ def stream_fast_chat(
                 api_key=api_key,
                 usage_tracker=usage_tracker,
                 llm_transport=llm_transport,
+                tone_override=tone_override,
             )
     except DailyCapExceeded as exc:
         yield {
@@ -96,24 +101,25 @@ def stream_fast_chat(
         }
         return
     except Exception as exc:
+        _STREAM_LOGGER.warning("stream_fast_chat failed: %s", type(exc).__name__)
         yield {
             "type": "error",
             "code": "ENGINE_FAILED",
-            "message": str(exc),
+            "message": "Gagal menerjemahkan teks saat ini. Coba lagi sebentar.",
         }
         return
 
     sentences_flat: list[dict[str, Any]] = []
     used_model = settings.llm_models[0]
     for p_idx, tpara in enumerate(result.paragraphs):
-        dst_text = tpara.target or tpara.source.text
+        dst_text = sanitize_zero_em_dash(tpara.target or tpara.source.text, target_lang)
         for s in tpara.sentences:
             if s.engine:
                 used_model = s.engine
             sentences_flat.append(
                 {
                     "src": s.source,
-                    "dst": s.target,
+                    "dst": sanitize_zero_em_dash(s.target, target_lang),
                     "status": s.status,
                     "engine": s.engine,
                 }
@@ -128,7 +134,7 @@ def stream_fast_chat(
     elapsed_ms = round((time.monotonic() - started) * 1000)
     yield {
         "type": "done",
-        "fullDst": result.target,
+        "fullDst": sanitize_zero_em_dash(result.target, target_lang),
         "detectedSource": eff_src,
         "sentences": sentences_flat,
         "ms": elapsed_ms,
@@ -194,12 +200,14 @@ def stream_document_chunks(
     cache: LayeredTranslationCache,
     existing_paras: Mapping[int, dict[str, Any]] | None = None,
     on_para_saved: Callable[[int, dict[str, Any]], None] | None = None,
+    on_chunk_saved: Callable[[list[tuple[int, dict[str, Any]]], int], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     style: TitleStyle | None = None,
     chunk_size: int = DEFAULT_CHUNK_PARAS,
     api_key: str | None = None,
     usage_tracker: UsageTracker | None = None,
     llm_transport: Any = None,
+    tone_override: str = "auto",
 ) -> Iterator[dict[str, Any]]:
     """Translate a Document in resumable paragraph chunks, skipping already persisted paragraphs."""
     started = time.monotonic()
@@ -226,11 +234,20 @@ def stream_document_chunks(
     if not (eff_src == "ja" and target_lang in ("id", "en")):
         pending_indices = [i for i in range(total) if i not in persisted]
         done_count = len(persisted)
+        doc_profile = profile_document(
+            [p.text for p in doc.paragraphs],
+            eff_src,
+            target_lang,
+            tone_override=tone_override,
+            doc_format=doc.fmt,
+        )
+        doc_glossary_entries = glossary.non_builtin_entries()
         for offset in range(0, len(pending_indices), max(chunk_size, 1)):
             if should_stop is not None and should_stop():
                 yield {
                     "type": "done",
                     "state": "stopped",
+                    "detectedSource": eff_src,
                     "doneParas": done_count,
                     "totalParas": total,
                     "ms": round((time.monotonic() - started) * 1000),
@@ -250,11 +267,13 @@ def stream_document_chunks(
                     src_lang=eff_src,
                     tgt_lang=target_lang,
                     settings=settings,
-                    glossary_entries=glossary.non_builtin_entries(),
+                    glossary_entries=doc_glossary_entries,
                     cache=cache,
                     api_key=api_key,
                     usage_tracker=usage_tracker,
                     llm_transport=llm_transport,
+                    profile=doc_profile,
+                    tone_override=tone_override,
                 )
             except DailyCapExceeded as exc:
                 yield {
@@ -269,32 +288,45 @@ def stream_document_chunks(
                 }
                 return
             except Exception as exc:
+                _STREAM_LOGGER.warning("stream_document_chunks multilingual chunk failed: %s", type(exc).__name__)
                 yield {
                     "type": "error",
                     "code": "ENGINE_FAILED",
                     "state": "partial" if done_count > 0 else "error",
                     "doneParas": done_count,
                     "totalParas": total,
-                    "message": str(exc),
+                    "message": "Gagal memproses sebagian dokumen. Bagian yang selesai tetap tersimpan.",
                 }
                 return
+            chunk_rows: list[tuple[int, dict[str, Any]]] = []
             for global_idx, tpara in zip(batch_indices, sub_result.paragraphs):
+                dst_clean = sanitize_zero_em_dash(tpara.target or tpara.source.text, target_lang)
                 para_payload = {
                     "i": global_idx,
                     "src": tpara.source.text,
-                    "dst": tpara.target or tpara.source.text,
+                    "dst": dst_clean,
                     "kind": tpara.source.kind,
                     "meta": dict(tpara.source.meta),
                     "sentences": [
-                        {"src": s.source, "dst": s.target, "status": s.status, "engine": s.engine, "turn": s.turn}
+                        {
+                            "src": s.source,
+                            "dst": sanitize_zero_em_dash(s.target, target_lang),
+                            "status": s.status,
+                            "engine": s.engine,
+                            "turn": s.turn,
+                        }
                         for s in tpara.sentences
                     ],
                     "model": used_m,
                 }
                 persisted[global_idx] = para_payload
                 done_count += 1
-                if on_para_saved is not None:
+                chunk_rows.append((global_idx, para_payload))
+                if on_chunk_saved is None and on_para_saved is not None:
                     on_para_saved(global_idx, para_payload)
+            if on_chunk_saved is not None and chunk_rows:
+                on_chunk_saved(chunk_rows, done_count)
+            for _g_idx, para_payload in chunk_rows:
                 yield {"type": "para", **para_payload, "doneParas": done_count, "totalParas": total}
         yield {
             "type": "done",
@@ -330,6 +362,17 @@ def stream_document_chunks(
                 "charCap": exc.char_cap,
             }
             return
+        except Exception as exc:
+            _STREAM_LOGGER.warning("stream_document_chunks prepare failed: %s", type(exc).__name__)
+            yield {
+                "type": "error",
+                "code": "ENGINE_FAILED",
+                "state": "partial" if persisted else "error",
+                "doneParas": len(persisted),
+                "totalParas": total,
+                "message": "Gagal menyiapkan kamus dokumen. Coba lagi sebentar.",
+            }
+            return
 
         yield {
             "type": "names",
@@ -343,88 +386,101 @@ def stream_document_chunks(
         pending_indices = [i for i in range(total) if i not in persisted]
         done_count = len(persisted)
 
-        for offset in range(0, len(pending_indices), max(chunk_size, 1)):
-            if should_stop is not None and should_stop():
-                yield {
-                    "type": "done",
-                    "state": "stopped",
-                    "doneParas": done_count,
-                    "totalParas": total,
-                    "ms": round((time.monotonic() - started) * 1000),
-                }
-                return
+        # Hoist batch Translator + engine chain outside chunk loop to avoid per-chunk teardown/setup
+        batch_cfg = chat_config(settings, target_lang, style=style)
+        batch_engines = build_engine_chain(
+            batch_cfg,
+            settings,
+            api_key=api_key,
+            usage_tracker=usage_tracker,
+            transport=llm_transport,
+        )
+        with Translator(batch_cfg, batch_engines, cache, glossary) as batch_tr:
+            for offset in range(0, len(pending_indices), max(chunk_size, 1)):
+                if should_stop is not None and should_stop():
+                    yield {
+                        "type": "done",
+                        "state": "stopped",
+                        "detectedSource": eff_src,
+                        "doneParas": done_count,
+                        "totalParas": total,
+                        "ms": round((time.monotonic() - started) * 1000),
+                    }
+                    return
 
-            batch_indices = pending_indices[offset : offset + max(chunk_size, 1)]
-            sub_doc = Document(
-                title=doc.title,
-                paragraphs=[doc.paragraphs[idx] for idx in batch_indices],
-                ruby=doc.ruby,
-                source_path=doc.source_path,
-                fmt=doc.fmt,
-            )
-            # Translate batch with fresh inner Translator sharing already-prepared glossary & cache
-            batch_cfg = chat_config(settings, target_lang, style=style)
-            batch_engines = build_engine_chain(
-                batch_cfg,
-                settings,
-                api_key=api_key,
-                usage_tracker=usage_tracker,
-                transport=llm_transport,
-            )
-            try:
-                with Translator(batch_cfg, batch_engines, cache, glossary) as batch_tr:
+                batch_indices = pending_indices[offset : offset + max(chunk_size, 1)]
+                sub_doc = Document(
+                    title=doc.title,
+                    paragraphs=[doc.paragraphs[idx] for idx in batch_indices],
+                    ruby=doc.ruby,
+                    source_path=doc.source_path,
+                    fmt=doc.fmt,
+                )
+                try:
                     sub_result = batch_tr.translate_document(sub_doc)
-            except DailyCapExceeded as exc:
-                yield {
-                    "type": "error",
-                    "code": "DAILY_CAP_REACHED",
-                    "state": "partial",
-                    "doneParas": done_count,
-                    "totalParas": total,
-                    "message": "Batas pemakaian harian tercapai. Bagian yang selesai tetap tersimpan.",
-                    "charsUsed": exc.chars_used,
-                    "charCap": exc.char_cap,
-                }
-                return
-            except Exception as exc:
-                yield {
-                    "type": "error",
-                    "code": "ENGINE_FAILED",
-                    "state": "partial" if done_count > 0 else "error",
-                    "doneParas": done_count,
-                    "totalParas": total,
-                    "message": str(exc),
-                }
-                return
+                except DailyCapExceeded as exc:
+                    yield {
+                        "type": "error",
+                        "code": "DAILY_CAP_REACHED",
+                        "state": "partial",
+                        "doneParas": done_count,
+                        "totalParas": total,
+                        "message": "Batas pemakaian harian tercapai. Bagian yang selesai tetap tersimpan.",
+                        "charsUsed": exc.chars_used,
+                        "charCap": exc.char_cap,
+                    }
+                    return
+                except Exception as exc:
+                    _STREAM_LOGGER.warning("stream_document_chunks ja chunk failed: %s", type(exc).__name__)
+                    yield {
+                        "type": "error",
+                        "code": "ENGINE_FAILED",
+                        "state": "partial" if done_count > 0 else "error",
+                        "doneParas": done_count,
+                        "totalParas": total,
+                        "message": "Gagal memproses sebagian dokumen. Bagian yang selesai tetap tersimpan.",
+                    }
+                    return
 
-            for global_idx, tpara in zip(batch_indices, sub_result.paragraphs):
-                para_payload = {
-                    "i": global_idx,
-                    "src": tpara.source.text,
-                    "dst": tpara.target or tpara.source.text,
-                    "kind": tpara.source.kind,
-                    "meta": dict(tpara.source.meta),
-                    "sentences": [
-                        {
-                            "src": s.source,
-                            "dst": s.target,
-                            "status": s.status,
-                            "engine": s.engine,
-                            "turn": s.turn,
-                        }
-                        for s in tpara.sentences
-                    ],
-                    "model": settings.llm_models[0],
-                }
-                persisted[global_idx] = para_payload
-                done_count += 1
-                if on_para_saved is not None:
-                    on_para_saved(global_idx, para_payload)
-                yield {"type": "para", **para_payload, "doneParas": done_count, "totalParas": total}
+                chunk_rows_ja: list[tuple[int, dict[str, Any]]] = []
+                for global_idx, tpara in zip(batch_indices, sub_result.paragraphs):
+                    used_m = settings.llm_models[0]
+                    sents_out: list[dict[str, Any]] = []
+                    for s in tpara.sentences:
+                        if s.engine:
+                            used_m = s.engine
+                        sents_out.append(
+                            {
+                                "src": s.source,
+                                "dst": sanitize_zero_em_dash(s.target, target_lang),
+                                "status": s.status,
+                                "engine": s.engine,
+                                "turn": s.turn,
+                            }
+                        )
+                    para_payload = {
+                        "i": global_idx,
+                        "src": tpara.source.text,
+                        "dst": sanitize_zero_em_dash(tpara.target or tpara.source.text, target_lang),
+                        "kind": tpara.source.kind,
+                        "meta": dict(tpara.source.meta),
+                        "sentences": sents_out,
+                        "model": used_m,
+                    }
+                    persisted[global_idx] = para_payload
+                    done_count += 1
+                    chunk_rows_ja.append((global_idx, para_payload))
+                    if on_chunk_saved is None and on_para_saved is not None:
+                        on_para_saved(global_idx, para_payload)
+                if on_chunk_saved is not None and chunk_rows_ja:
+                    on_chunk_saved(chunk_rows_ja, done_count)
+                for _g_idx, para_payload in chunk_rows_ja:
+                    yield {"type": "para", **para_payload, "doneParas": done_count, "totalParas": total}
 
     yield {
         "type": "done",
         "state": "done",
+        "detectedSource": eff_src,
         "doneParas": done_count,
         "totalParas": total,
         "ms": round((time.monotonic() - started) * 1000),

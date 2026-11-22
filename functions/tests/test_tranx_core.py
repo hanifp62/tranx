@@ -32,7 +32,6 @@ from tranx_core import (  # noqa: E402
     RawVisionBubble,
     SSRFBlockedError,
     TitleStyle,
-    WebGateBlockedError,
     denormalize_box_to_xywh,
     dict_to_glossary_entry,
     export_translated_document,

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import html as html_lib
 import http.client
+import io
 import ipaddress
 import re
 import socket
 import ssl
+import time
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +22,7 @@ from jptrans.models import Document, Paragraph
 from jptrans.pipeline import Translator
 from jptrans.readers.aozora import is_aozora, parse_aozora
 from jptrans.textnorm import contains_japanese
+from PIL import Image, PngImagePlugin
 
 from .cache import LayeredTranslationCache
 from .config import AppSettings, TitleStyle, long_config
@@ -28,14 +32,86 @@ from .multilingual import parse_mode_pair, translate_multilingual_document
 
 MAX_URL_LENGTH = 2048
 MAX_HTML_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_IMAGE_PROXY_BYTES = 15 * 1024 * 1024  # 15 MB
 MAX_REDIRECTS = 3
 CONNECT_TIMEOUT_SEC = 5.0
-READ_TIMEOUT_SEC = 12.0
+READ_TIMEOUT_SEC = 10.0
+TOTAL_FETCH_DEADLINE_SEC = 20.0
 
 CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+BENCHMARK_NET = ipaddress.ip_network("198.18.0.0/15")
+NAT64_NET = ipaddress.ip_network("64:ff9b::/96")
+NAT64_LOCAL_NET = ipaddress.ip_network("64:ff9b:1::/48")
+DISCARD_V6_NET = ipaddress.ip_network("100::/64")
+IPV4_COMPAT_V6_NET = ipaddress.ip_network("::/96")
+_HEADER_CTRL_RE = re.compile(r"[\r\n\x00]")
+_SCHEME_WS_RE = re.compile(r"[\x00-\x20]+")
+_CHARSET_HDR_RE = re.compile(r"charset=([A-Za-z0-9_\-]+)", re.I)
+_CHARSET_META_RE = re.compile(rb'charset=["\']?([A-Za-z0-9_\-]+)', re.I)
+_CSS_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/")
+_CSS_HEX_ESC_RE = re.compile(r"\\([0-9a-fA-F]{1,6})[ \t\r\n\f]?")
+_CSS_SINGLE_ESC_RE = re.compile(r"\\([^\r\n\f0-9a-fA-F])")
+_UNSAFE_CSS_RE = re.compile(
+    r"(?:@import\b|expression\s*\(|-moz-binding\s*:|behavior\s*:|\burl\s*\(|\bimage-set\s*\()",
+    re.I,
+)
+
+
+def _has_unsafe_css(css_text: str) -> bool:
+    """Normalize CSS comments and backslash/hex escapes before checking exfiltration/XSS primitives."""
+    if not css_text:
+        return False
+    stripped = _CSS_COMMENT_RE.sub("", css_text)
+
+    def _decode_hex(m: re.Match[str]) -> str:
+        try:
+            cp = int(m.group(1), 16)
+            return chr(cp) if 0 < cp <= 0x10FFFF else ""
+        except ValueError:
+            return ""
+
+    decoded = _CSS_HEX_ESC_RE.sub(_decode_hex, stripped)
+    decoded = _CSS_SINGLE_ESC_RE.sub(r"\1", decoded)
+    return bool(_UNSAFE_CSS_RE.search(decoded))
+_SAFE_IMG_DATA_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[a-z0-9+/=\s]+$", re.I)
 ALLOWED_CONTENT_TYPES = ("text/html", "application/xhtml+xml", "text/plain")
+ALLOWED_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
+IMAGE_PROXY_FORMATS = ("PNG", "JPEG", "WEBP", "GIF")
+Image.MAX_IMAGE_PIXELS = 36_000_000
+PngImagePlugin.MAX_TEXT_CHUNK = 64 * 1024
+PngImagePlugin.MAX_TEXT_MEMORY = 256 * 1024
+
+_PINNED_SSL_CONTEXT = ssl.create_default_context()
+_PINNED_SSL_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+IMAGE_REFERER_ALLOWLIST: dict[str, str] = {
+    "pstatic.net": "https://www.webtoons.com/",
+    "pximg.net": "https://www.pixiv.net/",
+    "mangadex.network": "https://mangadex.org/",
+    "mangadex.org": "https://mangadex.org/",
+}
 STRIP_TAGS = frozenset(
-    {"script", "noscript", "object", "embed", "applet", "iframe", "frame", "frameset"}
+    {
+        "script",
+        "noscript",
+        "object",
+        "embed",
+        "applet",
+        "iframe",
+        "frame",
+        "frameset",
+        "template",
+        "math",
+        "svg",
+        "area",
+        "map",
+        "form",
+        "foreignobject",
+        "animate",
+        "animatemotion",
+        "animatetransform",
+        "set",
+        "use",
+    }
 )
 SKIP_TEXT_PARENTS = frozenset(
     {"script", "style", "noscript", "code", "pre", "textarea", "svg", "math"}
@@ -70,8 +146,17 @@ class FetchedPage:
     text: str
 
 
+@dataclass(frozen=True)
+class FetchedImage:
+    final_url: str
+    host: str
+    content_type: str
+    data: bytes
+
+
 ResolverFn = Callable[[str, int], list[str]]
 HttpFetchFn = Callable[[str], FetchedPage]
+ImageFetchFn = Callable[[str], FetchedImage]
 
 
 def default_dns_resolver(host: str, port: int) -> list[str]:
@@ -95,19 +180,40 @@ def assert_public_ip(ip_str: str) -> None:
     except ValueError as exc:
         raise SSRFBlockedError(f"Alamat IP tidak sah: {ip_str!r}") from exc
 
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
+    candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [addr]
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            candidates.append(addr.ipv4_mapped)
+        if addr.sixtofour is not None:
+            candidates.append(addr.sixtofour)
+        if addr.teredo is not None:
+            candidates.extend(addr.teredo)
+        if addr in NAT64_NET or addr in NAT64_LOCAL_NET:
+            embedded_v4 = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+            candidates.append(embedded_v4)
 
-    if (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_multicast
-        or addr.is_reserved
-        or addr.is_unspecified
-        or (isinstance(addr, ipaddress.IPv4Address) and addr in CGNAT_NET)
-    ):
-        raise SSRFBlockedError(f"Akses ke alamat internal/privat ditolak ({ip_str})")
+    for ip in candidates:
+        if (
+            not ip.is_global
+            or ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+            or (isinstance(ip, ipaddress.IPv4Address) and (ip in CGNAT_NET or ip in BENCHMARK_NET))
+            or (
+                isinstance(ip, ipaddress.IPv6Address)
+                and (
+                    ip.is_site_local
+                    or ip in NAT64_NET
+                    or ip in NAT64_LOCAL_NET
+                    or ip in DISCARD_V6_NET
+                    or ip in IPV4_COMPAT_V6_NET
+                )
+            )
+        ):
+            raise SSRFBlockedError("Akses ke alamat internal atau privat ditolak")
 
 
 def validate_and_resolve_url(
@@ -117,6 +223,8 @@ def validate_and_resolve_url(
     url = (raw_url or "").strip()
     if not url or len(url) > MAX_URL_LENGTH:
         raise SSRFBlockedError("URL kosong atau melebihi batas 2.048 karakter")
+    if _HEADER_CTRL_RE.search(url):
+        raise SSRFBlockedError("URL mengandung karakter kontrol tidak sah")
 
     parts = urlsplit(url)
     scheme = parts.scheme.lower()
@@ -126,7 +234,13 @@ def validate_and_resolve_url(
         raise SSRFBlockedError("Kredensial di dalam URL tidak diizinkan")
 
     host = (parts.hostname or "").strip().lower().rstrip(".")
-    if not host or host in ("localhost", "metadata.google.internal", "metadata") or host.endswith(".local") or host.endswith(".internal"):
+    if (
+        not host
+        or host in ("localhost", "metadata.google.internal", "metadata")
+        or host.endswith(".localhost")
+        or host.endswith(".local")
+        or host.endswith(".internal")
+    ):
         raise SSRFBlockedError(f"Host tidak diizinkan: {host!r}")
 
     try:
@@ -151,50 +265,94 @@ def validate_and_resolve_url(
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """Connect TCP to a pre-validated IP while verifying TLS SNI against the original hostname."""
+    """Connect TCP to a pre-validated IP while verifying TLS 1.2+ SNI against the original hostname."""
 
     def __init__(self, pinned_ip: str, server_hostname: str, port: int, timeout: float) -> None:
-        super().__init__(server_hostname, port=port, timeout=timeout, context=ssl.create_default_context())
+        super().__init__(server_hostname, port=port, timeout=timeout, context=_PINNED_SSL_CONTEXT)
         self._pinned_ip = pinned_ip
         self._server_hostname = server_hostname
 
     def connect(self) -> None:
         raw_sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
-        self.sock = self._context.wrap_socket(raw_sock, server_hostname=self._server_hostname)
+        try:
+            self.sock = self._context.wrap_socket(raw_sock, server_hostname=self._server_hostname)
+        except Exception:
+            raw_sock.close()
+            raise
+
+
+def _encode_ascii_host(host: str) -> str:
+    clean = (host or "").strip().lower()
+    if not clean:
+        raise SSRFBlockedError("Host URL kosong atau tidak sah")
+    if ":" in clean:
+        try:
+            ipaddress.IPv6Address(clean)
+        except ValueError as exc:
+            raise SSRFBlockedError("Host IPv6 tidak sah") from exc
+        return f"[{clean}]"
+    try:
+        encoded = clean.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise SSRFBlockedError("Nama domain internasional (IDNA) tidak sah") from exc
+    if not encoded or _HEADER_CTRL_RE.search(encoded):
+        raise SSRFBlockedError("Nama domain tidak sah")
+    return encoded
+
+
+def _encode_request_target(parts: Any) -> str:
+    path = quote(parts.path or "/", safe="/:@!$&'()*+,;=-._~%")
+    if parts.query:
+        query = quote(parts.query, safe="=&/:@!$'()*+,;?-._~%")
+        return f"{path}?{query}"
+    return path
 
 
 def fetch_url_safely(
     url: str, *, resolver: ResolverFn = default_dns_resolver
 ) -> FetchedPage:
-    """Fetch HTML with IP pinning, redirect re-validation, size limit, and anti-bot check."""
+    """Fetch HTML with IP pinning, total wall-clock deadline, redirect re-validation, size limit, and anti-bot check."""
     current_url = url
+    deadline = time.monotonic() + TOTAL_FETCH_DEADLINE_SEC
     for _hop in range(MAX_REDIRECTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise InputError("Waktu pengambilan halaman web habis")
         parts, pinned_ip = validate_and_resolve_url(current_url, resolver=resolver)
         scheme = parts.scheme.lower()
         host = (parts.hostname or "").lower()
+        ascii_host = _encode_ascii_host(host)
+        sni_host = ascii_host.strip("[]")
         port = parts.port or (443 if scheme == "https" else 80)
-        path_and_query = parts.path or "/"
-        if parts.query:
-            path_and_query = f"{path_and_query}?{parts.query}"
+        path_and_query = _encode_request_target(parts)
 
+        conn_timeout = min(CONNECT_TIMEOUT_SEC, max(0.5, remaining))
         conn: http.client.HTTPConnection
         if scheme == "https":
-            conn = _PinnedHTTPSConnection(pinned_ip, host, port, CONNECT_TIMEOUT_SEC)
+            conn = _PinnedHTTPSConnection(pinned_ip, sni_host, port, conn_timeout)
         else:
-            conn = http.client.HTTPConnection(pinned_ip, port=port, timeout=CONNECT_TIMEOUT_SEC)
+            conn = http.client.HTTPConnection(pinned_ip, port=port, timeout=conn_timeout)
 
+        if _HEADER_CTRL_RE.search(ascii_host) or _HEADER_CTRL_RE.search(path_and_query):
+            raise SSRFBlockedError("Header permintaan mengandung karakter kontrol tidak sah")
+        resp: http.client.HTTPResponse | None = None
         try:
             conn.request(
                 "GET",
                 path_and_query,
                 headers={
-                    "Host": host,
-                    "User-Agent": "tranX-Reader/2.1 (+personal-translator)",
+                    "Host": ascii_host,
+                    "User-Agent": "tranX-Reader/2.5 (+personal-translator)",
                     "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9",
-                    "Accept-Encoding": "identity",
+                    "Accept-Encoding": "gzip, identity",
+                    "Connection": "close",
                 },
             )
-            conn.sock.settimeout(READ_TIMEOUT_SEC)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InputError("Waktu tunggu server halaman web habis")
+            if conn.sock is not None:
+                conn.sock.settimeout(min(READ_TIMEOUT_SEC, max(0.5, remaining)))
             resp = conn.getresponse()
             status = resp.status
 
@@ -202,6 +360,8 @@ def fetch_url_safely(
                 location = resp.getheader("Location")
                 if not location:
                     raise InputError("Situs mengalihkan halaman tanpa tujuan Location")
+                if _HEADER_CTRL_RE.search(location):
+                    raise SSRFBlockedError("Header pengalihan Location mengandung karakter tidak sah")
                 current_url = urljoin(current_url, location)
                 continue
 
@@ -217,18 +377,56 @@ def fetch_url_safely(
             if not any(mime_only.startswith(allowed) for allowed in ALLOWED_CONTENT_TYPES):
                 raise InputError(f"Tipe konten {mime_only!r} bukan halaman teks/HTML")
 
-            chunks: list[bytes] = []
-            total = 0
+            clen_raw = (resp.getheader("Content-Length") or "").strip()
+            if clen_raw.isdigit() and int(clen_raw) > MAX_HTML_BYTES:
+                raise InputError("Ukuran halaman web melebihi batas aman 5 MB")
+
+            c_enc = (resp.getheader("Content-Encoding") or "").strip().lower()
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS) if c_enc == "gzip" else None
+            read_sock = conn.sock or getattr(getattr(resp.fp, "raw", None), "_sock", None)
+            buf = bytearray()
+            wire_bytes = 0
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise InputError("Pengunduhan halaman web melebihi batas waktu aman")
+                if read_sock is not None:
+                    read_sock.settimeout(min(READ_TIMEOUT_SEC, max(0.5, remaining)))
                 piece = resp.read(65536)
                 if not piece:
                     break
-                total += len(piece)
-                if total > MAX_HTML_BYTES:
+                wire_bytes += len(piece)
+                if wire_bytes > MAX_HTML_BYTES:
                     raise InputError("Ukuran halaman web melebihi batas aman 5 MB")
-                chunks.append(piece)
-            raw_bytes = b"".join(chunks)
+                if decompressor is not None:
+                    try:
+                        room = MAX_HTML_BYTES - len(buf) + 1
+                        out_chunk = decompressor.decompress(piece, room)
+                    except zlib.error as exc:
+                        raise InputError("Aliran kompresi gzip halaman web tidak sah") from exc
+                    if len(buf) + len(out_chunk) > MAX_HTML_BYTES or decompressor.unconsumed_tail:
+                        raise InputError("Ukuran halaman web melebihi batas aman 5 MB")
+                    buf.extend(out_chunk)
+                else:
+                    if len(buf) + len(piece) > MAX_HTML_BYTES:
+                        raise InputError("Ukuran halaman web melebihi batas aman 5 MB")
+                    buf.extend(piece)
+            if decompressor is not None:
+                try:
+                    tail_chunk = decompressor.flush(MAX_HTML_BYTES - len(buf) + 1)
+                except zlib.error as exc:
+                    raise InputError("Aliran kompresi gzip halaman web tidak sah") from exc
+                if len(buf) + len(tail_chunk) > MAX_HTML_BYTES:
+                    raise InputError("Ukuran halaman web melebihi batas aman 5 MB")
+                buf.extend(tail_chunk)
+            raw_bytes = bytes(buf)
+        except (InputError, WebGateBlockedError, SSRFBlockedError):
+            raise
+        except (OSError, ssl.SSLError, http.client.HTTPException, TimeoutError) as exc:
+            raise InputError("Gagal mengambil halaman web dari server tujuan") from exc
         finally:
+            if resp is not None:
+                resp.close()
             conn.close()
 
         decoded = _decode_html_bytes(raw_bytes, ctype_header)
@@ -247,17 +445,179 @@ def fetch_url_safely(
     raise InputError(f"Terlalu banyak pengalihan URL (> {MAX_REDIRECTS})")
 
 
+def _detect_image_mime_from_magic(raw: bytes) -> str | None:
+    if len(raw) < 12:
+        return None
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _allowlisted_referer_for_host(host: str) -> str | None:
+    low = host.lower().rstrip(".")
+    for suffix, ref in IMAGE_REFERER_ALLOWLIST.items():
+        if low == suffix or low.endswith(f".{suffix}"):
+            return ref
+    return None
+
+
+def fetch_image_safely(
+    url: str, *, resolver: ResolverFn = default_dns_resolver
+) -> FetchedImage:
+    """IP-pinned anti-SSRF image proxy fetcher with total wall-clock deadline, 15 MB cap, and Pillow verification."""
+    current_url = url
+    deadline = time.monotonic() + TOTAL_FETCH_DEADLINE_SEC
+
+    for _hop in range(MAX_REDIRECTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise InputError("Pengunduhan gambar melebihi batas waktu aman")
+
+        parts, pinned_ip = validate_and_resolve_url(current_url, resolver=resolver)
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower()
+        ascii_host = _encode_ascii_host(host)
+        sni_host = ascii_host.strip("[]")
+        port = parts.port or (443 if scheme == "https" else 80)
+        path_and_query = _encode_request_target(parts)
+
+        conn_timeout = min(CONNECT_TIMEOUT_SEC, max(0.5, remaining))
+        conn: http.client.HTTPConnection
+        if scheme == "https":
+            conn = _PinnedHTTPSConnection(pinned_ip, sni_host, port, conn_timeout)
+        else:
+            conn = http.client.HTTPConnection(pinned_ip, port=port, timeout=conn_timeout)
+
+        if _HEADER_CTRL_RE.search(ascii_host) or _HEADER_CTRL_RE.search(path_and_query):
+            raise SSRFBlockedError("Header permintaan gambar mengandung karakter kontrol tidak sah")
+        req_headers = {
+            "Host": ascii_host,
+            "User-Agent": "tranX-MediaProxy/2.5 (+personal-translator)",
+            "Accept": "image/webp,image/png,image/jpeg,image/gif;q=0.9",
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+        }
+        if scheme == "https":
+            ref = _allowlisted_referer_for_host(host)
+            if ref:
+                req_headers["Referer"] = ref
+
+        resp: http.client.HTTPResponse | None = None
+        try:
+            conn.request("GET", path_and_query, headers=req_headers)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InputError("Waktu tunggu server gambar habis")
+            if conn.sock is not None:
+                conn.sock.settimeout(min(READ_TIMEOUT_SEC, max(0.5, remaining)))
+            resp = conn.getresponse()
+            status = resp.status
+
+            if status in (301, 302, 303, 307, 308):
+                location = resp.getheader("Location")
+                if not location:
+                    raise InputError("Server gambar mengalihkan URL tanpa tujuan Location")
+                if _HEADER_CTRL_RE.search(location):
+                    raise SSRFBlockedError("Header pengalihan gambar mengandung karakter tidak sah")
+                current_url = urljoin(current_url, location)
+                continue
+
+            if status in (401, 403):
+                raise WebGateBlockedError(
+                    "Situs sumber menolak akses gambar otomatis. Tempel atau unggah gambar secara manual."
+                )
+            if status >= 400:
+                raise InputError(f"Server gambar mengembalikan status HTTP {status}")
+
+            upstream_ct = (resp.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if upstream_ct.startswith(("text/html", "image/svg", "application/javascript", "text/javascript")):
+                raise InputError("Tautan mengembalikan dokumen web/SVG, bukan berkas gambar raster")
+
+            clen_raw = (resp.getheader("Content-Length") or "").strip()
+            if clen_raw.isdigit() and int(clen_raw) > MAX_IMAGE_PROXY_BYTES:
+                raise InputError("Ukuran gambar melebihi batas aman 15 MB")
+
+            read_sock = conn.sock or getattr(getattr(resp.fp, "raw", None), "_sock", None)
+            buf = bytearray()
+            detected_mime: str | None = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise InputError("Pengunduhan gambar melebihi batas waktu aman")
+                if read_sock is not None:
+                    read_sock.settimeout(min(READ_TIMEOUT_SEC, max(0.5, remaining)))
+                piece = resp.read(65536)
+                if not piece:
+                    break
+                if len(buf) + len(piece) > MAX_IMAGE_PROXY_BYTES:
+                    raise InputError("Ukuran gambar melebihi batas aman 15 MB")
+                buf.extend(piece)
+                if detected_mime is None and len(buf) >= 12:
+                    detected_mime = _detect_image_mime_from_magic(bytes(buf[:16]))
+                    if not detected_mime or detected_mime not in ALLOWED_IMAGE_MIMES:
+                        raise InputError(
+                            "Tautan tidak mengembalikan berkas gambar PNG, JPG, WEBP, atau GIF yang sah"
+                        )
+            raw_bytes = bytes(buf)
+        except (InputError, WebGateBlockedError, SSRFBlockedError):
+            raise
+        except (OSError, ssl.SSLError, http.client.HTTPException, TimeoutError) as exc:
+            raise InputError("Gagal mengambil gambar dari server tujuan") from exc
+        finally:
+            if resp is not None:
+                resp.close()
+            conn.close()
+
+        if detected_mime is None:
+            detected_mime = _detect_image_mime_from_magic(raw_bytes)
+        if not detected_mime or detected_mime not in ALLOWED_IMAGE_MIMES:
+            raise InputError("Tautan tidak mengembalikan berkas gambar PNG, JPG, WEBP, atau GIF yang sah")
+
+        # Validate structural raster headers via Pillow to prevent polyglot tunneling
+        try:
+            with Image.open(io.BytesIO(raw_bytes), formats=IMAGE_PROXY_FORMATS) as img:
+                if (img.format or "").upper() not in IMAGE_PROXY_FORMATS:
+                    raise InputError("Format gambar tidak diizinkan")
+                n_frames = int(getattr(img, "n_frames", 1) or 1)
+                if n_frames > 1:
+                    raise InputError("Gambar animasi multi-frame belum didukung")
+                w, h = img.size
+                if w <= 0 or h <= 0 or w > 8192 or h > 65536 or (w * h) > 36_000_000:
+                    raise InputError("Dimensi gambar melampaui batas aman")
+        except InputError:
+            raise
+        except Image.DecompressionBombError as exc:
+            raise InputError("Dimensi gambar melampaui batas aman") from exc
+        except Exception as exc:
+            raise InputError("Berkas gambar rusak atau tidak dapat diverifikasi") from exc
+
+        return FetchedImage(
+            final_url=current_url,
+            host=host,
+            content_type=detected_mime,
+            data=raw_bytes,
+        )
+
+    raise InputError(f"Terlalu banyak pengalihan URL (> {MAX_REDIRECTS})")
+
+
 def _is_blocked_or_antibot_html(decoded: str) -> bool:
     lower_sample = decoded[:16384].lower()
     return any(marker in lower_sample for marker in ANTIBOT_MARKERS) and len(decoded) < 25000
 
 
 def _decode_html_bytes(raw: bytes, content_type_header: str) -> str:
-    m = re.search(r"charset=([A-Za-z0-9_\-]+)", content_type_header, re.I)
+    m = _CHARSET_HDR_RE.search(content_type_header)
     candidates: list[str] = []
     if m:
         candidates.append(m.group(1))
-    meta_match = re.search(br'charset=["\']?([A-Za-z0-9_\-]+)', raw[:4096], re.I)
+    meta_match = _CHARSET_META_RE.search(raw[:4096])
     if meta_match:
         candidates.append(meta_match.group(1).decode("ascii", errors="ignore"))
     candidates.extend(["utf-8", "shift_jis", "euc_jp", "cp932"])
@@ -271,23 +631,44 @@ def _decode_html_bytes(raw: bytes, content_type_header: str) -> str:
 
 
 def sanitize_soup(soup: BeautifulSoup, final_url: str, rewrite_link_fn: Callable[[str], str]) -> None:
-    """Strip executable scripts/handlers, inject <base>, and rewrite navigable <a href> links."""
+    """Strip executable scripts/handlers, furigana ruby text, unsafe CSS/links, inject <base>, and rewrite <a>."""
     for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
         comment.extract()
 
     for bad in soup.find_all(STRIP_TAGS):
         bad.decompose()
 
+    # Strip Japanese ruby furigana annotations so DOM translation matches clean prose (parity with web/)
+    for ruby_sub in soup.find_all(("rt", "rp")):
+        ruby_sub.decompose()
+
+    for style_tag in soup.find_all("style"):
+        css_txt = style_tag.get_text() or ""
+        if _has_unsafe_css(css_txt):
+            style_tag.decompose()
+
     for meta in soup.find_all("meta"):
-        http_equiv = (meta.get("http-equiv") or "").lower()
-        if http_equiv in ("refresh", "content-security-policy", "set-cookie"):
+        raw_he = meta.get("http-equiv")
+        http_equiv = (" ".join(raw_he) if isinstance(raw_he, list) else str(raw_he or "")).strip().lower()
+        if http_equiv and http_equiv != "content-type":
             meta.decompose()
 
+    page_host = (urlsplit(final_url).hostname or "").lower()
     for link in soup.find_all("link"):
         rel_val = link.get("rel")
         rels = [r.lower() for r in (rel_val if isinstance(rel_val, list) else [str(rel_val or "")])]
         if "stylesheet" not in rels:
             link.decompose()
+            continue
+        href_val = str(link.get("href") or "").strip()
+        abs_css = urljoin(final_url, href_val) if href_val else ""
+        css_parsed = urlsplit(abs_css)
+        css_host = (css_parsed.hostname or "").lower()
+        # Keep only same-host HTTPS stylesheets to block third-party CSS exfiltration beacons
+        if css_parsed.scheme != "https" or not css_host or (page_host and css_host != page_host):
+            link.decompose()
+        else:
+            link["href"] = abs_css
 
     for tag in soup.find_all(True):
         if not isinstance(tag, Tag):
@@ -296,41 +677,56 @@ def sanitize_soup(soup: BeautifulSoup, final_url: str, rewrite_link_fn: Callable
             low = attr.lower()
             val = tag.attrs.get(attr)
             val_str = " ".join(val) if isinstance(val, list) else str(val or "")
-            if low.startswith("on") or low == "srcdoc":
+            if low.startswith("on") or low in ("srcdoc", "ping", "srcset", "imagesrcset", "dynsrc", "lowsrc", "background"):
                 del tag.attrs[attr]
                 continue
-            if low in ("href", "src", "action", "formaction", "xlink:href", "poster"):
-                normalized_scheme = re.sub(r"[\x00-\x20]+", "", val_str).lower()
-                if normalized_scheme.startswith(
-                    (
-                        "javascript:",
-                        "vbscript:",
-                        "data:text/html",
-                        "data:image/svg",
-                        "data:application/",
-                    )
-                ):
+            if low == "style":
+                if _has_unsafe_css(val_str):
                     del tag.attrs[attr]
+                continue
+            if low in ("href", "src", "action", "formaction", "xlink:href", "poster"):
+                normalized_scheme = _SCHEME_WS_RE.sub("", val_str).lower()
+                if normalized_scheme.startswith(("javascript:", "vbscript:", "file:", "blob:")):
+                    del tag.attrs[attr]
+                elif normalized_scheme.startswith("data:"):
+                    if not (tag.name == "img" and low == "src" and _SAFE_IMG_DATA_RE.match(val_str.strip())):
+                        del tag.attrs[attr]
+                elif tag.name in ("img", "source", "video") and low in ("src", "poster") and val_str.strip():
+                    # Resolve relative media URLs to absolute https:// since /v1/web CSP sets base-uri 'none'
+                    abs_media = urljoin(final_url, val_str.strip())
+                    if abs_media.lower().startswith("https://"):
+                        tag.attrs[attr] = abs_media
+                    else:
+                        del tag.attrs[attr]
 
-        if tag.name == "a" and tag.get("href"):
-            href_val = str(tag.get("href")).strip()
-            if not href_val.startswith("#") and not href_val.lower().startswith("mailto:"):
+        if tag.name == "a":
+            if "target" in tag.attrs:
+                del tag.attrs["target"]
+            raw_href = tag.get("href")
+            if raw_href:
+                href_val = str(raw_href).strip()
+                if href_val.startswith("#") or href_val.lower().startswith("mailto:"):
+                    continue
                 abs_target = urljoin(final_url, href_val)
-                if abs_target.startswith(("http://", "https://")):
+                if abs_target.lower().startswith(("http://", "https://")):
                     tag["href"] = rewrite_link_fn(abs_target)
                     tag["target"] = "_top"
+                    tag["rel"] = "noopener noreferrer"
+                else:
+                    del tag.attrs["href"]
 
-    if soup.head is None:
+    head_tag: Tag | None = soup.head
+    if head_tag is None:
         head_tag = soup.new_tag("head")
         if soup.html:
             soup.html.insert(0, head_tag)
         else:
             soup.insert(0, head_tag)
 
-    for existing_base in soup.head.find_all("base"):
+    for existing_base in head_tag.find_all("base"):
         existing_base.decompose()
     base_tag = soup.new_tag("base", href=final_url)
-    soup.head.insert(0, base_tag)
+    head_tag.insert(0, base_tag)
 
 
 def translate_web_page(
@@ -369,7 +765,8 @@ def translate_web_page(
         q_url = quote(abs_url, safe="")
         q_mode = quote(f"{req_src}-{target_lang}", safe="")
         tid_part = f"&titleId={quote(title_id, safe='')}" if title_id else ""
-        return f"{viewer_route_prefix}?url={q_url}&mode={q_mode}{tid_part}"
+        view_part = "&view=site" if view in ("site", "translated") else ""
+        return f"{viewer_route_prefix}?url={q_url}&mode={q_mode}{tid_part}{view_part}"
 
     sanitize_soup(soup, page.final_url, _rewrite_link)
 
@@ -479,6 +876,7 @@ def translate_web_page(
         "finalUrl": page.final_url,
         "host": page.host,
         "isAozora": is_aozora_page,
+        "detectedSource": eff_src,
         "titleSrc": raw_title,
         "titleDst": title_dst,
         "excerptSrc": excerpt_src,

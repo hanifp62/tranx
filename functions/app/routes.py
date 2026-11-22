@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import concurrent.futures
+import contextvars
 import json
+import logging
 import os
+import re
 import secrets
 import tempfile
 import threading
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
@@ -16,12 +22,16 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from flask import Flask, Response, jsonify, request, stream_with_context
+from werkzeug.exceptions import HTTPException
 
 from tranx_core import (
     JPTRANS_VERSION,
     SUPPORTED_MODES,
     SUPPORTED_UI_LANGS,
+    AllEnginesFailed,
+    AppSettings,
     DailyCapExceeded,
+    EngineError,
     FirestoreGlossary,
     GeminiSpeechTranscriber,
     GeminiVisionExtractor,
@@ -33,13 +43,16 @@ from tranx_core import (
     WebGateBlockedError,
     build_engine_chain,
     chat_config,
+    effective_settings_for_key_source,
     export_translated_document,
+    fetch_image_safely,
     fetch_url_safely,
     inspect_zip_archive,
     lookup_new_names_for_text,
     parse_aozora,
+    parse_mode_pair,
     parse_mode_target,
-    read_document,
+    read_document_safely,
     read_text,
     rebuild_translated_document_from_paras,
     stream_document_chunks,
@@ -49,11 +62,54 @@ from tranx_core import (
     translate_image_bytes,
     translate_web_page,
 )
+from tranx_core.doc_readers import read_docx_document
+from tranx_core.speech_stt import ALLOWED_SPEECH_LANGS
 
-from .store import AuthError, CURRENT_USER_UID, Repository, get_current_uid, scoped_user_uid
+from .store import (
+    CURRENT_USER_UID,
+    AuthError,
+    Repository,
+    get_current_uid,
+    scoped_user_uid,
+    validate_doc_id,
+)
 
 MAX_STORAGE_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 MAX_HTTP_PAYLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
+MAX_SPEECH_UPLOAD_BYTES = 4 * 1024 * 1024  # 4 MB
+ALLOWED_RESUME_SUFFIXES = frozenset({".txt", ".epub", ".pdf", ".docx", ".srt", ".ass", ".ssa", ".vtt", ".md", ".html", ".htm", ".xhtml"})
+ALLOWED_TONE_OVERRIDES = frozenset({"auto", "novel", "casual", "formal"})
+_API_LOGGER = logging.getLogger("tranx.api")
+_BG_CACHE_LOCK = threading.Lock()
+_BG_SHARED_CACHES: weakref.WeakKeyDictionary[Any, LayeredTranslationCache] = weakref.WeakKeyDictionary()
+_SAFE_CSP_HOST_RE = re.compile(r"^[a-z0-9.-]{1,253}$")
+
+
+def _resolve_effective_settings(repo: Repository) -> tuple[AppSettings, str | None, str]:
+    api_key, key_source = repo.get_api_key()
+    settings = effective_settings_for_key_source(repo.get_settings(), key_source)
+    return settings, api_key, key_source
+
+
+def _public_app_origin() -> str:
+    raw = (os.environ.get("TRANX_PUBLIC_ORIGIN") or "https://tranx-hanif-id.web.app").strip().rstrip("/")
+    parsed = urlsplit(raw)
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return "https://tranx-hanif-id.web.app"
+
+
+def _get_bg_shared_cache(repo: Repository) -> LayeredTranslationCache:
+    store = repo.cache_store
+    with _BG_CACHE_LOCK:
+        try:
+            cached = _BG_SHARED_CACHES.get(store)
+            if cached is None:
+                cached = LayeredTranslationCache(store, namespace_fn=get_current_uid)
+                _BG_SHARED_CACHES[store] = cached
+            return cached
+        except TypeError:
+            return LayeredTranslationCache(store, namespace_fn=get_current_uid)
 
 
 class _RepoUsageAdapter:
@@ -158,6 +214,7 @@ def create_flask_app(
     vision_extractor_factory: Callable[[str], VisionExtractor] | None = None,
     speech_transcriber_factory: Callable[[str], SpeechTranscriber] | None = None,
     web_fetcher: Any = fetch_url_safely,
+    image_fetcher: Any = fetch_image_safely,
     rate_limit_rpm: int = 120,
     auth_rate_limit_rpm: int = 15,
 ) -> Flask:
@@ -169,15 +226,60 @@ def create_flask_app(
         default_rpm=rate_limit_rpm,
         auth_rpm=auth_rate_limit_rpm,
     )
+    media_proxy_limiter = _SlidingWindowRateLimiter(
+        default_rpm=30,
+        auth_rpm=15,
+    )
+    media_proxy_semaphore = threading.BoundedSemaphore(4)
 
     @app.teardown_request
     def _reset_user_context(_exc: Any = None) -> None:
-        CURRENT_USER_UID.set("owner-1")
+        CURRENT_USER_UID.set("")
+
+    def _get_request_id() -> str:
+        existing = request.environ.get("tranx.request_id")
+        if isinstance(existing, str) and existing:
+            return existing
+        tp = (request.headers.get("traceparent") or "").strip()
+        if tp:
+            parts = tp.split("-")
+            if len(parts) >= 2 and re.fullmatch(r"[0-9a-fA-F]{16,32}", parts[1]):
+                rid = parts[1].lower()
+                request.environ["tranx.request_id"] = rid
+                return rid
+        raw_hdr = (request.headers.get("X-Request-Id") or "").strip()
+        if raw_hdr and re.fullmatch(r"[A-Za-z0-9_.:-]{6,64}", raw_hdr):
+            request.environ["tranx.request_id"] = raw_hdr
+            return raw_hdr
+        rid = secrets.token_hex(8)
+        request.environ["tranx.request_id"] = rid
+        return rid
 
     @app.before_request
     def _handle_options_and_rate_limit() -> Any:
+        rid = _get_request_id()
         if request.method == "OPTIONS":
             return "", 204
+        # Fetch Metadata + Origin CSRF defense on browser state-changing calls
+        # (preserves non-browser X-Inbox-Token webhooks on /v1/inbox)
+        if request.method in ("POST", "DELETE", "PUT", "PATCH"):
+            is_inbox_webhook = request.path == "/v1/inbox" and bool(request.headers.get("X-Inbox-Token"))
+            sec_fetch_site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            origin = (request.headers.get("Origin") or "").strip().rstrip("/").lower()
+            allowed_origins_lc = {o.lower() for o in _allowed_origins()}
+            if not is_inbox_webhook and (sec_fetch_site == "cross-site" or bool(origin)) and origin not in allowed_origins_lc:
+                return (
+                    jsonify(
+                        {
+                            "error": {
+                                "code": "CSRF_BLOCKED",
+                                "message": "Permintaan lintas situs ditolak demi keamanan.",
+                                "requestId": rid,
+                            }
+                        }
+                    ),
+                    403,
+                )
         if request.path == "/v1/healthz":
             return None
         client_ip = _extract_client_ip()
@@ -203,6 +305,7 @@ def create_flask_app(
                         "code": "RATE_LIMITED",
                         "message": "Terlalu banyak permintaan dalam waktu singkat. Coba lagi sebentar.",
                         "retryAfter": retry_after,
+                        "requestId": rid,
                     }
                 }
             )
@@ -225,13 +328,20 @@ def create_flask_app(
             )
         resp.headers["Vary"] = "Origin"
         resp.headers.setdefault(
-            "Access-Control-Allow-Headers", "Authorization, Content-Type, X-Inbox-Token"
+            "Access-Control-Allow-Headers", "Authorization, Content-Type, X-Inbox-Token, X-Request-Id, traceparent"
         )
         resp.headers.setdefault(
             "Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"
         )
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
         resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        resp.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")
+        resp.headers.setdefault("X-Request-Id", _get_request_id())
+        if request.path.startswith("/v1/"):
+            resp.headers.setdefault("Cache-Control", "no-store")
+            resp.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
         if "tranx.rl_limit" in request.environ:
             resp.headers.setdefault("X-RateLimit-Limit", request.environ["tranx.rl_limit"])
             resp.headers.setdefault("X-RateLimit-Remaining", request.environ["tranx.rl_remaining"])
@@ -239,19 +349,19 @@ def create_flask_app(
 
     @app.errorhandler(AuthError)
     def _handle_auth_error(err: AuthError) -> tuple[Response, int]:
-        return jsonify({"error": {"code": err.code, "message": err.message}}), err.status
+        return jsonify({"error": {"code": err.code, "message": err.message, "requestId": _get_request_id()}}), err.status
 
     @app.errorhandler(SSRFBlockedError)
     def _handle_ssrf_error(err: SSRFBlockedError) -> tuple[Response, int]:
-        return jsonify({"error": {"code": "BLOCKED_URL", "message": str(err)}}), 403
+        return jsonify({"error": {"code": "BLOCKED_URL", "message": str(err), "requestId": _get_request_id()}}), 403
 
     @app.errorhandler(WebGateBlockedError)
     def _handle_gate_error(err: WebGateBlockedError) -> tuple[Response, int]:
-        return jsonify({"error": {"code": "SITE_GATE", "message": str(err)}}), 422
+        return jsonify({"error": {"code": "SITE_GATE", "message": str(err), "requestId": _get_request_id()}}), 422
 
     @app.errorhandler(InputError)
     def _handle_input_error(err: InputError) -> tuple[Response, int]:
-        return jsonify({"error": {"code": "INVALID_INPUT", "message": str(err)}}), 400
+        return jsonify({"error": {"code": "INVALID_INPUT", "message": str(err), "requestId": _get_request_id()}}), 400
 
     @app.errorhandler(413)
     def _handle_payload_too_large(_err: Any) -> tuple[Response, int]:
@@ -261,6 +371,7 @@ def create_flask_app(
                     "error": {
                         "code": "PAYLOAD_TOO_LARGE",
                         "message": "Ukuran muatan permintaan melebihi batas aman 25 MB.",
+                        "requestId": _get_request_id(),
                     }
                 }
             ),
@@ -277,10 +388,61 @@ def create_flask_app(
                         "message": "Batas pemakaian harian tercapai.",
                         "charsUsed": err.chars_used,
                         "charCap": err.char_cap,
+                        "requestId": _get_request_id(),
                     }
                 }
             ),
             429,
+        )
+
+    @app.errorhandler(AllEnginesFailed)
+    @app.errorhandler(EngineError)
+    def _handle_engine_error(err: Exception) -> tuple[Response, int]:
+        rid = _get_request_id()
+        _API_LOGGER.warning("Upstream engine failure [%s]: %s", rid, type(err).__name__)
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "code": "ENGINE_UNAVAILABLE",
+                        "message": "Layanan mesin terjemahan sedang sibuk atau tidak dapat dijangkau. Coba lagi sebentar.",
+                        "requestId": rid,
+                    }
+                }
+            ),
+            503,
+        )
+
+    @app.errorhandler(Exception)
+    def _handle_unexpected_error(err: Exception) -> tuple[Response, int]:
+        rid = _get_request_id()
+        if isinstance(err, HTTPException):
+            status_code = int(err.code or 500)
+            code_name = "NOT_FOUND" if status_code == 404 else ("METHOD_NOT_ALLOWED" if status_code == 405 else "HTTP_ERROR")
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "code": code_name,
+                            "message": str(err.description or err.name),
+                            "requestId": rid,
+                        }
+                    }
+                ),
+                status_code,
+            )
+        _API_LOGGER.exception("Unhandled API error [%s]: %s", rid, type(err).__name__)
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "code": "INTERNAL_ERROR",
+                        "message": "Terjadi kesalahan internal server.",
+                        "requestId": rid,
+                    }
+                }
+            ),
+            500,
         )
 
     @app.route("/v1/<path:_any>", methods=["OPTIONS"])
@@ -301,8 +463,7 @@ def create_flask_app(
     @app.get("/v1/meta")
     def get_meta() -> Response:
         _require_owner()
-        settings = repo.get_settings()
-        _, key_source = repo.get_api_key()
+        settings, _, key_source = _resolve_effective_settings(repo)
         return jsonify(
             {
                 "modes": list(SUPPORTED_MODES),
@@ -334,8 +495,7 @@ def create_flask_app(
     @app.post("/v1/engine:check")
     def check_engines() -> Response:
         _require_owner()
-        settings = repo.get_settings()
-        api_key, _ = repo.get_api_key()
+        settings, api_key, _ = _resolve_effective_settings(repo)
         cfg = chat_config(settings, "id")
         engines = build_engine_chain(
             cfg,
@@ -345,21 +505,43 @@ def create_flask_app(
             transport=llm_transport,
         )
         sample_sentences = ["おはようございます。", "千早は小さく笑った。", "次の駅で降ります。"]
-        report: list[dict[str, Any]] = []
-        status_map: dict[str, Any] = {}
+        pairs = list(zip(engines, settings.llm_models))
 
-        for eng, model_name in zip(engines, settings.llm_models):
+        def _probe_one(item: tuple[Any, str]) -> tuple[str, dict[str, Any], dict[str, Any]]:
+            eng, model_name = item
             t0 = time.monotonic()
             try:
                 out = eng.translate(sample_sentences, "ja", "id")
                 ms = round((time.monotonic() - t0) * 1000)
-                row = {"model": model_name, "ok": True, "ms": ms, "sample": " ".join(out)}
-                status_map[model_name] = {"ok": True, "lastError": None, "ms": ms}
+                return (
+                    model_name,
+                    {"model": model_name, "ok": True, "ms": ms, "sample": " ".join(out)},
+                    {"ok": True, "lastError": None, "ms": ms},
+                )
             except Exception as exc:
                 ms = round((time.monotonic() - t0) * 1000)
-                row = {"model": model_name, "ok": False, "ms": ms, "error": str(exc)}
-                status_map[model_name] = {"ok": False, "lastError": str(exc), "ms": ms}
-            report.append(row)
+                _API_LOGGER.warning("Model health probe failed (%s): %s", model_name, type(exc).__name__)
+                safe_err = f"Model tidak merespons ({type(exc).__name__})"
+                return (
+                    model_name,
+                    {"model": model_name, "ok": False, "ms": ms, "error": safe_err},
+                    {"ok": False, "lastError": safe_err, "ms": ms},
+                )
+
+        report: list[dict[str, Any]] = []
+        status_map: dict[str, Any] = {}
+        if len(pairs) > 1 and llm_transport is None:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(pairs))) as pool:
+                futs = [pool.submit(contextvars.copy_context().run, _probe_one, p) for p in pairs]
+                for fut in futs:
+                    model_name, row, st_row = fut.result()
+                    report.append(row)
+                    status_map[model_name] = st_row
+        else:
+            for p in pairs:
+                model_name, row, st_row = _probe_one(p)
+                report.append(row)
+                status_map[model_name] = st_row
 
         repo.update_engine_status(status_map)
         return jsonify({"models": report})
@@ -369,17 +551,33 @@ def create_flask_app(
         claims = _require_owner()
         user_uid = str(claims["uid"])
         body = request.get_json(silent=True) or {}
-        cid = str(body.get("cid") or f"c_{secrets.token_hex(6)}").strip()
-        user_mid = str(body.get("clientMsgId") or f"m_{secrets.token_hex(6)}_u").strip()
-        asst_mid = f"{user_mid}_r"
+        cid = validate_doc_id(str(body.get("cid") or f"c_{secrets.token_hex(6)}"), "cid")
+        user_mid = validate_doc_id(str(body.get("clientMsgId") or f"m_{secrets.token_hex(6)}_u"), "clientMsgId")
+        asst_mid = validate_doc_id(f"{user_mid}_r", "clientMsgId")
         mode = str(body.get("mode") or "ja-id").strip()
         text = str(body.get("text") or "")
+        clean_text = text.strip()
+        if not clean_text:
+            raise InputError("Teks masukan kosong.")
+        raw_tone = str(body.get("tone") or "auto").strip().lower()
+        tone = raw_tone if raw_tone in ALLOWED_TONE_OVERRIDES else "auto"
         requested_title_id = body.get("titleId")
+        if requested_title_id is not None and str(requested_title_id).strip():
+            requested_title_id = validate_doc_id(str(requested_title_id), "titleId")
         inbox_id = body.get("inboxId")
+        if inbox_id is not None and str(inbox_id).strip():
+            inbox_id = validate_doc_id(str(inbox_id), "inboxId")
 
-        settings = repo.get_settings()
-        api_key, _ = repo.get_api_key()
-        first_line = (text.strip().splitlines() or ["Percakapan"])[0][:80]
+        settings, api_key, _ = _resolve_effective_settings(repo)
+        if len(clean_text) > settings.chat_max_chars:
+            raise InputError(f"Teks melampaui batas {settings.chat_max_chars} karakter untuk obrolan cepat.")
+        parse_mode_pair(
+            mode,
+            sample_text=clean_text,
+            default_source=settings.default_source,
+            default_target=settings.default_target,
+        )
+        first_line = (clean_text.splitlines() or ["Percakapan"])[0][:80]
         tid, title_name, style = repo.ensure_title(requested_title_id, first_line, kind="lepas")
         glossary = FirestoreGlossary.load_from_backend(
             tid, repo.glossary_backend, fallback_title=title_name
@@ -403,6 +601,7 @@ def create_flask_app(
                 "text": text,
                 "state": "done",
             },
+            is_new=True,
         )
         if inbox_id:
             repo.delete_inbox_item(str(inbox_id))
@@ -425,6 +624,7 @@ def create_flask_app(
                 api_key=api_key,
                 usage_tracker=usage_adapter,
                 llm_transport=llm_transport,
+                tone_override=tone,
             ):
                 if ev["type"] == "meta":
                     ev = {**ev, "cid": cid, "mid": asst_mid, "titleId": tid}
@@ -482,7 +682,7 @@ def create_flask_app(
         return Response(
             stream_with_context(_bind_stream(user_uid, _generate())),
             mimetype="application/x-ndjson",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={"Cache-Control": "no-store, no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.post("/v1/names:lookup")
@@ -503,8 +703,7 @@ def create_flask_app(
         if not raw_text:
             return jsonify({"entries": []})
 
-        settings = repo.get_settings()
-        api_key, _ = repo.get_api_key()
+        settings, api_key, _ = _resolve_effective_settings(repo)
         tid, title_name, style = repo.ensure_title(title_id, "Percakapan")
         glossary = FirestoreGlossary.load_from_backend(
             tid, repo.glossary_backend, fallback_title=title_name
@@ -529,14 +728,15 @@ def create_flask_app(
         uploaded = request.files.get("audio")
         if uploaded is None:
             return jsonify({"error": {"code": "MISSING_AUDIO", "message": "Berkas audio belum dilampirkan."}}), 400
-        audio_bytes = uploaded.read()
-        if len(audio_bytes) > 4 * 1024 * 1024:
+        audio_bytes = uploaded.read(MAX_SPEECH_UPLOAD_BYTES + 1)
+        if len(audio_bytes) > MAX_SPEECH_UPLOAD_BYTES:
             return jsonify({"error": {"code": "AUDIO_TOO_LARGE", "message": "Ukuran klip suara maksimal 4 MB."}}), 413
 
         mime = uploaded.mimetype or "audio/webm"
-        lang = str(request.form.get("lang") or "ja-JP")
-        settings = repo.get_settings()
-        api_key, _ = repo.get_api_key()
+        lang = str(request.form.get("lang") or "ja-JP").strip()
+        if lang not in ALLOWED_SPEECH_LANGS:
+            raise InputError(f"Kode bahasa dikte tidak didukung: {lang!r}")
+        settings, api_key, _ = _resolve_effective_settings(repo)
         factory = speech_transcriber_factory or (lambda k: GeminiSpeechTranscriber(k))
         transcriber = factory(api_key or "")
         result = transcribe_short_audio(
@@ -553,10 +753,12 @@ def create_flask_app(
     def post_image_translate() -> Response:
         _require_owner()
         body = request.get_json(silent=True) or {}
-        cid = str(body.get("cid") or f"c_{secrets.token_hex(6)}").strip()
-        mid = str(body.get("clientMsgId") or f"img_{secrets.token_hex(6)}").strip()
+        cid = validate_doc_id(str(body.get("cid") or f"c_{secrets.token_hex(6)}"), "cid")
+        mid = validate_doc_id(str(body.get("clientMsgId") or f"img_{secrets.token_hex(6)}"), "clientMsgId")
         mode = str(body.get("mode") or "ja-id").strip()
         title_id = body.get("titleId")
+        if title_id is not None and str(title_id).strip():
+            title_id = validate_doc_id(str(title_id), "titleId")
         file_name = str(body.get("fileName") or "gambar.png")
 
         storage_path = body.get("storagePath")
@@ -564,13 +766,17 @@ def create_flask_app(
         if storage_path:
             image_bytes = repo.read_storage_blob(str(storage_path))
         elif isinstance(image_b64, str) and image_b64.strip():
-            raw_b64 = image_b64.split(",", 1)[-1]
-            image_bytes = base64.b64decode(raw_b64)
+            raw_b64 = image_b64.split(",", 1)[-1].strip()
+            if len(raw_b64) > int(20 * 1024 * 1024 * 4 / 3) + 16:
+                raise InputError("Ukuran gambar terlalu besar.")
+            try:
+                image_bytes = base64.b64decode(raw_b64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise InputError("Format base64 gambar tidak sah.") from exc
         else:
             raise InputError("Sertakan storagePath atau imageB64 untuk menerjemahkan gambar.")
 
-        settings = repo.get_settings()
-        api_key, _ = repo.get_api_key()
+        settings, api_key, _ = _resolve_effective_settings(repo)
         tid, title_name, style = repo.ensure_title(title_id, file_name, kind="komik")
         glossary = FirestoreGlossary.load_from_backend(
             tid, repo.glossary_backend, fallback_title=title_name
@@ -618,14 +824,17 @@ def create_flask_app(
         claims = _require_owner()
         user_uid = str(claims["uid"])
         body = request.get_json(silent=True) or {}
-        cid = str(body.get("cid") or f"c_{secrets.token_hex(6)}").strip()
-        mid = str(body.get("clientMsgId") or f"doc_{secrets.token_hex(6)}").strip()
+        cid = validate_doc_id(str(body.get("cid") or f"c_{secrets.token_hex(6)}"), "cid")
+        mid = validate_doc_id(str(body.get("clientMsgId") or f"doc_{secrets.token_hex(6)}"), "clientMsgId")
         mode = str(body.get("mode") or "ja-id").strip()
+        raw_tone = str(body.get("tone") or "auto").strip().lower()
+        tone = raw_tone if raw_tone in ALLOWED_TONE_OVERRIDES else "auto"
         source = body.get("source") or {}
         title_id = body.get("titleId")
+        if title_id is not None and str(title_id).strip():
+            title_id = validate_doc_id(str(title_id), "titleId")
 
-        settings = repo.get_settings()
-        api_key, _ = repo.get_api_key()
+        settings, api_key, _ = _resolve_effective_settings(repo)
 
         if isinstance(source.get("aozoraUrl"), str) and source["aozoraUrl"].strip():
             aozora_url = source["aozoraUrl"].strip()
@@ -640,6 +849,14 @@ def create_flask_app(
                 raise InputError(f"Teks melebihi batas {settings.long_max_chars} karakter.")
             doc_label = raw_text.splitlines()[0][:80]
             doc = read_text(raw_text, doc_label)
+
+        sample_long = "\n".join(p.text for p in doc.paragraphs[:6])
+        parse_mode_pair(
+            mode,
+            sample_text=sample_long,
+            default_source=settings.default_source,
+            default_target=settings.default_target,
+        )
 
         tid, title_name, style = repo.ensure_title(title_id, doc_label, kind="novel")
         glossary = FirestoreGlossary.load_from_backend(
@@ -669,8 +886,8 @@ def create_flask_app(
             },
         )
 
-        def _save_para_cb(idx: int, para_payload: dict[str, Any]) -> None:
-            repo.save_para(cid, mid, idx, para_payload)
+        def _save_chunk_cb(rows: list[tuple[int, dict[str, Any]]], _done: int) -> None:
+            repo.save_paras_batch(cid, mid, rows)
 
         def _stream() -> Any:
             final_state = "done"
@@ -681,11 +898,12 @@ def create_flask_app(
                 settings=settings,
                 glossary=glossary,
                 cache=shared_cache,
-                on_para_saved=_save_para_cb,
+                on_chunk_saved=_save_chunk_cb,
                 style=style,
                 api_key=api_key,
                 usage_tracker=usage_adapter,
                 llm_transport=llm_transport,
+                tone_override=tone,
             ):
                 if ev["type"] == "meta":
                     ev = {**ev, "cid": cid, "mid": mid, "titleId": tid}
@@ -706,7 +924,7 @@ def create_flask_app(
         return Response(
             stream_with_context(_bind_stream(user_uid, _stream())),
             mimetype="application/x-ndjson",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={"Cache-Control": "no-store, no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.post("/v1/translate:resume")
@@ -729,12 +947,21 @@ def create_flask_app(
             storage_in = job.get("storageInputPath") or job.get("storagePath")
             if storage_in:
                 blob_bytes = repo.read_storage_blob(str(storage_in))
-                suffix = Path(str(job.get("fileName") or "berkas.txt")).suffix or ".txt"
+                if len(blob_bytes) > MAX_STORAGE_UPLOAD_BYTES:
+                    raise InputError("Ukuran berkas melebihi batas aman 50 MB.")
+                raw_suffix = Path(str(job.get("fileName") or "berkas.txt")).suffix.lower()
+                suffix = raw_suffix if raw_suffix in ALLOWED_RESUME_SUFFIXES else ".txt"
                 with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
                     tf.write(blob_bytes)
                     tmp_path = Path(tf.name)
                 try:
-                    doc = read_document(tmp_path, title=str(job.get("fileName") or "Dokumen"))
+                    if suffix == ".docx":
+                        inspect_zip_archive(tmp_path)
+                        doc = read_docx_document(tmp_path, title=str(job.get("fileName") or "Dokumen"), already_validated=True)
+                    else:
+                        if suffix == ".epub":
+                            inspect_zip_archive(tmp_path)
+                        doc = read_document_safely(tmp_path, title=str(job.get("fileName") or "Dokumen"))
                 finally:
                     tmp_path.unlink(missing_ok=True)
             else:
@@ -744,15 +971,14 @@ def create_flask_app(
                 raise InputError("Teks sumber untuk dilanjutkan tidak tersedia.")
             doc = read_text(raw_src, "Lanjutan")
 
-        settings = repo.get_settings()
-        api_key, _ = repo.get_api_key()
+        settings, api_key, _ = _resolve_effective_settings(repo)
         tid, title_name, style = repo.ensure_title(tid or None, doc.title)
         glossary = FirestoreGlossary.load_from_backend(
             tid, repo.glossary_backend, fallback_title=title_name
         )
 
-        def _save_para_cb(idx: int, para_payload: dict[str, Any]) -> None:
-            repo.save_para(cid, mid, idx, para_payload)
+        def _save_chunk_cb(rows: list[tuple[int, dict[str, Any]]], _done: int) -> None:
+            repo.save_paras_batch(cid, mid, rows)
 
         def _stream() -> Any:
             final_state = "done"
@@ -764,7 +990,7 @@ def create_flask_app(
                 glossary=glossary,
                 cache=shared_cache,
                 existing_paras=existing_paras,
-                on_para_saved=_save_para_cb,
+                on_chunk_saved=_save_chunk_cb,
                 style=style,
                 api_key=api_key,
                 usage_tracker=usage_adapter,
@@ -779,7 +1005,7 @@ def create_flask_app(
         return Response(
             stream_with_context(_bind_stream(user_uid, _stream())),
             mimetype="application/x-ndjson",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={"Cache-Control": "no-store, no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.get("/v1/messages/<mid>/export")
@@ -832,25 +1058,32 @@ def create_flask_app(
             rebuilt, fmt, bilingual=bilingual, theme=theme
         )
         inline = str(request.args.get("inline") or "") in ("1", "true")
-        disp = "inline" if inline else f'attachment; filename="tranx-{mid}.{ext}"'
+        safe_mid = re.sub(r"[^A-Za-z0-9_-]", "", mid)[:64] or "export"
+        disp = "inline" if inline else f'attachment; filename="tranx-{safe_mid}.{ext}"'
+        export_headers = {"Content-Disposition": disp, "Content-Type": ctype}
+        if ctype.startswith("text/html"):
+            export_headers["Content-Security-Policy"] = (
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; object-src 'none'; base-uri 'none';"
+            )
         return Response(
             out_bytes,
             mimetype=ctype.split(";", 1)[0],
-            headers={"Content-Disposition": disp, "Content-Type": ctype},
+            headers=export_headers,
         )
 
     @app.post("/v1/links:preview")
     def post_links_preview() -> Response:
         _require_owner()
         body = request.get_json(silent=True) or {}
-        cid = str(body.get("cid") or f"c_{secrets.token_hex(6)}").strip()
-        mid = str(body.get("clientMsgId") or f"lnk_{secrets.token_hex(6)}").strip()
+        cid = validate_doc_id(str(body.get("cid") or f"c_{secrets.token_hex(6)}"), "cid")
+        mid = validate_doc_id(str(body.get("clientMsgId") or f"lnk_{secrets.token_hex(6)}"), "clientMsgId")
         mode = str(body.get("mode") or "ja-id").strip()
         url = str(body.get("url") or "").strip()
         title_id = body.get("titleId")
+        if title_id is not None and str(title_id).strip():
+            title_id = validate_doc_id(str(title_id), "titleId")
 
-        settings = repo.get_settings()
-        api_key, _ = repo.get_api_key()
+        settings, api_key, _ = _resolve_effective_settings(repo)
         host_hint = urlsplit(url).hostname or "Tautan Web"
         tid, title_name, style = repo.ensure_title(title_id, host_hint, kind="web")
         glossary = FirestoreGlossary.load_from_backend(
@@ -871,6 +1104,8 @@ def create_flask_app(
             usage_tracker=usage_adapter,
             llm_transport=llm_transport,
         )
+        locked_raw = web_res.get("lockedNames")
+        locked_count = len(locked_raw) if isinstance(locked_raw, list) else int(locked_raw or 0)
         preview_payload = {
             "mid": mid,
             "cid": cid,
@@ -883,7 +1118,7 @@ def create_flask_app(
             "excerptSrc": web_res["excerptSrc"],
             "excerptDst": web_res["excerptDst"],
             "paragraphCount": web_res["paragraphCount"],
-            "lockedNames": web_res["lockedNames"],
+            "lockedNames": locked_count,
             "readerSupported": True,
         }
         repo.ensure_conversation(
@@ -908,6 +1143,54 @@ def create_flask_app(
         )
         return jsonify(preview_payload)
 
+    @app.get("/v1/media:proxy")
+    def get_media_proxy() -> Response | tuple[Response, int]:
+        _require_owner()
+        client_ip = _extract_client_ip()
+        ok_rl, _, _, retry_after = media_proxy_limiter.check(f"media:{client_ip}", is_auth=False)
+        if not ok_rl:
+            resp = jsonify(
+                {
+                    "error": {
+                        "code": "RATE_LIMITED",
+                        "message": "Terlalu banyak permintaan gambar dalam waktu singkat. Coba lagi sebentar.",
+                        "retryAfter": retry_after,
+                    }
+                }
+            )
+            resp.headers["Retry-After"] = str(retry_after)
+            return resp, 429
+        url = str(request.args.get("url") or "").strip()
+        if not url:
+            raise InputError("Sertakan parameter url gambar.")
+        if not media_proxy_semaphore.acquire(blocking=False):
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "code": "PROXY_BUSY",
+                            "message": "Antrean pengunduhan gambar sedang penuh. Coba lagi sebentar.",
+                        }
+                    }
+                ),
+                503,
+            )
+        try:
+            fetched = image_fetcher(url)
+        finally:
+            media_proxy_semaphore.release()
+        return Response(
+            fetched.data,
+            mimetype=fetched.content_type,
+            headers={
+                "Content-Type": fetched.content_type,
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, max-age=600, no-transform",
+                "Cross-Origin-Resource-Policy": "cross-origin",
+                "Content-Security-Policy": "default-src 'none'; sandbox;",
+            },
+        )
+
     @app.get("/v1/web")
     def get_translated_web() -> Response:
         _require_owner()
@@ -916,8 +1199,7 @@ def create_flask_app(
         title_id = request.args.get("titleId")
         view = str(request.args.get("view") or "translated").strip().lower()
 
-        settings = repo.get_settings()
-        api_key, _ = repo.get_api_key()
+        settings, api_key, _ = _resolve_effective_settings(repo)
         host_hint = urlsplit(url).hostname or "Tautan Web"
         tid, title_name, style = repo.ensure_title(title_id, host_hint, kind="web")
         glossary = FirestoreGlossary.load_from_backend(
@@ -936,13 +1218,20 @@ def create_flask_app(
             api_key=api_key,
             usage_tracker=usage_adapter,
             llm_transport=llm_transport,
+            viewer_route_prefix=f"{_public_app_origin()}/web",
+        )
+        final_host = (urlsplit(str(web_res.get("finalUrl") or "")).hostname or "").lower()
+        style_src = (
+            f"style-src 'unsafe-inline' https://{final_host}"
+            if final_host and _SAFE_CSP_HOST_RE.fullmatch(final_host)
+            else "style-src 'unsafe-inline'"
         )
         return Response(
             web_res["html"],
             mimetype="text/html",
             headers={
                 "Content-Type": "text/html; charset=utf-8",
-                "Content-Security-Policy": "sandbox allow-forms allow-same-origin; script-src 'none'; object-src 'none';",
+                "Content-Security-Policy": f"sandbox allow-top-navigation-by-user-activation; default-src 'none'; {style_src}; img-src https: data:; script-src 'none'; object-src 'none'; base-uri 'none';",
             },
         )
 
@@ -1043,40 +1332,75 @@ def _process_uploaded_document_blob_scoped(
     object_name: str,
     llm_transport: Any = None,
 ) -> dict[str, Any]:
+    job_id = validate_doc_id(job_id, "jobId")
     job = repo.get_job(job_id) or {}
-    cid = str(job.get("cid") or f"c_{job_id}")
-    mid = str(job.get("mid") or f"m_{job_id}")
+    cid = validate_doc_id(str(job.get("cid") or f"c_{job_id}"), "cid")
+    mid = validate_doc_id(str(job.get("mid") or f"m_{job_id}"), "mid")
     mode = str(job.get("mode") or "ja-id")
     title_id = job.get("titleId")
-
-    raw_bytes = repo.read_storage_blob(object_name)
-    if len(raw_bytes) > MAX_STORAGE_UPLOAD_BYTES:
-        repo.save_job(job_id, {"state": "error", "errorCode": "FILE_TOO_LARGE"})
-        return {"state": "error", "errorCode": "FILE_TOO_LARGE"}
-
-    suffix = Path(file_name).suffix.lower()
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
-        tf.write(raw_bytes)
-        tmp_path = Path(tf.name)
+    if title_id is not None and str(title_id).strip():
+        title_id = validate_doc_id(str(title_id), "titleId")
 
     try:
-        if suffix in (".epub", ".docx"):
-            inspect_zip_archive(tmp_path)
-        doc = read_document(tmp_path, title=Path(file_name).stem)
-    except Exception as exc:
-        repo.save_job(job_id, {"state": "error", "errorCode": "UNREADABLE_DOCUMENT", "message": str(exc)})
-        repo.save_message(cid, mid, {"role": "assistant", "kind": "document", "jobId": job_id, "state": "error", "error": str(exc)})
-        return {"state": "error", "message": str(exc)}
-    finally:
-        tmp_path.unlink(missing_ok=True)
+        repo.assert_uid_allowed(uid)
+    except AuthError as exc:
+        repo.save_job(job_id, {"state": "error", "errorCode": exc.code, "message": exc.message})
+        repo.save_message(cid, mid, {"role": "assistant", "kind": "document", "jobId": job_id, "state": "error", "error": exc.message})
+        return {"state": "error", "errorCode": exc.code, "message": exc.message}
 
-    settings = repo.get_settings()
-    api_key, _ = repo.get_api_key()
+    suffix = Path(file_name).suffix.lower()
+    if suffix not in ALLOWED_RESUME_SUFFIXES:
+        err_msg = f"Format dokumen {suffix or '(tanpa ekstensi)'} tidak didukung."
+        repo.save_job(job_id, {"state": "error", "errorCode": "UNSUPPORTED_FORMAT", "message": err_msg})
+        repo.save_message(cid, mid, {"role": "assistant", "kind": "document", "jobId": job_id, "state": "error", "error": err_msg})
+        return {"state": "error", "errorCode": "UNSUPPORTED_FORMAT", "message": err_msg}
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+            tmp_path = Path(tf.name)
+        dl_to_file = getattr(repo, "download_storage_blob_to_file", None)
+        if callable(dl_to_file):
+            dl_to_file(object_name, tmp_path, max_bytes=MAX_STORAGE_UPLOAD_BYTES)
+        else:
+            raw_bytes = repo.read_storage_blob(object_name)
+            if len(raw_bytes) > MAX_STORAGE_UPLOAD_BYTES:
+                raise InputError("FILE_TOO_LARGE")
+            tmp_path.write_bytes(raw_bytes)
+
+        if suffix == ".docx":
+            inspect_zip_archive(tmp_path)
+            doc = read_docx_document(tmp_path, title=Path(file_name).stem, already_validated=True)
+        else:
+            if suffix == ".epub":
+                inspect_zip_archive(tmp_path)
+            doc = read_document_safely(tmp_path, title=Path(file_name).stem)
+    except InputError as exc:
+        if str(exc) == "FILE_TOO_LARGE":
+            err_msg = "Ukuran berkas melebihi batas aman 50 MB."
+            repo.save_job(job_id, {"state": "error", "errorCode": "FILE_TOO_LARGE", "message": err_msg})
+            repo.save_message(cid, mid, {"role": "assistant", "kind": "document", "jobId": job_id, "state": "error", "error": err_msg})
+            return {"state": "error", "errorCode": "FILE_TOO_LARGE", "message": err_msg}
+        err_msg = str(exc)
+        repo.save_job(job_id, {"state": "error", "errorCode": "UNREADABLE_DOCUMENT", "message": err_msg})
+        repo.save_message(cid, mid, {"role": "assistant", "kind": "document", "jobId": job_id, "state": "error", "error": err_msg})
+        return {"state": "error", "message": err_msg}
+    except Exception as exc:
+        _API_LOGGER.exception("Document blob processing failed for %s: %s", job_id, type(exc).__name__)
+        err_msg = "Berkas dokumen tidak dapat dibaca atau diproses."
+        repo.save_job(job_id, {"state": "error", "errorCode": "UNREADABLE_DOCUMENT", "message": err_msg})
+        repo.save_message(cid, mid, {"role": "assistant", "kind": "document", "jobId": job_id, "state": "error", "error": err_msg})
+        return {"state": "error", "message": err_msg}
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+    settings, api_key, _ = _resolve_effective_settings(repo)
     tid, title_name, style = repo.ensure_title(title_id, Path(file_name).stem, kind="dokumen")
     glossary = FirestoreGlossary.load_from_backend(
         tid, repo.glossary_backend, fallback_title=title_name
     )
-    cache = LayeredTranslationCache(repo.cache_store)
+    cache = _get_bg_shared_cache(repo)
     usage_adapter = _RepoUsageAdapter(repo)
 
     repo.ensure_conversation(
@@ -1118,55 +1442,83 @@ def _process_uploaded_document_blob_scoped(
     )
 
     existing_paras = repo.list_paras(cid, mid)
+    persisted_mem: dict[int, dict[str, Any]] = dict(existing_paras)
 
     def _should_stop() -> bool:
         cur = repo.get_job(job_id) or {}
         return cur.get("state") == "stopped"
 
-    def _on_para(idx: int, payload: dict[str, Any]) -> None:
-        repo.save_para(cid, mid, idx, payload)
-        repo.save_job(job_id, {"doneParas": idx + 1, "totalParas": len(doc.paragraphs)})
+    def _on_chunk(rows: list[tuple[int, dict[str, Any]]], done_now: int) -> None:
+        repo.save_paras_batch(cid, mid, rows)
+        for p_idx, p_row in rows:
+            persisted_mem[p_idx] = p_row
+        repo.save_job(job_id, {"doneParas": done_now, "totalParas": len(doc.paragraphs)})
 
     final_state = "done"
     done_count = len(existing_paras)
-    for ev in stream_document_chunks(
-        doc=doc,
-        mode=mode,
-        settings=settings,
-        glossary=glossary,
-        cache=cache,
-        existing_paras=existing_paras,
-        on_para_saved=_on_para,
-        should_stop=_should_stop,
-        style=style,
-        api_key=api_key,
-        usage_tracker=usage_adapter,
-        llm_transport=llm_transport,
-    ):
-        if ev["type"] in ("done", "error"):
-            final_state = str(ev.get("state") or ("done" if ev["type"] == "done" else "error"))
-            done_count = int(ev.get("doneParas", done_count))
+    output_storage_path: str | None = None
+    try:
+        for ev in stream_document_chunks(
+            doc=doc,
+            mode=mode,
+            settings=settings,
+            glossary=glossary,
+            cache=cache,
+            existing_paras=existing_paras,
+            on_chunk_saved=_on_chunk,
+            should_stop=_should_stop,
+            style=style,
+            api_key=api_key,
+            usage_tracker=usage_adapter,
+            llm_transport=llm_transport,
+        ):
+            if ev["type"] in ("done", "error"):
+                final_state = str(ev.get("state") or ("done" if ev["type"] == "done" else "error"))
+                done_count = int(ev.get("doneParas", done_count))
 
-    output_storage_path = None
-    if final_state == "done":
-        target_lang = parse_mode_target(mode, settings.default_target)
-        out_fmt = suffix.lstrip(".")
-        if out_fmt in ("epub", "pdf", "htm", "xhtml"):
-            out_fmt = "html"
-        elif out_fmt == "ssa":
-            out_fmt = "ass"
-        rebuilt = rebuild_translated_document_from_paras(
-            title=title_name,
-            target_lang=target_lang,
-            fmt=doc.fmt,
-            stored_paras=list(repo.list_paras(cid, mid).values()),
-            glossary_entries=glossary.non_builtin_entries(),
-            ruby=doc.ruby,
+        if final_state == "done":
+            target_lang = parse_mode_target(mode, settings.default_target)
+            out_fmt = suffix.lstrip(".")
+            if out_fmt in ("epub", "pdf", "htm", "xhtml"):
+                out_fmt = "html"
+            elif out_fmt == "ssa":
+                out_fmt = "ass"
+            rebuilt = rebuild_translated_document_from_paras(
+                title=title_name,
+                target_lang=target_lang,
+                fmt=doc.fmt,
+                stored_paras=list(persisted_mem.values()),
+                glossary_entries=glossary.non_builtin_entries(),
+                ruby=doc.ruby,
+            )
+            out_bytes, out_ctype, ext = export_translated_document(rebuilt, out_fmt)
+            safe_stem = re.sub(r"[^A-Za-z0-9._-]", "_", Path(file_name).stem).strip("._")[:200] or "dokumen"
+            output_storage_path = f"outputs/{uid}/{job_id}/{safe_stem}.{target_lang}.{ext}"
+            repo.write_storage_blob(output_storage_path, out_bytes, out_ctype)
+    except Exception as exc:
+        _API_LOGGER.exception("Background document worker failed for %s: %s", job_id, type(exc).__name__)
+        final_state = "partial" if done_count > 0 else "error"
+        err_msg = "Terjadi kendala saat memproses atau mengekspor dokumen."
+        repo.save_job(
+            job_id,
+            {
+                "state": final_state,
+                "doneParas": done_count,
+                "totalParas": len(doc.paragraphs),
+                "errorCode": "JOB_FAILED",
+                "message": err_msg,
+            },
         )
-        out_bytes, out_ctype, ext = export_translated_document(rebuilt, out_fmt)
-        stem = Path(file_name).stem
-        output_storage_path = f"outputs/{uid}/{job_id}/{stem}.{target_lang}.{ext}"
-        repo.write_storage_blob(output_storage_path, out_bytes, out_ctype)
+        repo.save_message(
+            cid,
+            mid,
+            {
+                "done": done_count,
+                "state": final_state,
+                "error": err_msg,
+            },
+        )
+        return {"state": final_state, "doneParas": done_count, "outputPath": None, "message": err_msg}
 
     repo.save_job(
         job_id,

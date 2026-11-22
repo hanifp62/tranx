@@ -151,7 +151,8 @@ def rebuild_translated_document_from_paras(
     for row in ordered:
         src_text = str(row.get("src", ""))
         kind = str(row.get("kind", "text"))
-        meta = dict(row.get("meta") or {})
+        raw_meta = row.get("meta")
+        meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
         para_obj = Paragraph(text=src_text, kind=kind, meta=meta)
         doc_paras.append(para_obj)
 
@@ -159,16 +160,22 @@ def rebuild_translated_document_from_paras(
         sent_pairs: list[SentencePair] = []
         if isinstance(raw_sents, list) and raw_sents:
             for s in raw_sents:
+                if not isinstance(s, dict):
+                    continue
+                try:
+                    turn_val = int(s.get("turn", 0))
+                except (TypeError, ValueError):
+                    turn_val = 0
                 sent_pairs.append(
                     SentencePair(
                         source=str(s.get("src") or s.get("source") or ""),
                         target=str(s.get("dst") or s.get("target") or ""),
                         engine=str(s.get("engine") or row.get("model") or "tranx_llm"),
                         status=str(s.get("status") or "ok"),
-                        turn=int(s.get("turn", 0)),
+                        turn=turn_val,
                     )
                 )
-        else:
+        if not sent_pairs:
             sent_pairs.append(
                 SentencePair(
                     source=src_text,
@@ -178,10 +185,11 @@ def rebuild_translated_document_from_paras(
             )
         trans_paras.append(TranslatedParagraph(source=para_obj, sentences=sent_pairs))
 
+    safe_ruby = {str(k): str(v) for k, v in ruby.items()} if isinstance(ruby, dict) else {}
     doc = Document(
         title=title,
         paragraphs=doc_paras,
-        ruby=dict(ruby or {}),
+        ruby=safe_ruby,
         fmt=fmt or "txt",
     )
     return TranslatedDocument(

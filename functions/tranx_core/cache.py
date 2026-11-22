@@ -25,6 +25,17 @@ class InMemoryCacheStore:
             row = self._data.get(key)
             return None if row is None else row[3]
 
+    def get_many(self, keys: Sequence[str]) -> dict[str, str]:
+        if not keys:
+            return {}
+        out: dict[str, str] = {}
+        with self._lock:
+            for key in keys:
+                row = self._data.get(key)
+                if row is not None:
+                    out[key] = row[3]
+        return out
+
     def put_many(self, rows: Sequence[tuple[str, str, str, str, str]]) -> None:
         with self._lock:
             for key, engine, src, tgt, value in rows:
@@ -72,6 +83,46 @@ class LayeredTranslationCache(TranslationCache):
         with self._lru_lock:
             self._misses += 1
         return None
+
+    def get_many(self, keys: Sequence[str]) -> dict[str, str]:
+        """Batch lookup resolving L1 hits first, then a single store.get_many() call for misses."""
+        if not keys:
+            return {}
+        found: dict[str, str] = {}
+        missed_keys: list[str] = []
+        seen_missed: set[str] = set()
+        with self._lru_lock:
+            for key in keys:
+                mkey = self._mem_key(key)
+                if mkey in self._lru:
+                    self._lru.move_to_end(mkey)
+                    self._hits += 1
+                    found[key] = self._lru[mkey]
+                elif key not in seen_missed:
+                    seen_missed.add(key)
+                    missed_keys.append(key)
+        if missed_keys and self._store is not None:
+            store_get_many = getattr(self._store, "get_many", None)
+            fetched: dict[str, str] = {}
+            if callable(store_get_many):
+                fetched = dict(store_get_many(missed_keys))
+            else:
+                for key in missed_keys:
+                    val = self._store.get(key)
+                    if val is not None:
+                        fetched[key] = val
+            with self._lru_lock:
+                for key in missed_keys:
+                    if key in fetched:
+                        self._put_lru(self._mem_key(key), fetched[key])
+                        self._hits += 1
+                        found[key] = fetched[key]
+                    else:
+                        self._misses += 1
+        elif missed_keys:
+            with self._lru_lock:
+                self._misses += len(missed_keys)
+        return found
 
     def put_many(self, rows: Sequence[tuple[str, str, str, str, str]]) -> None:
         if not rows:

@@ -6,10 +6,12 @@ import contextlib
 import contextvars
 import hashlib
 import os
+import re
 import secrets
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Protocol
 
 from tranx_core import (
@@ -20,19 +22,49 @@ from tranx_core import (
     InMemoryCacheStore,
     InMemoryGlossaryBackend,
     InMemoryUsageTracker,
+    InputError,
     TitleStyle,
     dict_to_glossary_entry,
     glossary_doc_id,
     glossary_entry_to_dict,
 )
 
+_SAFE_STORAGE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+_SAFE_DOC_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def validate_doc_id(raw: str | None, field: str = "id") -> str:
+    clean = (raw or "").strip()
+    if not clean or clean in (".", "..") or not _SAFE_DOC_ID_RE.fullmatch(clean):
+        raise InputError(f"Identifier {field} tidak sah.")
+    return clean
+
+
+def _validate_user_storage_path(storage_path: str, uid: str) -> str:
+    clean = (storage_path or "").strip()
+    if not clean or "\x00" in clean or "\\" in clean or "%" in clean or clean.startswith("/"):
+        raise InputError("Jalur berkas Storage tidak sah.")
+    parts = clean.split("/")
+    if len(parts) != 4 or parts[0] not in ("uploads", "outputs") or parts[1] != uid:
+        raise AuthError(403, "FORBIDDEN_STORAGE_PATH", "Akses berkas Storage lintas pengguna ditolak.")
+    if any(p in ("", ".", "..") or not _SAFE_STORAGE_SEGMENT_RE.match(p) for p in parts[2:]):
+        raise InputError("Nama berkas Storage tidak sah.")
+    return clean
+
 CURRENT_USER_UID: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "tranx_current_uid", default="owner-1"
+    "tranx_current_uid", default=""
 )
 
 
 def get_current_uid() -> str:
     return CURRENT_USER_UID.get()
+
+
+def _require_current_uid(uid: str | None = None) -> str:
+    target = (uid if uid is not None else get_current_uid()).strip()
+    if not target:
+        raise AuthError(401, "UNAUTHENTICATED", "Konteks pengguna tidak ditemukan.")
+    return target
 
 
 @contextlib.contextmanager
@@ -65,6 +97,7 @@ class Repository(Protocol):
     glossary_backend: GlossaryBackend
 
     def verify_owner_token(self, token: str) -> dict[str, Any]: ...
+    def assert_uid_allowed(self, uid: str) -> None: ...
     def get_api_key(self) -> tuple[str | None, str]: ...
     def set_vault_api_key(self, api_key: str) -> None: ...
     def get_settings(self) -> AppSettings: ...
@@ -88,14 +121,22 @@ class Repository(Protocol):
         active_tab: str = "teks",
         preview: str = "",
     ) -> None: ...
-    def save_message(self, cid: str, mid: str, payload: dict[str, Any]) -> None: ...
+    def save_message(
+        self, cid: str, mid: str, payload: dict[str, Any], *, is_new: bool = False
+    ) -> None: ...
     def get_message(self, cid: str, mid: str) -> dict[str, Any] | None: ...
     def save_para(self, cid: str, mid: str, idx: int, payload: dict[str, Any]) -> None: ...
+    def save_paras_batch(
+        self, cid: str, mid: str, items: Sequence[tuple[int, dict[str, Any]]]
+    ) -> None: ...
     def list_paras(self, cid: str, mid: str) -> dict[int, dict[str, Any]]: ...
     def delete_conversation_cascade(self, cid: str) -> None: ...
     def get_job(self, job_id: str) -> dict[str, Any] | None: ...
     def save_job(self, job_id: str, payload: dict[str, Any]) -> None: ...
     def read_storage_blob(self, storage_path: str) -> bytes: ...
+    def download_storage_blob_to_file(
+        self, storage_path: str, dest_path: Path, *, max_bytes: int
+    ) -> int: ...
     def write_storage_blob(
         self, storage_path: str, data: bytes, content_type: str
     ) -> None: ...
@@ -169,7 +210,7 @@ class InMemoryRepository:
         self.revoked_uids: set[str] = set()
 
     def _state(self, uid: str | None = None) -> _InMemoryUserState:
-        target = uid or get_current_uid()
+        target = uid or get_current_uid() or "owner-1"
         st = self._users.get(target)
         if st is None:
             st = _InMemoryUserState()
@@ -241,6 +282,22 @@ class InMemoryRepository:
             return {"uid": "stranger-1", "email": email, "email_verified": True}
         raise AuthError(401, "UNAUTHENTICATED", "Token sesi tidak sah atau kedaluwarsa.")
 
+    def assert_uid_allowed(self, uid: str) -> None:
+        clean_uid = (uid or "").strip()
+        if not clean_uid:
+            raise AuthError(403, "ACCOUNT_RESTRICTED", "Identitas akun tidak sah.")
+        allowlist = _allowed_emails_from_env()
+        if allowlist is None:
+            return
+        uid_emails = {
+            "owner-1": "user1@example.com",
+            "user-b": "user2@example.com",
+            "stranger-1": "stranger@example.com",
+        }
+        email = uid_emails.get(clean_uid, "")
+        if email not in allowlist:
+            raise AuthError(403, "ACCOUNT_RESTRICTED", "Akun tidak terdaftar dalam daftar izin.")
+
     def get_api_key(self) -> tuple[str | None, str]:
         st = self._state()
         if st.vault_api_key:
@@ -283,7 +340,7 @@ class InMemoryRepository:
         self, title_id: str | None, fallback_name: str, kind: str = "lepas"
     ) -> tuple[str, str, TitleStyle]:
         st = self._state()
-        tid = (title_id or "").strip() or f"t_{secrets.token_hex(6)}"
+        tid = validate_doc_id(title_id, "titleId") if (title_id or "").strip() else f"t_{secrets.token_hex(6)}"
         existing = st.titles.get(tid)
         if existing is None:
             name = (fallback_name or "Percakapan").strip()[:200]
@@ -301,6 +358,8 @@ class InMemoryRepository:
         return tid, str(existing.get("name") or fallback_name), style
 
     def merge_titles(self, from_id: str, to_id: str) -> dict[str, Any]:
+        from_id = validate_doc_id(from_id, "fromTitleId")
+        to_id = validate_doc_id(to_id, "toTitleId")
         st = self._state()
         _, src_entries = st.glossary_backend.load_entries(from_id)
         _, dst_entries = st.glossary_backend.load_entries(to_id)
@@ -339,6 +398,8 @@ class InMemoryRepository:
         active_tab: str = "teks",
         preview: str = "",
     ) -> None:
+        cid = validate_doc_id(cid, "cid")
+        title_id = validate_doc_id(title_id, "titleId")
         st = self._state()
         now_iso = datetime.now(timezone.utc).isoformat()
         existing = st.conversations.get(cid)
@@ -361,22 +422,45 @@ class InMemoryRepository:
                 existing["preview"] = preview[:200]
             existing["updatedAt"] = now_iso
 
-    def save_message(self, cid: str, mid: str, payload: dict[str, Any]) -> None:
+    def save_message(
+        self, cid: str, mid: str, payload: dict[str, Any], *, is_new: bool = False
+    ) -> None:
+        del is_new
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
         st = self._state()
         bucket = st.messages.setdefault(cid, {})
         existing = bucket.get(mid, {})
         bucket[mid] = {**existing, **payload}
 
     def get_message(self, cid: str, mid: str) -> dict[str, Any] | None:
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
         return self._state().messages.get(cid, {}).get(mid)
 
     def save_para(self, cid: str, mid: str, idx: int, payload: dict[str, Any]) -> None:
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
         self._state().paras.setdefault((cid, mid), {})[idx] = dict(payload)
 
+    def save_paras_batch(
+        self, cid: str, mid: str, items: Sequence[tuple[int, dict[str, Any]]]
+    ) -> None:
+        if not items:
+            return
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
+        bucket = self._state().paras.setdefault((cid, mid), {})
+        for idx, payload in items:
+            bucket[idx] = dict(payload)
+
     def list_paras(self, cid: str, mid: str) -> dict[int, dict[str, Any]]:
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
         return dict(self._state().paras.get((cid, mid), {}))
 
     def delete_conversation_cascade(self, cid: str) -> None:
+        cid = validate_doc_id(cid, "cid")
         st = self._state()
         st.conversations.pop(cid, None)
         msgs = st.messages.pop(cid, {})
@@ -384,23 +468,36 @@ class InMemoryRepository:
             st.paras.pop((cid, mid), None)
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
+        job_id = validate_doc_id(job_id, "jobId")
         return self._state().jobs.get(job_id)
 
     def save_job(self, job_id: str, payload: dict[str, Any]) -> None:
+        job_id = validate_doc_id(job_id, "jobId")
         st = self._state()
         existing = st.jobs.get(job_id, {})
         st.jobs[job_id] = {**existing, **payload}
 
     def read_storage_blob(self, storage_path: str) -> bytes:
-        item = self.blobs.get(storage_path)
+        safe_path = _validate_user_storage_path(storage_path, get_current_uid() or "owner-1")
+        item = self.blobs.get(safe_path)
         if item is None:
-            raise FileNotFoundError(f"Objek Storage tidak ditemukan: {storage_path}")
+            raise InputError("Berkas sumber tidak ditemukan di Storage.")
         return item[0]
+
+    def download_storage_blob_to_file(
+        self, storage_path: str, dest_path: Path, *, max_bytes: int
+    ) -> int:
+        data = self.read_storage_blob(storage_path)
+        if len(data) > max_bytes:
+            raise InputError("FILE_TOO_LARGE")
+        dest_path.write_bytes(data)
+        return len(data)
 
     def write_storage_blob(
         self, storage_path: str, data: bytes, content_type: str
     ) -> None:
-        self.blobs[storage_path] = (data, content_type)
+        safe_path = _validate_user_storage_path(storage_path, get_current_uid() or "owner-1")
+        self.blobs[safe_path] = (data, content_type)
 
     def create_pair_code(self, owner_uid: str) -> dict[str, Any]:
         code = f"{secrets.randbelow(900000) + 100000:06d}"
@@ -419,31 +516,40 @@ class InMemoryRepository:
 
     def redeem_pair_code(self, code: str) -> str:
         clean = (code or "").strip()
+        if len(clean) != 6 or not clean.isdigit():
+            raise AuthError(400, "INVALID_FORMAT", "Kode pasangan harus terdiri atas 6 angka.")
         record = self.pair_codes.get(clean)
         if record is None:
-            expired_codes = []
-            for active_code, rec in list(self.pair_codes.items()):
-                rec["attempts"] = int(rec.get("attempts", 0)) + 1
-                if rec["attempts"] >= 5:
-                    expired_codes.append(active_code)
-            for c in expired_codes:
-                self.pair_codes.pop(c, None)
+            self._pair_failed_attempts += 1
+            if self._pair_failed_attempts >= 5:
+                self.pair_codes.clear()
+                self._pair_failed_attempts = 0
             raise AuthError(401, "INVALID_PAIR_CODE", "Kode pasangan tidak ditemukan atau sudah dipakai.")
         if time.time() > record["expiresAt"]:
             self.pair_codes.pop(clean, None)
             raise AuthError(401, "PAIR_CODE_EXPIRED", "Kode pasangan sudah kedaluwarsa.")
         self.pair_codes.pop(clean, None)
+        self._pair_failed_attempts = 0
         return f"custom-token-for-{record['uid']}"
 
     def revoke_all_sessions(self, owner_uid: str) -> None:
         self.revoked_uids.add(owner_uid)
+        for c in [k for k, v in self.pair_codes.items() if v.get("uid") == owner_uid]:
+            self.pair_codes.pop(c, None)
+        for tid in [k for k, v in self.inbox_tokens.items() if v.get("uid") == owner_uid]:
+            self.inbox_tokens.pop(tid, None)
 
     def create_inbox_token(self) -> dict[str, str]:
+        uid = get_current_uid() or "owner-1"
+        existing_for_user = [k for k, v in self.inbox_tokens.items() if v.get("uid") == uid]
+        if len(existing_for_user) >= 5:
+            raise InputError("Batas maksimum 5 token Pintasan aktif tercapai.")
         token_id = f"inb_{secrets.token_hex(6)}"
         raw_secret = f"txi_{secrets.token_urlsafe(24)}"
         digest = hashlib.sha256(raw_secret.encode("utf-8")).hexdigest()
-        self.inbox_tokens[token_id] = {
-            "uid": get_current_uid(),
+        self.inbox_tokens[digest] = {
+            "id": token_id,
+            "uid": uid,
             "hash": digest,
             "windowHour": "",
             "windowCount": 0,
@@ -454,12 +560,8 @@ class InMemoryRepository:
         if not raw_token:
             raise AuthError(401, "MISSING_INBOX_TOKEN", "Header X-Inbox-Token wajib diisi.")
         digest = hashlib.sha256(raw_token.strip().encode("utf-8")).hexdigest()
-        matched_rec = None
-        for rec in self.inbox_tokens.values():
-            if secrets.compare_digest(rec["hash"], digest):
-                matched_rec = rec
-                break
-        if matched_rec is None:
+        matched_rec = self.inbox_tokens.get(digest)
+        if matched_rec is None or not secrets.compare_digest(matched_rec["hash"], digest):
             raise AuthError(401, "INVALID_INBOX_TOKEN", "Token Pintasan tidak dikenal.")
 
         hour_key = datetime.now(timezone.utc).strftime("%Y%m%d%H")
@@ -482,6 +584,7 @@ class InMemoryRepository:
         return inbox_id
 
     def delete_inbox_item(self, inbox_id: str) -> None:
+        inbox_id = validate_doc_id(inbox_id, "inboxId")
         self._state().inbox_items.pop(inbox_id, None)
 
     def export_backup(self) -> dict[str, Any]:
@@ -506,7 +609,7 @@ class _FirestoreCacheStore:
         self._db = db
 
     def _col(self) -> Any:
-        return self._db.collection("users").document(get_current_uid()).collection("cacheEntries")
+        return self._db.collection("users").document(_require_current_uid()).collection("cacheEntries")
 
     def get(self, key: str) -> str | None:
         snap = self._col().document(key).get()
@@ -516,25 +619,42 @@ class _FirestoreCacheStore:
         val = data.get("value")
         return str(val) if isinstance(val, str) else None
 
+    def get_many(self, keys: Sequence[str]) -> dict[str, str]:
+        if not keys:
+            return {}
+        col = self._col()
+        out: dict[str, str] = {}
+        unique_keys = list(dict.fromkeys(keys))
+        for start in range(0, len(unique_keys), 100):
+            refs = [col.document(k) for k in unique_keys[start : start + 100]]
+            for snap in self._db.get_all(refs):
+                if snap.exists:
+                    data = snap.to_dict() or {}
+                    val = data.get("value")
+                    if isinstance(val, str):
+                        out[snap.id] = val
+        return out
+
     def put_many(self, rows: Sequence[tuple[str, str, str, str, str]]) -> None:
         if not rows:
             return
         col = self._col()
-        batch = self._db.batch()
         now = datetime.now(timezone.utc)
-        for key, engine, src, tgt, value in rows[:400]:
-            ref = col.document(key)
-            batch.set(
-                ref,
-                {
-                    "engine": engine,
-                    "src": src,
-                    "tgt": tgt,
-                    "value": value,
-                    "updatedAt": now,
-                },
-            )
-        batch.commit()
+        for start in range(0, len(rows), 400):
+            batch = self._db.batch()
+            for key, engine, src, tgt, value in rows[start : start + 400]:
+                ref = col.document(key)
+                batch.set(
+                    ref,
+                    {
+                        "engine": engine,
+                        "src": src,
+                        "tgt": tgt,
+                        "value": value,
+                        "updatedAt": now,
+                    },
+                )
+            batch.commit()
 
 
 class _FirestoreGlossaryBackend:
@@ -542,7 +662,7 @@ class _FirestoreGlossaryBackend:
         self._db = db
 
     def _titles_col(self) -> Any:
-        return self._db.collection("users").document(get_current_uid()).collection("titles")
+        return self._db.collection("users").document(_require_current_uid()).collection("titles")
 
     def load_entries(self, title_id: str) -> tuple[str, list[dict[str, Any]]]:
         t_col = self._titles_col()
@@ -551,7 +671,7 @@ class _FirestoreGlossaryBackend:
         if t_snap.exists:
             title_name = str((t_snap.to_dict() or {}).get("name") or title_id)
         docs = t_col.document(title_id).collection("glossary").stream()
-        rows = [d.to_dict() for d in docs if d.exists]
+        rows: list[dict[str, Any]] = [d.to_dict() or {} for d in docs if d.exists]
         return title_name, rows
 
     def commit_mutations(
@@ -565,42 +685,58 @@ class _FirestoreGlossaryBackend:
         t_col = self._titles_col()
         col = t_col.document(title_id).collection("glossary")
         now = datetime.now(timezone.utc)
+        all_ids_sorted = sorted(set(upserts.keys()) | set(removals))
+        if not all_ids_sorted:
+            return
 
-        @gc_fs.transactional
-        def _txn(transaction: Any) -> None:
-            all_ids = sorted(set(upserts.keys()) | set(removals))
-            snapshots = {doc_id: col.document(doc_id).get(transaction=transaction) for doc_id in all_ids}
-            for doc_id in removals:
-                snap = snapshots[doc_id]
-                if snap.exists:
-                    cur = snap.to_dict() or {}
-                    if cur.get("source") == "user" and cur.get("confirmed") is True:
-                        continue
-                    transaction.delete(col.document(doc_id))
-            for doc_id, incoming in upserts.items():
-                snap = snapshots[doc_id]
-                if snap.exists:
-                    cur = snap.to_dict() or {}
-                    if (
-                        cur.get("source") == "user"
-                        and cur.get("confirmed") is True
-                        and incoming.get("source") != "user"
-                    ):
-                        continue
-                transaction.set(col.document(doc_id), {**incoming, "updatedAt": now})
-            transaction.set(
-                t_col.document(title_id),
-                {"updatedAt": now},
-                merge=True,
-            )
+        # Chunk <= 200 documents per Firestore transaction (safe under 500-op ceiling)
+        for start in range(0, len(all_ids_sorted), 200):
+            chunk_ids = all_ids_sorted[start : start + 200]
+            chunk_removals = [doc_id for doc_id in chunk_ids if doc_id in removals]
+            chunk_upserts = [(doc_id, upserts[doc_id]) for doc_id in chunk_ids if doc_id in upserts]
 
-        _txn(self._db.transaction())
+            @gc_fs.transactional
+            def _txn(
+                transaction: Any,
+                _chunk_ids: list[str] = chunk_ids,
+                _chunk_removals: list[str] = chunk_removals,
+                _chunk_upserts: list[tuple[str, dict[str, Any]]] = chunk_upserts,
+            ) -> None:
+                snapshots = {
+                    doc_id: col.document(doc_id).get(transaction=transaction)
+                    for doc_id in _chunk_ids
+                }
+                for doc_id in _chunk_removals:
+                    snap = snapshots[doc_id]
+                    if snap.exists:
+                        cur = snap.to_dict() or {}
+                        if cur.get("source") == "user" and cur.get("confirmed") is True:
+                            continue
+                        transaction.delete(col.document(doc_id))
+                for doc_id, incoming in _chunk_upserts:
+                    snap = snapshots[doc_id]
+                    if snap.exists:
+                        cur = snap.to_dict() or {}
+                        if (
+                            cur.get("source") == "user"
+                            and cur.get("confirmed") is True
+                            and incoming.get("source") != "user"
+                        ):
+                            continue
+                    transaction.set(col.document(doc_id), {**incoming, "updatedAt": now})
+                transaction.set(
+                    t_col.document(title_id),
+                    {"updatedAt": now},
+                    merge=True,
+                )
+
+            _txn(self._db.transaction())
 
 
 class FirestoreRepository:
     """Production multi-tenant Firebase Admin repository isolated under /users/{uid}/..."""
 
-    def __init__(self, *, env_api_key_getter=lambda: None) -> None:
+    def __init__(self, *, env_api_key_getter: Callable[[], str | None] = lambda: None) -> None:
         from firebase_admin import auth as fb_auth
         from firebase_admin import firestore as fb_fs
         from firebase_admin import storage as fb_storage
@@ -613,7 +749,25 @@ class FirestoreRepository:
         self.glossary_backend = _FirestoreGlossaryBackend(self._db)
 
     def _user_root(self, uid: str | None = None) -> Any:
-        return self._db.collection("users").document(uid or get_current_uid())
+        return self._db.collection("users").document(_require_current_uid(uid))
+
+    def assert_uid_allowed(self, uid: str) -> None:
+        clean_uid = _require_current_uid(uid)
+        try:
+            user_rec = self._auth.get_user(clean_uid)
+        except Exception as exc:
+            raise AuthError(403, "ACCOUNT_RESTRICTED", "Akun pengguna tidak ditemukan atau tidak sah.") from exc
+        if getattr(user_rec, "disabled", False):
+            raise AuthError(403, "ACCOUNT_DISABLED", "Akun dinonaktifkan.")
+        claims = getattr(user_rec, "custom_claims", None) or {}
+        is_paired = claims.get("paired") is True or claims.get("owner") is True
+        if not getattr(user_rec, "email_verified", False) and not is_paired:
+            raise AuthError(403, "EMAIL_UNVERIFIED", "Email akun belum terverifikasi.")
+        allowlist = _allowed_emails_from_env()
+        if allowlist is not None:
+            email_val = str(getattr(user_rec, "email", "") or "").strip().lower()
+            if email_val not in allowlist:
+                raise AuthError(403, "ACCOUNT_RESTRICTED", "Akun tidak terdaftar dalam daftar izin.")
 
     def verify_owner_token(self, token: str) -> dict[str, Any]:
         if not token:
@@ -633,8 +787,14 @@ class FirestoreRepository:
             raise AuthError(403, "EMAIL_UNVERIFIED", "Email akun Google belum terverifikasi.")
 
         allowlist = _allowed_emails_from_env()
-        if allowlist is not None and not is_paired:
+        if allowlist is not None:
             email_val = str(decoded.get("email") or "").strip().lower()
+            if not email_val and is_paired:
+                try:
+                    user_rec = self._auth.get_user(str(decoded["uid"]))
+                    email_val = str(getattr(user_rec, "email", "") or "").strip().lower()
+                except Exception:
+                    email_val = ""
             if email_val not in allowlist:
                 raise AuthError(403, "ACCOUNT_RESTRICTED", "Akun tidak terdaftar dalam daftar izin.")
 
@@ -644,15 +804,15 @@ class FirestoreRepository:
 
     def get_api_key(self) -> tuple[str | None, str]:
         root = self._user_root()
-        # 1. Per-user BYOK secret stored in /users/{uid}/settings/secrets or /users/{uid}/serverSecrets/llm
-        sec_snap = root.collection("settings").document("secrets").get()
-        if sec_snap.exists:
-            val = (sec_snap.to_dict() or {}).get("geminiApiKey")
-            if isinstance(val, str) and val.strip():
-                return val.strip(), "vault"
+        # 1. Server-only vault takes priority over legacy client-readable settings/secrets
         vault_snap = root.collection("serverSecrets").document("llm").get()
         if vault_snap.exists:
             val = (vault_snap.to_dict() or {}).get("apiKey")
+            if isinstance(val, str) and val.strip():
+                return val.strip(), "vault"
+        sec_snap = root.collection("settings").document("secrets").get()
+        if sec_snap.exists:
+            val = (sec_snap.to_dict() or {}).get("geminiApiKey")
             if isinstance(val, str) and val.strip():
                 return val.strip(), "vault"
         # 2. Optional server-level fallback key if configured by deployer
@@ -663,11 +823,14 @@ class FirestoreRepository:
 
     def set_vault_api_key(self, api_key: str) -> None:
         clean = api_key.strip()
-        ref = self._user_root().collection("serverSecrets").document("llm")
+        server_ref = self._user_root().collection("serverSecrets").document("llm")
+        client_ref = self._user_root().collection("settings").document("secrets")
         if clean:
-            ref.set({"apiKey": clean, "updatedAt": datetime.now(timezone.utc)})
+            server_ref.set({"apiKey": clean, "updatedAt": datetime.now(timezone.utc)})
+            client_ref.delete()
         else:
-            ref.delete()
+            server_ref.delete()
+            client_ref.delete()
 
     def get_settings(self) -> AppSettings:
         snap = self._user_root().collection("settings").document("app").get()
@@ -696,7 +859,7 @@ class FirestoreRepository:
         @gc_fs.transactional
         def _txn(transaction: Any) -> None:
             snap = ref.get(transaction=transaction)
-            cur = snap.to_dict() if snap.exists else {"chars": 0, "calls": 0, "byModel": {}}
+            cur = (snap.to_dict() or {}) if snap.exists else {"chars": 0, "calls": 0, "byModel": {}}
             used_chars = int(cur.get("chars", 0))
             used_calls = int(cur.get("calls", 0))
             if used_chars + max(chars, 0) > char_cap or used_calls + max(calls, 0) > call_cap:
@@ -726,7 +889,7 @@ class FirestoreRepository:
     def get_usage_today(self) -> dict[str, Any]:
         day_key = InMemoryUsageTracker.today_key()
         snap = self._user_root().collection("usage").document(day_key).get()
-        cur = snap.to_dict() if snap.exists else {"chars": 0, "calls": 0, "byModel": {}}
+        cur = (snap.to_dict() or {}) if snap.exists else {"chars": 0, "calls": 0, "byModel": {}}
         return {
             "day": day_key,
             "chars": int(cur.get("chars", 0)),
@@ -735,9 +898,15 @@ class FirestoreRepository:
         }
 
     def ensure_title(
-        self, title_id: str | None, fallback_name: str, kind: str = "lepas"
+        self,
+        title_id: str | None,
+        fallback_name: str,
+        kind: str = "lepas",
+        _seen: set[str] | None = None,
     ) -> tuple[str, str, TitleStyle]:
-        tid = (title_id or "").strip() or f"t_{secrets.token_hex(6)}"
+        seen = _seen if _seen is not None else set()
+        raw_tid = (title_id or "").strip()
+        tid = validate_doc_id(raw_tid, "titleId") if raw_tid else f"t_{secrets.token_hex(6)}"
         ref = self._user_root().collection("titles").document(tid)
         snap = ref.get()
         now = datetime.now(timezone.utc)
@@ -758,11 +927,17 @@ class FirestoreRepository:
             return tid, name, style
         data = snap.to_dict() or {}
         if data.get("mergedInto"):
-            return self.ensure_title(str(data["mergedInto"]), fallback_name, kind)
+            target_id = str(data["mergedInto"])
+            if target_id in seen or len(seen) >= 5:
+                raise InputError("Rantai penggabungan judul melingkar terdeteksi.")
+            seen.add(tid)
+            return self.ensure_title(target_id, fallback_name, kind, _seen=seen)
         style = TitleStyle.from_dict(data.get("style"))
         return tid, str(data.get("name") or fallback_name), style
 
     def merge_titles(self, from_id: str, to_id: str) -> dict[str, Any]:
+        from_id = validate_doc_id(from_id, "fromTitleId")
+        to_id = validate_doc_id(to_id, "toTitleId")
         _, src_rows = self.glossary_backend.load_entries(from_id)
         _, dst_rows = self.glossary_backend.load_entries(to_id)
         dst_map = {r.get("surface"): r for r in dst_rows if r.get("surface")}
@@ -785,8 +960,15 @@ class FirestoreRepository:
         root.collection("titles").document(from_id).set(
             {"mergedInto": to_id, "updatedAt": now}, merge=True
         )
-        for conv in root.collection("conversations").where("titleId", "==", from_id).stream():
-            conv.reference.update({"titleId": to_id, "updatedAt": now})
+        conv_refs = [
+            conv.reference
+            for conv in root.collection("conversations").where("titleId", "==", from_id).stream()
+        ]
+        for start in range(0, len(conv_refs), 400):
+            batch = self._db.batch()
+            for cref in conv_refs[start : start + 400]:
+                batch.update(cref, {"titleId": to_id, "updatedAt": now})
+            batch.commit()
         return {"merged": merged, "conflicts": conflicts}
 
     def ensure_conversation(
@@ -799,6 +981,8 @@ class FirestoreRepository:
         active_tab: str = "teks",
         preview: str = "",
     ) -> None:
+        cid = validate_doc_id(cid, "cid")
+        title_id = validate_doc_id(title_id, "titleId")
         ref = self._user_root().collection("conversations").document(cid)
         snap = ref.get()
         now = datetime.now(timezone.utc)
@@ -826,7 +1010,11 @@ class FirestoreRepository:
                 patch["preview"] = preview[:200]
             ref.update(patch)
 
-    def save_message(self, cid: str, mid: str, payload: dict[str, Any]) -> None:
+    def save_message(
+        self, cid: str, mid: str, payload: dict[str, Any], *, is_new: bool = False
+    ) -> None:
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
         now = datetime.now(timezone.utc)
         ref = (
             self._user_root()
@@ -837,10 +1025,13 @@ class FirestoreRepository:
         )
         data = {**payload, "updatedAt": now}
         if "createdAt" not in data:
-            data["createdAt"] = now
+            if is_new or not ref.get().exists:
+                data["createdAt"] = now
         ref.set(data, merge=True)
 
     def get_message(self, cid: str, mid: str) -> dict[str, Any] | None:
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
         snap = (
             self._user_root()
             .collection("conversations")
@@ -852,6 +1043,8 @@ class FirestoreRepository:
         return snap.to_dict() if snap.exists else None
 
     def save_para(self, cid: str, mid: str, idx: int, payload: dict[str, Any]) -> None:
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
         key = f"{idx:04d}"
         ref = (
             self._user_root()
@@ -864,7 +1057,30 @@ class FirestoreRepository:
         )
         ref.set(payload)
 
+    def save_paras_batch(
+        self, cid: str, mid: str, items: Sequence[tuple[int, dict[str, Any]]]
+    ) -> None:
+        if not items:
+            return
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
+        col = (
+            self._user_root()
+            .collection("conversations")
+            .document(cid)
+            .collection("messages")
+            .document(mid)
+            .collection("paras")
+        )
+        for start in range(0, len(items), 400):
+            batch = self._db.batch()
+            for idx, payload in items[start : start + 400]:
+                batch.set(col.document(f"{idx:04d}"), payload)
+            batch.commit()
+
     def list_paras(self, cid: str, mid: str) -> dict[int, dict[str, Any]]:
+        cid = validate_doc_id(cid, "cid")
+        mid = validate_doc_id(mid, "mid")
         col = (
             self._user_root()
             .collection("conversations")
@@ -877,23 +1093,36 @@ class FirestoreRepository:
         for d in col.stream():
             if d.exists:
                 row = d.to_dict() or {}
-                idx = int(row.get("i", int(d.id)))
+                raw_i = row.get("i")
+                try:
+                    idx = int(raw_i) if raw_i is not None else int(d.id)
+                except (TypeError, ValueError):
+                    continue
                 out[idx] = row
         return out
 
     def delete_conversation_cascade(self, cid: str) -> None:
+        cid = validate_doc_id(cid, "cid")
         conv_ref = self._user_root().collection("conversations").document(cid)
+        refs_to_delete: list[Any] = []
         for msg_doc in conv_ref.collection("messages").stream():
             for para_doc in msg_doc.reference.collection("paras").stream():
-                para_doc.reference.delete()
-            msg_doc.reference.delete()
-        conv_ref.delete()
+                refs_to_delete.append(para_doc.reference)
+            refs_to_delete.append(msg_doc.reference)
+        refs_to_delete.append(conv_ref)
+        for start in range(0, len(refs_to_delete), 400):
+            batch = self._db.batch()
+            for r in refs_to_delete[start : start + 400]:
+                batch.delete(r)
+            batch.commit()
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
+        job_id = validate_doc_id(job_id, "jobId")
         snap = self._user_root().collection("jobs").document(job_id).get()
         return snap.to_dict() if snap.exists else None
 
     def save_job(self, job_id: str, payload: dict[str, Any]) -> None:
+        job_id = validate_doc_id(job_id, "jobId")
         now = datetime.now(timezone.utc)
         data = {
             **payload,
@@ -903,71 +1132,145 @@ class FirestoreRepository:
         self._user_root().collection("jobs").document(job_id).set(data, merge=True)
 
     def read_storage_blob(self, storage_path: str) -> bytes:
+        safe_path = _validate_user_storage_path(storage_path, _require_current_uid())
         bucket = self._storage.bucket()
-        blob = bucket.blob(storage_path)
+        blob = bucket.blob(safe_path)
         if not blob.exists():
-            raise FileNotFoundError(f"Berkas tidak ditemukan di Storage: {storage_path}")
+            raise InputError("Berkas sumber tidak ditemukan di Storage.")
         return blob.download_as_bytes()
+
+    def download_storage_blob_to_file(
+        self, storage_path: str, dest_path: Path, *, max_bytes: int
+    ) -> int:
+        safe_path = _validate_user_storage_path(storage_path, _require_current_uid())
+        bucket = self._storage.bucket()
+        blob = bucket.blob(safe_path)
+        blob.reload()
+        size = int(getattr(blob, "size", 0) or 0)
+        if size > max_bytes:
+            raise InputError("FILE_TOO_LARGE")
+        blob.download_to_filename(str(dest_path))
+        actual = dest_path.stat().st_size
+        if actual > max_bytes:
+            dest_path.unlink(missing_ok=True)
+            raise InputError("FILE_TOO_LARGE")
+        return actual
 
     def write_storage_blob(
         self, storage_path: str, data: bytes, content_type: str
     ) -> None:
+        safe_path = _validate_user_storage_path(storage_path, _require_current_uid())
         bucket = self._storage.bucket()
-        blob = bucket.blob(storage_path)
+        blob = bucket.blob(safe_path)
         blob.upload_from_string(data, content_type=content_type)
 
     def create_pair_code(self, owner_uid: str) -> dict[str, Any]:
-        code = f"{secrets.randbelow(900000) + 100000:06d}"
         expires = datetime.now(timezone.utc) + timedelta(seconds=120)
         # Keep only one active pairing code per user at a time
         for stale in self._db.collection("pairCodes").where("uid", "==", owner_uid).stream():
             stale.reference.delete()
-        self._db.collection("pairCodes").document(code).set(
-            {
-                "uid": owner_uid,
-                "expiresAt": expires,
-                "attempts": 0,
-            }
-        )
-        return {"code": code, "expiresAt": expires.isoformat()}
+        for _ in range(5):
+            code = f"{secrets.randbelow(900000) + 100000:06d}"
+            ref = self._db.collection("pairCodes").document(code)
+            if not ref.get().exists:
+                ref.set(
+                    {
+                        "uid": owner_uid,
+                        "expiresAt": expires,
+                        "attempts": 0,
+                    }
+                )
+                return {"code": code, "expiresAt": expires.isoformat()}
+        raise AuthError(503, "PAIR_CODE_COLLISION", "Gagal membuat kode pasangan, coba lagi.")
 
     def redeem_pair_code(self, code: str) -> str:
+        from google.cloud import firestore as gc_fs
+
         clean = (code or "").strip()
         if len(clean) != 6 or not clean.isdigit():
             raise AuthError(400, "INVALID_FORMAT", "Kode pasangan harus terdiri atas 6 angka.")
         ref = self._db.collection("pairCodes").document(clean)
-        snap = ref.get()
-        if not snap.exists:
-            # Count wrong guesses against active codes and invalidate after 5 failed attempts
-            for active in self._db.collection("pairCodes").stream():
-                data = active.to_dict() or {}
-                next_attempts = int(data.get("attempts", 0)) + 1
-                if next_attempts >= 5:
-                    active.reference.delete()
-                else:
-                    active.reference.update({"attempts": next_attempts})
+        guard_ref = self._db.collection("pairMeta").document("guard")
+
+        @gc_fs.transactional
+        def _consume(txn: Any) -> tuple[str | None, bool]:
+            snap = ref.get(transaction=txn)
+            g_snap = guard_ref.get(transaction=txn)
+            now = datetime.now(timezone.utc)
+            if not snap.exists:
+                g_data = (g_snap.to_dict() or {}) if g_snap.exists else {}
+                win_start = g_data.get("windowStart")
+                failed = int(g_data.get("failedAttempts", 0))
+                if not isinstance(win_start, datetime) or (now - win_start).total_seconds() > 120:
+                    failed = 0
+                    win_start = now
+                failed += 1
+                should_purge = failed >= 5
+                txn.set(
+                    guard_ref,
+                    {
+                        "failedAttempts": 0 if should_purge else failed,
+                        "windowStart": now if should_purge else win_start,
+                        "updatedAt": now,
+                    },
+                )
+                return None, should_purge
+            rec = snap.to_dict() or {}
+            attempts = int(rec.get("attempts", 0))
+            expires_at = rec.get("expiresAt")
+            if attempts >= 5 or (expires_at and now > expires_at):
+                txn.delete(ref)
+                raise AuthError(401, "PAIR_CODE_EXPIRED", "Kode pasangan sudah kedaluwarsa.")
+            txn.delete(ref)
+            txn.set(
+                guard_ref,
+                {"failedAttempts": 0, "windowStart": now, "updatedAt": now},
+            )
+            return str(rec["uid"]), False
+
+        uid, should_purge = _consume(self._db.transaction())
+        if uid is None:
+            if should_purge:
+                stale_snaps = list(self._db.collection("pairCodes").limit(50).stream())
+                if stale_snaps:
+                    batch = self._db.batch()
+                    for st_doc in stale_snaps:
+                        batch.delete(st_doc.reference)
+                    batch.commit()
             raise AuthError(401, "INVALID_PAIR_CODE", "Kode pasangan salah atau sudah dipakai.")
-        rec = snap.to_dict() or {}
-        attempts = int(rec.get("attempts", 0))
-        expires_at = rec.get("expiresAt")
-        now = datetime.now(timezone.utc)
-        if attempts >= 5 or (expires_at and now > expires_at):
-            ref.delete()
-            raise AuthError(401, "PAIR_CODE_EXPIRED", "Kode pasangan sudah kedaluwarsa.")
-        ref.delete()
-        custom_bytes = self._auth.create_custom_token(str(rec["uid"]), {"paired": True})
+
+        allowlist = _allowed_emails_from_env()
+        if allowlist is not None:
+            user_rec = self._auth.get_user(uid)
+            email_val = str(getattr(user_rec, "email", "") or "").strip().lower()
+            if email_val not in allowlist:
+                raise AuthError(403, "ACCOUNT_RESTRICTED", "Akun tidak terdaftar dalam daftar izin.")
+        custom_bytes = self._auth.create_custom_token(uid, {"paired": True})
         return custom_bytes.decode("utf-8") if isinstance(custom_bytes, bytes) else str(custom_bytes)
 
     def revoke_all_sessions(self, owner_uid: str) -> None:
         self._auth.revoke_refresh_tokens(owner_uid)
+        now = datetime.now(timezone.utc)
+        # Close 60-minute ID token grace window directly in Firestore Security Rules via serverSecrets/session
+        self._user_root(owner_uid).collection("serverSecrets").document("session").set(
+            {"revokedBefore": int(time.time()), "updatedAt": now}
+        )
+        for col_name in ("inboxTokens", "pairCodes"):
+            for doc_snap in self._db.collection(col_name).where("uid", "==", owner_uid).stream():
+                doc_snap.reference.delete()
 
     def create_inbox_token(self) -> dict[str, str]:
+        uid = _require_current_uid()
+        existing = list(self._db.collection("inboxTokens").where("uid", "==", uid).stream())
+        if len(existing) >= 5:
+            raise InputError("Batas maksimum 5 token Pintasan aktif tercapai. Cabut token lama terlebih dahulu.")
         token_id = f"inb_{secrets.token_hex(6)}"
         raw_secret = f"txi_{secrets.token_urlsafe(24)}"
         digest = hashlib.sha256(raw_secret.encode("utf-8")).hexdigest()
-        self._db.collection("inboxTokens").document(token_id).set(
+        self._db.collection("inboxTokens").document(digest).set(
             {
-                "uid": get_current_uid(),
+                "id": token_id,
+                "uid": uid,
                 "hash": digest,
                 "windowHour": "",
                 "windowCount": 0,
@@ -977,27 +1280,32 @@ class FirestoreRepository:
         return {"id": token_id, "token": raw_secret}
 
     def push_inbox_item(self, raw_token: str, item: dict[str, Any]) -> str:
+        from google.cloud import firestore as gc_fs
+
         if not raw_token:
             raise AuthError(401, "MISSING_INBOX_TOKEN", "Header X-Inbox-Token wajib diisi.")
         digest = hashlib.sha256(raw_token.strip().encode("utf-8")).hexdigest()
-        matched_doc = None
-        for d in self._db.collection("inboxTokens").stream():
-            rec = d.to_dict() or {}
-            if isinstance(rec.get("hash"), str) and secrets.compare_digest(rec["hash"], digest):
-                matched_doc = d
-                break
-        if matched_doc is None:
-            raise AuthError(401, "INVALID_INBOX_TOKEN", "Token Pintasan tidak sah.")
-
-        rec = matched_doc.to_dict() or {}
-        target_uid = str(rec.get("uid") or "").strip()
-        if not target_uid:
-            raise AuthError(401, "INVALID_INBOX_TOKEN", "Token Pintasan tidak terikat ke akun.")
+        ref = self._db.collection("inboxTokens").document(digest)
         hour_key = datetime.now(timezone.utc).strftime("%Y%m%d%H")
-        count = int(rec.get("windowCount", 0)) if rec.get("windowHour") == hour_key else 0
-        if count >= 30:
-            raise AuthError(429, "INBOX_RATE_LIMIT", "Batas 30 kiriman Pintasan per jam tercapai.")
-        matched_doc.reference.update({"windowHour": hour_key, "windowCount": count + 1})
+
+        @gc_fs.transactional
+        def _consume_quota(txn: Any) -> str:
+            snap = ref.get(transaction=txn)
+            if not snap.exists:
+                raise AuthError(401, "INVALID_INBOX_TOKEN", "Token Pintasan tidak sah.")
+            rec = snap.to_dict() or {}
+            if not isinstance(rec.get("hash"), str) or not secrets.compare_digest(rec["hash"], digest):
+                raise AuthError(401, "INVALID_INBOX_TOKEN", "Token Pintasan tidak sah.")
+            target = str(rec.get("uid") or "").strip()
+            if not target:
+                raise AuthError(401, "INVALID_INBOX_TOKEN", "Token Pintasan tidak terikat ke akun.")
+            count = int(rec.get("windowCount", 0)) if rec.get("windowHour") == hour_key else 0
+            if count >= 30:
+                raise AuthError(429, "INBOX_RATE_LIMIT", "Batas 30 kiriman Pintasan per jam tercapai.")
+            txn.update(ref, {"windowHour": hour_key, "windowCount": count + 1})
+            return target
+
+        target_uid = _consume_quota(self._db.transaction())
 
         now = datetime.now(timezone.utc)
         inbox_ref = self._user_root(target_uid).collection("inbox").document()
@@ -1014,6 +1322,7 @@ class FirestoreRepository:
         return inbox_ref.id
 
     def delete_inbox_item(self, inbox_id: str) -> None:
+        inbox_id = validate_doc_id(inbox_id, "inboxId")
         self._user_root().collection("inbox").document(inbox_id).delete()
 
     def export_backup(self) -> dict[str, Any]:

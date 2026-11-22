@@ -1,0 +1,21 @@
+{
+  "venvPath": "functions",
+  "venv": "venv",
+  "pythonVersion": "3.12",
+  "extraPaths": [
+    "functions",
+    "functions/vendor"
+  ],
+  "include": [
+    "functions",
+    "tools"
+  ],
+  "exclude": [
+    "functions/venv",
+    "functions/.venv",
+    "functions/vendor",
+    "web",
+    "**/__pycache__"
+  ],
+  "typeCheckingMode": "basic"
+}

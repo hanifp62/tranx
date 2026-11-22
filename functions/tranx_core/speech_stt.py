@@ -15,6 +15,12 @@ from .config import AppSettings
 from .engines import UsageTracker
 
 MAX_AUDIO_BYTES = 4 * 1024 * 1024  # 4 MB
+ALLOWED_SPEECH_LANGS: dict[str, str] = {
+    "ja-JP": "Japanese (日本語)",
+    "id-ID": "Indonesian (Bahasa Indonesia)",
+    "en-US": "English (US)",
+    "en-GB": "English (UK)",
+}
 ALLOWED_AUDIO_MIMES = frozenset(
     {
         "audio/webm",
@@ -49,7 +55,10 @@ class GeminiSpeechTranscriber:
             raise EngineError("speech", "LLM_KEY belum dikonfigurasi")
         clean_model = model.removeprefix("models/")
         url = f"{self._api_root}/models/{clean_model}:generateContent"
-        lang_hint = "Japanese (日本語)" if lang.startswith("ja") else lang
+        clean_lang = (lang or "ja-JP").strip()
+        if clean_lang not in ALLOWED_SPEECH_LANGS:
+            raise InputError("Kode bahasa dikte tidak didukung")
+        lang_hint = ALLOWED_SPEECH_LANGS[clean_lang]
         body = {
             "contents": [
                 {
@@ -90,8 +99,16 @@ class GeminiSpeechTranscriber:
             raise EngineError("speech", f"Gagal mentranskripsi suara: {exc}") from exc
 
         try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return str(text).strip()
+            parts = data["candidates"][0]["content"]["parts"]
+            text = ""
+            if isinstance(parts, list):
+                for p in parts:
+                    if isinstance(p, dict) and not p.get("thought") and isinstance(p.get("text"), str) and p["text"].strip():
+                        text = p["text"]
+                        break
+            if not text.strip():
+                raise ValueError("empty transcription")
+            return text.strip()
         except Exception as exc:
             raise EngineError("speech", "Respons transkripsi suara kosong") from exc
 
@@ -114,16 +131,31 @@ def transcribe_short_audio(
     if base_mime not in ALLOWED_AUDIO_MIMES:
         raise InputError(f"Format audio {base_mime!r} tidak didukung")
 
+    clean_lang = (lang or "ja-JP").strip()
+    if clean_lang not in ALLOWED_SPEECH_LANGS:
+        raise InputError("Kode bahasa dikte tidak didukung")
+
     started = time.monotonic()
-    model = settings.llm_models[0]
-    if usage_tracker is not None:
-        usage_tracker.check_and_record(
-            model=model,
-            chars=300,
-            calls=1,
-            char_cap=settings.daily_char_cap,
-            call_cap=settings.daily_call_cap,
-        )
-    text = transcriber.transcribe(audio_bytes, base_mime, lang or "ja-JP", model)
+    models_to_try = list(settings.llm_models) or ["gemini-2.5-flash-lite"]
+    last_err: Exception | None = None
+    text = ""
+    for model in models_to_try:
+        if usage_tracker is not None:
+            usage_tracker.check_and_record(
+                model=model,
+                chars=300,
+                calls=1,
+                char_cap=settings.daily_char_cap,
+                call_cap=settings.daily_call_cap,
+            )
+        try:
+            text = transcriber.transcribe(audio_bytes, base_mime, clean_lang, model)
+            last_err = None
+            break
+        except EngineError as exc:
+            last_err = exc
+            continue
+    if last_err is not None:
+        raise last_err
     elapsed_ms = round((time.monotonic() - started) * 1000)
-    return {"text": text, "lang": lang or "ja-JP", "ms": elapsed_ms}
+    return {"text": text, "lang": clean_lang, "ms": elapsed_ms}

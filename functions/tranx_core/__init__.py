@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 VENDOR_DIR = Path(__file__).resolve().parents[1] / "vendor"
@@ -25,6 +26,7 @@ from jptrans.writers import RENDERERS  # noqa: E402
 
 from .cache import CacheStore, InMemoryCacheStore, LayeredTranslationCache
 from .config import (
+    ALLOWED_SERVER_KEY_MODELS,
     DEFAULT_MODELS,
     SUPPORTED_MODES,
     SUPPORTED_SOURCES,
@@ -33,6 +35,7 @@ from .config import (
     AppSettings,
     TitleStyle,
     chat_config,
+    effective_settings_for_key_source,
     long_config,
     parse_mode_target,
 )
@@ -43,7 +46,7 @@ from .multilingual import (
     translate_multilingual_document,
     translate_multilingual_paragraphs,
 )
-from .doc_readers import inspect_zip_archive, register_custom_readers
+from .doc_readers import inspect_zip_archive, read_document_safely, register_custom_readers, sanitize_vtt_content
 from .engines import (
     DailyCapExceeded,
     InMemoryUsageTracker,
@@ -87,16 +90,18 @@ from .vision_ocr import (
     translate_image_bytes,
 )
 from .web_translator import (
+    FetchedImage,
     FetchedPage,
     SSRFBlockedError,
     WebGateBlockedError,
+    fetch_image_safely,
     fetch_url_safely,
     translate_web_page,
     validate_and_resolve_url,
 )
 
 
-def init_tranx_core(api_key_getter=lambda: None) -> str:
+def init_tranx_core(api_key_getter: Callable[[], str | None] = lambda: None) -> str:
     """Deferred runtime bootstrap for @init: verify manifest and register plugins."""
     manifest_hash = verify_vendor_manifest()
     register_custom_readers()
@@ -116,6 +121,8 @@ def supported_formats_metadata() -> dict[str, list[str]]:
 
 
 __all__ = [
+    "ALLOWED_SERVER_KEY_MODELS",
+    "ALL_MODE_PAIRS",
     "AllEnginesFailed",
     "AppSettings",
     "CacheStore",
@@ -124,6 +131,7 @@ __all__ = [
     "DailyCapExceeded",
     "EngineError",
     "EngineUnavailable",
+    "FetchedImage",
     "FetchedPage",
     "FirestoreGlossary",
     "GLOSSARY_ENTRY_FIELDS",
@@ -144,6 +152,8 @@ __all__ = [
     "RawVisionBubble",
     "SSRFBlockedError",
     "SUPPORTED_MODES",
+    "SUPPORTED_SOURCES",
+    "SUPPORTED_TARGETS",
     "SUPPORTED_UI_LANGS",
     "SpeechTranscriber",
     "ThinkLLM",
@@ -154,8 +164,11 @@ __all__ = [
     "build_engine_chain",
     "chat_config",
     "denormalize_box_to_xywh",
+    "detect_source_language",
     "dict_to_glossary_entry",
+    "effective_settings_for_key_source",
     "export_translated_document",
+    "fetch_image_safely",
     "fetch_url_safely",
     "glossary_doc_id",
     "glossary_entry_to_dict",
@@ -165,19 +178,24 @@ __all__ = [
     "long_config",
     "lookup_new_names_for_text",
     "parse_aozora",
+    "parse_mode_pair",
     "parse_mode_target",
     "read_document",
+    "read_document_safely",
     "read_text",
     "rebuild_translated_document_from_paras",
     "register_custom_readers",
     "register_custom_writers",
     "register_default_tranx_engine",
     "render_docx_bytes",
+    "sanitize_vtt_content",
     "stream_document_chunks",
     "stream_fast_chat",
     "supported_formats_metadata",
     "transcribe_short_audio",
     "translate_image_bytes",
+    "translate_multilingual_document",
+    "translate_multilingual_paragraphs",
     "translate_web_page",
     "validate_and_resolve_url",
     "verify_vendor_manifest",

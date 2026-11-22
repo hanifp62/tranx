@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime
+import threading
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,11 @@ from jptrans.errors import EngineError, EngineUnavailable, QuotaExceeded
 from jptrans.net import http_status
 
 from .config import AppSettings
+from .literary_polish import (
+    build_literary_system_prompt,
+    naturalize_paragraphs,
+    profile_document,
+)
 
 WIB = ZoneInfo("Asia/Jakarta")
 
@@ -61,6 +67,7 @@ class InMemoryUsageTracker:
     """Thread-safe WIB daily counter for tests and emulator mode."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.by_day: dict[str, dict[str, Any]] = {}
 
     @staticmethod
@@ -70,13 +77,14 @@ class InMemoryUsageTracker:
 
     def snapshot(self, day_key: str | None = None) -> dict[str, Any]:
         key = day_key or self.today_key()
-        entry = self.by_day.get(key, {"chars": 0, "calls": 0, "byModel": {}})
-        return {
-            "day": key,
-            "chars": int(entry["chars"]),
-            "calls": int(entry["calls"]),
-            "byModel": dict(entry["byModel"]),
-        }
+        with self._lock:
+            entry = self.by_day.get(key, {"chars": 0, "calls": 0, "byModel": {}})
+            return {
+                "day": key,
+                "chars": int(entry["chars"]),
+                "calls": int(entry["calls"]),
+                "byModel": dict(entry["byModel"]),
+            }
 
     def check_and_record(
         self,
@@ -88,21 +96,22 @@ class InMemoryUsageTracker:
         call_cap: int,
     ) -> None:
         key = self.today_key()
-        bucket = self.by_day.setdefault(key, {"chars": 0, "calls": 0, "byModel": {}})
-        next_chars = int(bucket["chars"]) + max(chars, 0)
-        next_calls = int(bucket["calls"]) + max(calls, 0)
-        if next_chars > char_cap or next_calls > call_cap:
-            raise DailyCapExceeded(
-                chars_used=int(bucket["chars"]),
-                char_cap=char_cap,
-                calls_used=int(bucket["calls"]),
-                call_cap=call_cap,
-            )
-        bucket["chars"] = next_chars
-        bucket["calls"] = next_calls
-        by_model = bucket["byModel"].setdefault(model, {"chars": 0, "calls": 0})
-        by_model["chars"] += max(chars, 0)
-        by_model["calls"] += max(calls, 0)
+        with self._lock:
+            bucket = self.by_day.setdefault(key, {"chars": 0, "calls": 0, "byModel": {}})
+            next_chars = int(bucket["chars"]) + max(chars, 0)
+            next_calls = int(bucket["calls"]) + max(calls, 0)
+            if next_chars > char_cap or next_calls > call_cap:
+                raise DailyCapExceeded(
+                    chars_used=int(bucket["chars"]),
+                    char_cap=char_cap,
+                    calls_used=int(bucket["calls"]),
+                    call_cap=call_cap,
+                )
+            bucket["chars"] = next_chars
+            bucket["calls"] = next_calls
+            by_model = bucket["byModel"].setdefault(model, {"chars": 0, "calls": 0})
+            by_model["chars"] += max(chars, 0)
+            by_model["calls"] += max(calls, 0)
 
 
 class ThinkLLM(LLMEngine):
@@ -136,7 +145,7 @@ class ThinkLLM(LLMEngine):
         self.chars_sent = 0
 
     def cache_tag(self) -> str:
-        base = super().cache_tag()
+        base = f"{super().cache_tag()}:v5discourse"
         if self.reasoning_effort:
             return f"{base}:re={self.reasoning_effort}"
         return base
@@ -169,6 +178,18 @@ class ThinkLLM(LLMEngine):
             )
 
         payload = build_payload(self.model, texts, src, tgt, hints)
+        profile = profile_document(texts, src, tgt)
+        if payload.get("messages") and isinstance(payload["messages"], list):
+            src_label = {"ja": "Japanese", "id": "Indonesian", "en": "English"}.get(src, src)
+            tgt_label = {"ja": "Japanese", "id": "Indonesian", "en": "English"}.get(tgt, tgt)
+            base_sys = str(payload["messages"][0].get("content") or "").strip()
+            lit_prompt = build_literary_system_prompt(src_label, tgt_label, profile)
+            # Preserve jptrans strict 1-to-1 item cardinality & baked [[E#]] honorific rules alongside literary craft
+            payload["messages"][0]["content"] = (
+                f"{base_sys}\n\nLiterary Craft Guidance (preserve exact 1-to-1 item count and existing [[E#]] tokens without adding duplicate honorifics):\n{lit_prompt}"
+                if base_sys
+                else lit_prompt
+            )
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
 
@@ -193,7 +214,18 @@ class ThinkLLM(LLMEngine):
                     raise EngineUnavailable(self.name, str(retry_exc)) from retry_exc
                 raise
 
-        return parse_translations(message_content(data), len(texts))
+        raw_list = parse_translations(message_content(data), len(texts))
+        hint_targets: list[str] = []
+        for h in hints:
+            s = str(h or "").strip()
+            for sep in ("->", "=>", "="):
+                if sep in s:
+                    rhs = s.split(sep, 1)[1].strip().strip("\"'")
+                    if len(rhs) >= 2:
+                        hint_targets.append(rhs)
+                    break
+        glossary_vals = tuple(dict.fromkeys(hint_targets))
+        return naturalize_paragraphs(texts, raw_list, profile, glossary_values=glossary_vals)
 
 
 def build_engine_chain(

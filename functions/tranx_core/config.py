@@ -16,13 +16,22 @@ if str(VENDOR_DIR) not in sys.path:
 from jptrans.config import (  # noqa: E402
     DEFAULT_LLM_BASE_URL,
     HONORIFIC_STYLES,
-    LANGS,
     NAME_ORDERS,
     ROMANIZATIONS,
     Config,
 )
 
 DEFAULT_MODELS: tuple[str, ...] = ("gemini-2.5-flash-lite", "gemini-2.5-flash")
+ALLOWED_SERVER_KEY_MODELS: frozenset[str] = frozenset(
+    {
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    }
+)
+SERVER_KEY_MAX_MODELS = 3
+SERVER_KEY_MAX_DAILY_CHARS = 300_000
+SERVER_KEY_MAX_DAILY_CALLS = 1_500
 SUPPORTED_SOURCES: tuple[str, ...] = ("auto", "ja", "id", "en")
 SUPPORTED_TARGETS: tuple[str, ...] = ("id", "en", "ja")
 SUPPORTED_MODES: tuple[str, ...] = (
@@ -87,10 +96,11 @@ class AppSettings:
     def from_dict(cls, raw: dict[str, Any] | None) -> AppSettings:
         if not raw:
             return cls()
+        raw_models = raw.get("llmModels") if isinstance(raw.get("llmModels"), list) else DEFAULT_MODELS
         models = [
-            str(m).strip()
-            for m in (raw.get("llmModels") or DEFAULT_MODELS)
-            if str(m).strip()
+            m
+            for m in (str(x).strip().removeprefix("models/") for x in raw_models[:10])
+            if m and all(ch.isalnum() or ch in "._-" for ch in m) and ".." not in m and len(m) <= 64
         ] or list(DEFAULT_MODELS)
         effort_raw = raw.get("reasoningEffort")
         effort = (
@@ -113,12 +123,12 @@ class AppSettings:
         return cls(
             llm_models=models,
             reasoning_effort=effort,
-            llm_base_url=str(raw.get("llmBaseUrl") or DEFAULT_LLM_BASE_URL),
+            llm_base_url=DEFAULT_LLM_BASE_URL,
             chat_max_chars=min(max(int(raw.get("chatMaxChars", 5000)), 200), 5000),
             long_max_chars=min(max(int(raw.get("longMaxChars", 60000)), 1000), 60000),
             max_upload_mb=min(max(int(raw.get("maxUploadMb", 50)), 1), 50),
-            daily_char_cap=max(int(raw.get("dailyCharCap", 300000)), 1000),
-            daily_call_cap=max(int(raw.get("dailyCallCap", 2000)), 10),
+            daily_char_cap=min(max(int(raw.get("dailyCharCap", 300000)), 1000), 1000000),
+            daily_call_cap=min(max(int(raw.get("dailyCallCap", 2000)), 10), 5000),
             default_source=source,
             default_target=target,
             ui_lang=ui_lang,
@@ -139,6 +149,35 @@ class AppSettings:
             "uiLang": self.ui_lang,
             "theme": self.theme,
         }
+
+
+def effective_settings_for_key_source(
+    settings: AppSettings, key_source: str
+) -> AppSettings:
+    """Enforce server-side model allowlist and quota ceilings when using deployer env LLM_KEY."""
+    if key_source != "env":
+        return settings
+    safe_models = [
+        m for m in settings.llm_models if m in ALLOWED_SERVER_KEY_MODELS
+    ][:SERVER_KEY_MAX_MODELS]
+    if not safe_models:
+        safe_models = list(DEFAULT_MODELS)
+    return AppSettings(
+        llm_models=safe_models,
+        reasoning_effort={
+            k: v for k, v in settings.reasoning_effort.items() if k in safe_models
+        },
+        llm_base_url=settings.llm_base_url,
+        chat_max_chars=settings.chat_max_chars,
+        long_max_chars=settings.long_max_chars,
+        max_upload_mb=settings.max_upload_mb,
+        daily_char_cap=min(settings.daily_char_cap, SERVER_KEY_MAX_DAILY_CHARS),
+        daily_call_cap=min(settings.daily_call_cap, SERVER_KEY_MAX_DAILY_CALLS),
+        default_source=settings.default_source,
+        default_target=settings.default_target,
+        ui_lang=settings.ui_lang,
+        theme=settings.theme,
+    )
 
 
 def parse_mode_target(mode: str, default_target: str = "id") -> str:
